@@ -4,7 +4,7 @@
 
 <h1 align="center">perch</h1>
 
-<p align="center"><b>claude sessions manager</b></p>
+<p align="center"><b>claude sessions manager — for windows</b></p>
 
 <p align="center">
   a smol always-on-top bird that watches your claude code sessions<br>
@@ -35,6 +35,18 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 - also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
 - dead sessions disappear on their own, headless subagents / agent-team workers are hidden
 - one powershell script. no electron. no node_modules. your grandma's windows can run it
+
+## "isn't there already something like this?"
+
+kind of, but not really — i looked:
+
+- [claude-squad](https://github.com/smtg-ai/claude-squad) (8k★) and [ccmanager](https://github.com/kbwo/ccmanager) (1k★) are great, but they're terminal multiplexers: you run your sessions *inside* them, tmux-style. that's a whole workflow change.
+- there's a small army of cute menubar companions (Pulse, notch dynamic-island apps, claude-code-menubar ×3...) — **every single one is macOS**.
+- windows had... a notification popup script. that's it.
+
+perch is different on both axes: it's **windows-native**, and it watches the
+windows terminal tabs **you already have** — no tmux, no TUI to live inside,
+no workflow change. your sessions don't even know it exists.
 
 ## install
 

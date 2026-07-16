@@ -74,6 +74,27 @@ namespace ClaudeHud {
         public uint dwTimeout;
     }
 
+    public static class Windows {
+        public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+        [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        // ALL visible top-level windows of a process. Windows Terminal hosts
+        // every window in ONE process, so Process.MainWindowHandle misses all
+        // but one of them.
+        public static System.Collections.Generic.List<long> TopLevelForProcess(uint pid) {
+            var list = new System.Collections.Generic.List<long>();
+            EnumWindows((h, l) => {
+                uint wpid;
+                GetWindowThreadProcessId(h, out wpid);
+                if (wpid == pid && IsWindowVisible(h)) { list.Add(h.ToInt64()); }
+                return true;
+            }, IntPtr.Zero);
+            return list;
+        }
+    }
+
     public static class Native {
         [DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
         public static void Flash(IntPtr hwnd, uint count) {
@@ -134,20 +155,34 @@ function Get-Sessions {
         $status = [string]$s.status
         if ($status -eq 'ended' -or [string]::IsNullOrWhiteSpace($status)) { continue }
 
-        # hide headless agent-team / subagent claudes: they have no tab to
-        # jump to and their parent session is already visible
-        if ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless) { continue }
-
         # liveness: prefer the recorded agent pid, fall back to file freshness.
         # (files with no pid are pre-upgrade relics; every live session gains a
         # pid on its first hook event, so the freshness window can be short)
         $agentPid = 0
+        $proc = $null
         if ($null -ne $s.PSObject.Properties['agent_pid']) { $agentPid = [int]$s.agent_pid }
         if ($agentPid -gt 0) {
-            $p = Get-Process -Id $agentPid -ErrorAction SilentlyContinue
-            if ($null -eq $p -or $p.ProcessName -notmatch $script:AgentProcRegex) { continue }
+            $proc = Get-Process -Id $agentPid -ErrorAction SilentlyContinue
+            if ($null -eq $proc -or $proc.ProcessName -notmatch $script:AgentProcRegex) { continue }
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
+
+        # headless flag: usually a true subagent (hide), but sessions living in
+        # a WT window the OLD hook couldn't see were mis-flagged too. Verify
+        # with our own resolver: if the process's console maps to a real tab,
+        # it's a visible session - rescue it.
+        if ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless) {
+            $rescueTab = $null
+            if ($null -ne $proc) { $rescueTab = Resolve-TabForPid -TargetPid $agentPid -Proc $proc }
+            if ($null -eq $rescueTab) { continue }
+            $s | Add-Member -NotePropertyName window -NotePropertyValue ([pscustomobject]@{
+                hwnd           = [long]$rescueTab.Hwnd
+                tab_runtime_id = $rescueTab.Rid
+                tab_name       = $rescueTab.Name
+                tab_index      = $rescueTab.Index
+                captured_event = 'hud-rescue+console'
+            }) -Force
+        }
 
         $ts = $f.LastWriteTime
         try {
@@ -264,12 +299,130 @@ function Ensure-ConsoleApi {
     return $false
 }
 
+function Test-ProcSuspended($Proc) {
+    # NEVER touch a suspended process's console: its console server can't
+    # answer and GetConsoleTitle blocks forever (agent-team workers are
+    # routinely suspended) - this once froze the whole HUD
+    $suspended = $true
+    try {
+        foreach ($t in $Proc.Threads) {
+            if ($t.ThreadState -ne 'Wait' -or $t.WaitReason -ne 'Suspended') { $suspended = $false; break }
+        }
+    }
+    catch { $suspended = $false }
+    return $suspended
+}
+
+function Start-ConsoleProbe {
+    # console RPC can hang FOREVER on a hosed conhost (observed live: one
+    # agent process froze a probe for 2 minutes). Never attach from the HUD
+    # process - spawn a disposable child that the caller can kill.
+    param([int]$TargetPid, [string]$Marker = '')
+
+    $probe = Join-Path $PSScriptRoot 'console-probe.ps1'
+    if (-not (Test-Path -LiteralPath $probe)) { return $null }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -TargetPid $TargetPid" +
+                     $(if ($Marker.Length -gt 0) { " -Marker `"$Marker`"" } else { '' })
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.CreateNoWindow = $true
+    try { return [System.Diagnostics.Process]::Start($psi) } catch { return $null }
+}
+
+function Read-ConsoleTitleBounded {
+    # returns the console title of a process, or $null - never blocks > ~2.5s
+    param([int]$TargetPid)
+
+    $p = Start-ConsoleProbe -TargetPid $TargetPid
+    if ($null -eq $p) { return $null }
+    try {
+        if (-not $p.WaitForExit(2500)) {
+            try { $p.Kill() } catch { }
+            return $null
+        }
+        if ($p.ExitCode -ne 0) { return $null }
+        return $p.StandardOutput.ReadLine()
+    }
+    catch { return $null }
+    finally { try { $p.Dispose() } catch { } }
+}
+
+function Resolve-TabByMarker {
+    # Uniquely identify which tab hosts a process's console: a bounded child
+    # stamps a marker title for ~900ms while we watch which tab shows it.
+    param([int]$TargetPid)
+
+    $marker = "perch-$TargetPid"
+    $p = Start-ConsoleProbe -TargetPid $TargetPid -Marker $marker
+    if ($null -eq $p) { return $null }
+    try {
+        $match = $null
+        $normMarker = Get-NormalizedTabName $marker
+        for ($i = 0; $i -lt 12; $i++) {
+            Start-Sleep -Milliseconds 150
+            $match = @(Get-AllTerminalTabs -Fresh) | Where-Object { $_.Norm -eq $normMarker } | Select-Object -First 1
+            if ($null -ne $match) { break }
+            if ($p.HasExited -and $i -gt 1) { break }
+        }
+        if (-not $p.WaitForExit(3000)) { try { $p.Kill() } catch { } }
+        return $match
+    }
+    catch { return $null }
+    finally { try { $p.Dispose() } catch { } }
+}
+
+$script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance runs once per process)
+$script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
+$script:ProbeBudget = 2         # console probes allowed this tick (reset in Update-List)
+
+function Resolve-TabForPid {
+    # Map an agent process to its WT tab: cached rid -> unique title match ->
+    # marker dance. Negative results are cached 5 min so truly headless
+    # processes don't cost a dance on every refresh tick.
+    param([int]$TargetPid, $Proc)
+
+    $tabs = @(Get-AllTerminalTabs)
+
+    if ($script:UntrackedTabMap.ContainsKey($TargetPid)) {
+        $rid = [string]$script:UntrackedTabMap[$TargetPid]
+        foreach ($tb in $tabs) { if ($tb.Rid -eq $rid) { return $tb } }
+        [void]$script:UntrackedTabMap.Remove($TargetPid)
+    }
+    if ($script:NoTabStamp.ContainsKey($TargetPid)) {
+        if (((Get-Date) - $script:NoTabStamp[$TargetPid]).TotalSeconds -lt 300) { return $null }
+        [void]$script:NoTabStamp.Remove($TargetPid)
+    }
+    if (Test-ProcSuspended $Proc) { return $null }   # not cached: may wake up
+
+    # probes cost a child process each (~0.7s); budget per tick so a fleet of
+    # unresolved processes can't stall the UI - leftovers resolve next ticks
+    if ($script:ProbeBudget -le 0) { return $null }
+    $script:ProbeBudget--
+
+    $title = Read-ConsoleTitleBounded -TargetPid $TargetPid
+    $match = $null
+    if (-not [string]::IsNullOrWhiteSpace($title)) {
+        $norm = Get-NormalizedTabName $title
+        $byName = @($tabs | Where-Object { $_.Norm -eq $norm })
+        if ($byName.Count -eq 1) { $match = $byName[0] }
+        elseif ($byName.Count -gt 1) { $match = Resolve-TabByMarker -TargetPid $TargetPid }
+    }
+    if ($null -ne $match) { $script:UntrackedTabMap[$TargetPid] = $match.Rid }
+    else { $script:NoTabStamp[$TargetPid] = Get-Date }
+    return $match
+}
+
 $script:UntrackedCache = @()
 $script:UntrackedStamp = [datetime]::MinValue
 function Get-UntrackedSessions {
-    # claude.exe processes with no live status file. Attach to each one's
-    # console, read its title (== its tab title), and match it to a real tab.
-    # Headless helpers/subagents have empty or tab-less titles -> skipped.
+    # Agent processes with no live status file. Two detection paths:
+    #  a) processes literally named claude/codex/... (claude.exe)
+    #  b) interpreter processes (node/bun/deno/python) whose COMMAND LINE
+    #     names an agent - e.g. Codex runs as `node ...\@openai\codex\bin\codex.js`
+    #     while codex.exe is just a consoleless launcher.
+    # Tab resolution: unique title match, else marker dance (cached per pid).
     param($Tracked)
 
     if (((Get-Date) - $script:UntrackedStamp).TotalSeconds -lt 20) { return $script:UntrackedCache }
@@ -289,58 +442,64 @@ function Get-UntrackedSessions {
             }
         }
 
-        $candidates = @()
+        # path a: by process name
+        $candidates = New-Object System.Collections.ArrayList
         foreach ($procName in $AgentProcNames) {
-            $candidates += @(Get-Process -Name $procName -ErrorAction SilentlyContinue |
-                             Where-Object { -not $trackedPids.ContainsKey($_.Id) })
-        }
-        if ($candidates.Count -eq 0) { $script:UntrackedCache = @(); return @() }
-
-        $tabs = @(Get-AllTerminalTabs)
-        foreach ($c in $candidates) {
-            # NEVER touch a suspended process's console: its console server
-            # can't answer and GetConsoleTitle blocks forever (agent-team
-            # workers are routinely suspended) - this froze the whole HUD
-            $suspended = $true
-            try {
-                foreach ($t in $c.Threads) {
-                    if ($t.ThreadState -ne 'Wait' -or $t.WaitReason -ne 'Suspended') { $suspended = $false; break }
+            foreach ($p in @(Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+                if (-not $trackedPids.ContainsKey($p.Id)) {
+                    [void]$candidates.Add(@{ Proc = $p; Provider = $procName.ToLowerInvariant() })
                 }
             }
-            catch { $suspended = $false }
-            if ($suspended) { continue }
+        }
 
-            $title = $null
-            try { $title = [AgentFocus.ConsoleApi]::ReadTitleFrom([uint32]$c.Id) } catch { }
-            if ([string]::IsNullOrWhiteSpace($title)) { continue }
-            $norm = Get-NormalizedTabName $title
-            if ($norm.Length -eq 0) { continue }
-
-            $match = $null
-            foreach ($tb in $tabs) {
-                if ($tb.Norm -eq $norm -and -not $claimedRids.ContainsKey($tb.Rid)) { $match = $tb; break }
+        # path b: interpreter-hosted agents, detected via command line
+        $namePattern = ($AgentProcNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
+        $cmdRegex = "[\\/@]($namePattern)[\\/. ]"
+        try {
+            $interp = @(Get-CimInstance Win32_Process -Filter "Name='node.exe' OR Name='bun.exe' OR Name='deno.exe' OR Name='python.exe'" -ErrorAction Stop)
+            foreach ($ip in $interp) {
+                $cl = [string]$ip.CommandLine
+                if ($cl -notmatch $cmdRegex) { continue }
+                $provider = $Matches[1].ToLowerInvariant()
+                if ($trackedPids.ContainsKey([int]$ip.ProcessId)) { continue }
+                $p = Get-Process -Id $ip.ProcessId -ErrorAction SilentlyContinue
+                if ($null -ne $p) {
+                    [void]$candidates.Add(@{ Proc = $p; Provider = $provider })
+                }
             }
+        }
+        catch { }
+
+        if ($candidates.Count -eq 0) { $script:UntrackedCache = @(); return @() }
+
+        foreach ($cand in $candidates) {
+            $c = $cand.Proc
+            $match = Resolve-TabForPid -TargetPid $c.Id -Proc $c
             if ($null -eq $match) { continue }
+            # a tab already claimed by a tracked session or another candidate
+            # (codex.exe launcher + its node child share one console) = skip
+            if ($claimedRids.ContainsKey($match.Rid)) { continue }
             $claimedRids[$match.Rid] = $true
 
-            $dispName = $norm
+            $dispName = Get-NormalizedTabName $match.Name
+            if ($dispName.Length -eq 0) { $dispName = "$($cand.Provider) session" }
             if ($dispName.Length -gt 34) { $dispName = $dispName.Substring(0, 34) }
             $ts = Get-Date
             try { $ts = $c.StartTime } catch { }
 
             [void]$found.Add([pscustomobject]@{
                 Id       = "untracked-$($c.Id)"
-                Provider = $c.ProcessName.ToLowerInvariant()
+                Provider = $cand.Provider
                 Status   = 'quiet'
                 CwdName  = $dispName
                 Cwd      = ''
-                Message  = 'untracked session (no hook events since the HUD upgrade) - send it any prompt to fully track it'
+                Message  = 'untracked session (no hook events yet) - for claude, send any prompt to fully track it'
                 Ts       = $ts
                 AgentPid = [int]$c.Id
                 Window   = [pscustomobject]@{
                     hwnd           = [long]$match.Hwnd
                     tab_runtime_id = $match.Rid
-                    tab_name       = $title
+                    tab_name       = $match.Name
                     tab_index      = $match.Index
                     captured_event = 'hud-scan+console'
                 }
@@ -359,10 +518,27 @@ function Get-NormalizedTabName([string]$Name) {
     return (($Name -replace '^[^\p{L}\p{Nd}]+', '').Trim().ToLowerInvariant())
 }
 
+$script:TabsCache = @()
+$script:TabsCacheStamp = [datetime]::MinValue
 function Get-AllTerminalTabs {
+    # UIA enumeration across EVERY top-level WT window (there can be several
+    # per process). Cached for 2s - callers hit this on every refresh tick.
+    # -Fresh bypasses the cache (marker dance polls for a just-set title).
+    param([switch]$Fresh)
+    if (-not $Fresh -and ((Get-Date) - $script:TabsCacheStamp).TotalMilliseconds -lt 2000) { return $script:TabsCache }
     $list = New-Object System.Collections.ArrayList
+    $handles = New-Object System.Collections.ArrayList
     foreach ($wt in @(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue)) {
-        $hwnd = $wt.MainWindowHandle
+        try {
+            foreach ($hl in [ClaudeHud.Windows]::TopLevelForProcess([uint32]$wt.Id)) {
+                [void]$handles.Add([IntPtr][long]$hl)
+            }
+        }
+        catch {
+            if ($wt.MainWindowHandle -ne [IntPtr]::Zero) { [void]$handles.Add($wt.MainWindowHandle) }
+        }
+    }
+    foreach ($hwnd in $handles) {
         if ($hwnd -eq [IntPtr]::Zero) { continue }
         try {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
@@ -389,7 +565,9 @@ function Get-AllTerminalTabs {
         }
         catch { }
     }
-    return @($list)
+    $script:TabsCache = @($list)
+    $script:TabsCacheStamp = Get-Date
+    return $script:TabsCache
 }
 
 function Invoke-FocusSession($Sess) {
@@ -459,6 +637,7 @@ function Invoke-FocusSession($Sess) {
 # ---------- probe mode (no UI) ----------
 Load-Prefs
 if ($Probe) {
+    $script:ProbeBudget = 100   # resolve everything in one pass for diagnostics
     # NOTE: the untracked scan detaches this process's console (AttachConsole
     # dance), which resets std handles and breaks the normal output path.
     # Grab the stdout writer BEFORE the scan so it binds to the real pipe.
@@ -1348,6 +1527,7 @@ function Update-List {
     }
     $script:InTick = $true
     $script:InTickStamp = Get-Date
+    $script:ProbeBudget = 2
     try {
 
     $sessions = @(Get-Sessions)

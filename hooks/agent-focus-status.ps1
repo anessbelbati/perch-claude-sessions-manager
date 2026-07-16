@@ -78,6 +78,14 @@ using System.Text;
 
 namespace AgentFocus {
     public static class NativeWindow {
+        public delegate bool EnumProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr hWnd);
+
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
@@ -91,6 +99,20 @@ namespace AgentFocus {
             var builder = new StringBuilder(512);
             GetWindowText(hWnd, builder, builder.Capacity);
             return builder.ToString();
+        }
+
+        // ALL visible top-level windows of a process. Windows Terminal hosts
+        // every window in ONE process, so Process.MainWindowHandle misses all
+        // but one of them - sessions in a second WT window were invisible.
+        public static System.Collections.Generic.List<long> TopLevelForProcess(uint pid) {
+            var list = new System.Collections.Generic.List<long>();
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+                uint wpid;
+                GetWindowThreadProcessId(h, out wpid);
+                if (wpid == pid && IsWindowVisible(h)) { list.Add(h.ToInt64()); }
+                return true;
+            }, IntPtr.Zero);
+            return list;
         }
     }
 }
@@ -233,8 +255,20 @@ function Find-TerminalTabByName {
 
     $found = $null
     $count = 0
+    $handles = New-Object System.Collections.ArrayList
     foreach ($wt in @(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue)) {
-        $hwnd = $wt.MainWindowHandle
+        $added = $false
+        try {
+            Ensure-NativeWindowType
+            foreach ($hl in [AgentFocus.NativeWindow]::TopLevelForProcess([uint32]$wt.Id)) {
+                [void]$handles.Add([IntPtr][long]$hl)
+                $added = $true
+            }
+        }
+        catch { }
+        if (-not $added -and $wt.MainWindowHandle -ne [IntPtr]::Zero) { [void]$handles.Add($wt.MainWindowHandle) }
+    }
+    foreach ($hwnd in $handles) {
         if ($hwnd -eq [IntPtr]::Zero) { continue }
         try {
             $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
@@ -251,10 +285,12 @@ function Find-TerminalTabByName {
                 if ($null -eq $found) {
                     $rid = ""
                     try { $rid = ($tab.GetRuntimeId() -join ".") } catch { }
+                    [uint32]$wtPid = 0
+                    [void][AgentFocus.NativeWindow]::GetWindowThreadProcessId($hwnd, [ref]$wtPid)
                     $found = [pscustomobject]@{
                         hwnd = $hwnd.ToInt64()
-                        process_id = [int]$wt.Id
-                        window_title = [string]$wt.MainWindowTitle
+                        process_id = [int]$wtPid
+                        window_title = [AgentFocus.NativeWindow]::GetTitle($hwnd)
                         tab_index = $i
                         tab_runtime_id = $rid
                     }

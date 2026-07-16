@@ -1,73 +1,58 @@
 <p align="center">
-  <img src="logo.png" width="140" alt="Perch">
+  <img src="logo.png" width="140" alt="perch bird">
 </p>
 
-<h1 align="center">Perch</h1>
+<h1 align="center">perch</h1>
 
 <p align="center">
-  A tiny always-on-top widget for Windows that watches all your agent CLI sessions
-  (Claude Code, Codex, ...) across Windows Terminal tabs - and lets you jump
-  straight to the exact tab with one click.
+  a smol always-on-top bird that watches your claude code sessions<br>
+  so you don't have to alt-tab through 10 terminal tabs like a maniac
 </p>
 
 ---
 
-Running many Claude Code sessions in parallel means constantly alt-tabbing
-through terminal tabs to check which one finished, which one is stuck waiting
-for permission, and which one is still grinding. Perch puts all of them in one
-small card that perches on the corner of your screen:
+## why
 
-- 🔴 **needs you** - waiting for permission or input (pulsing, resurfaces the widget)
-- 🟠 **working** - mid-task (pulsing)
-- 🟢 **done** - finished its turn
-- 🔵 **quiet** - live agent process discovered by scan, no events yet
+i run a LOT of claude code sessions at once. multiple windows terminal windows, tabs everywhere. at some point i genuinely could not tell which session was done, which one was stuck waiting for me to click "allow", and which one was still cooking.
 
-**Click a row → focuses the right Windows Terminal window AND selects the right
-tab.** Deterministically - no title guessing.
+so i made perch. it's a tiny card that sits in the corner of your screen and just... tells you:
 
-## Features
+- 🔴 **needs you** — waiting for permission or input (pulses + resurfaces so you actually notice)
+- 🟠 **working** — still cooking
+- 🟢 **done** — finished, waiting for your next prompt
+- 🔵 **quiet** — a live agent perch found on its own, no events from it yet
 
-- Live status per session via Claude Code hooks (works for every session, even ones started before Perch launches)
-- Click-to-focus down to the exact WT tab (UI Automation + console-title identity)
-- Right-click: **pin to top**, **rename**, **hide** (persisted per project folder)
-- Attention behavior you control: pinned = resurfaces above everything (never steals focus); unpinned = taskbar flash only
-- Auto-discovers untracked agent CLIs (`codex`, `gemini`, `opencode`, `aider`, configurable) as clickable rows
-- Dead sessions disappear (process liveness), headless subagents/agent-team workers are hidden
-- Single instance, remembers position, zero dependencies - one PowerShell 5.1 script, no runtime to install
+and the best part: **click a row and it jumps to the EXACT windows terminal tab.** not "roughly the right window" — the exact tab, deterministically. (this took an embarrassing amount of effort, see war stories below.)
 
-## Requirements
+## stuff it does
 
-- Windows 10/11 with **Windows Terminal**
-- **PowerShell 5.1** (preinstalled on Windows)
-- [Claude Code](https://claude.com/claude-code) for live statuses (other CLIs get presence + click-to-focus out of the box)
+- live status for every claude code session, via hooks
+- click-to-focus down to the exact tab
+- right-click a row → **pin to top**, **rename**, **hide** (remembered per project folder)
+- pin the widget = always on top. unpin = it stays out of your way and just flashes the taskbar when something needs you
+- also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
+- dead sessions disappear on their own, headless subagents / agent-team workers are hidden
+- one powershell script. no electron. no node_modules. your grandma's windows can run it
 
-## Install
+## install
+
+you need: windows 10/11, windows terminal, and [claude code](https://claude.com/claude-code) (for the live statuses — other CLIs get presence + click-to-focus without any setup).
 
 ```powershell
-git clone <this-repo> perch
+git clone https://github.com/anessbelbati/perch
 cd perch
 powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -DesktopShortcut
 ```
 
-The installer:
-1. deploys the status hook to `%LOCALAPPDATA%\AgentFocus\`
-2. compiles a tiny native helper DLL (console APIs)
-3. **non-destructively** merges the hook into `~/.claude/settings.json` (backup written first; already-registered events are left alone)
-4. generates `icon.ico` from `logo.png`
-5. optionally creates Desktop / Startup shortcuts (`-DesktopShortcut`, `-StartupShortcut`)
+the installer copies the hook to `%LOCALAPPDATA%\AgentFocus\`, compiles a tiny helper dll, and gently merges the hook into your `~/.claude/settings.json` (it backs it up first and never touches your existing hooks). add `-StartupShortcut` if you want perch at login.
 
-Launch with **`Perch.vbs`** (no console window). Sessions started after install
-get full status coverage; ones already running appear as soon as they do
-anything (or as "quiet" rows via the process scan).
+then double-click **`Perch.vbs`**. that's it. sessions you start after installing get full statuses; ones already running show up as soon as they do anything.
 
-## Other CLI tools (Codex, Gemini, opencode, aider, ...)
+## other CLI tools
 
-**Presence (zero setup):** any process named in `AgentProcessNames`
-(`%LOCALAPPDATA%\AgentFocus\settings.json`) that lives in a WT tab is
-auto-discovered with click-to-focus.
+any agent CLI running in a windows terminal tab shows up automatically if its process name is in `AgentProcessNames` (`%LOCALAPPDATA%\AgentFocus\settings.json`). that gives you presence + click-to-focus with zero setup.
 
-**Live status:** have the tool pipe one JSON line to
-`agent-focus-status.ps1 -Provider <name>` on its events:
+for real statuses the tool needs to tell perch what it's doing — pipe one JSON line to `agent-focus-status.ps1 -Provider <name>`:
 
 ```json
 {"hook_event_name":"Stop","session_id":"<stable-id>","cwd":"<dir>","last_assistant_message":"..."}
@@ -79,53 +64,50 @@ auto-discovered with click-to-focus.
 | `Stop` | done |
 | `Notification` | needs you |
 | `StopFailure` | failed |
-| `SessionEnd` | removed |
+| `SessionEnd` | gone |
 
-**Codex CLI** has a ready adapter - add to `~/.codex/config.toml`:
+**codex** users: there's a ready-made adapter. in `~/.codex/config.toml`:
 
 ```toml
 notify = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-          "-File", "<repo>\\codex-notify-adapter.ps1"]
+          "-File", "<wherever-you-cloned-perch>\\codex-notify-adapter.ps1"]
 ```
 
-## How it works (the fun part)
+## how it works (nerd corner)
 
-Mapping a session to its terminal tab is done **deterministically**:
+the hard problem is mapping a session to its exact tab. tab titles change constantly (spinner glyphs, task summaries) and guessing from the foreground window is a disaster if you tab-hop fast.
 
-1. Claude Code hooks spawn with their own hidden console (via bash.exe), so the
-   hook `AttachConsole()`s into the agent process itself - that console's title
-   IS the session's tab title (ConPTY mirrors it).
-2. The title is matched to a tab via UI Automation (normalized to survive
-   spinner glyphs). If it isn't unique, the hook briefly stamps a unique marker
-   title, finds it, and restores the original.
-3. If the marker never appears in any tab, that agent is headless (subagent /
-   agent-team worker) - flagged and hidden.
-4. The tab's UIA runtime id + fresh title are stored per session; clicking a row
-   re-matches against live tabs (fresh title first, runtime id as tiebreaker),
-   restores the window if minimized, selects the tab, `SetForegroundWindow`.
+the trick: claude code hooks run as child processes of the claude process, so the hook can `AttachConsole()` into claude itself — and that console's title IS the session's tab title (ConPTY mirrors it up to windows terminal). match that against all tabs via UI Automation, and if the title isn't unique, briefly stamp a unique marker title on the console, find which tab shows it, restore the title. boom: session ↔ tab, no guessing.
 
-Hard-won details, all handled: never capture from the foreground window
-(tab-hoppers poison it - it once recorded Spotify), never touch a *suspended*
-process's console (blocks forever), per-session mutex against concurrent hook
-writes, guard flags are time-limited leases (a stopped pipeline once orphaned
-a flag and froze the UI), `AttachConsole` resets std handles (bind stdout
-first), and PowerShell-hosted WPF needs its own `AppUserModelID` or the
-taskbar shows the PowerShell icon.
+clicking a row re-matches against live tabs (fresh title first, UIA runtime id as tiebreaker), restores the window if minimized, selects the tab, brings it forward.
 
-## Files
+## war stories
 
-| file | purpose |
+things that bit me so they don't have to bite you:
+
+- **never capture from the foreground window.** with fast tab-hopping the hook fires late and records whatever's focused. it once stored *spotify* as a session's location. clicking that row opened spotify.
+- **never touch a suspended process's console.** agent-team workers get suspended; their console server can't answer and `GetConsoleTitle` blocks forever. perch froze windowless at startup because of this.
+- **`DragMove()` eats child clicks.** the draggable header was swallowing every click on the pin button. mark the buttons' mouse-down as handled or they're decorative.
+- **powershell + WPF share one thread.** nested message pumps (menus!) stop each other's pipelines; a `trap { break }` then killed the whole app, and later an orphaned "refresh in progress" flag froze it silently. guard flags must be time-limited leases, not locks.
+- **`AttachConsole` resets std handles.** bind `[Console]::Out` before the first attach or your stdout just... stops.
+- **taskbar icons lie.** a powershell-hosted WPF window shows the powershell icon until you set your own `AppUserModelID`.
+- **process-hunting by command-line substring matches your own diagnostic process.** i killed my own kill-script mid-run more than once.
+
+## files
+
+| file | what |
 |---|---|
-| `perch.ps1` | the widget (WPF, single file) |
-| `hooks/agent-focus-status.ps1` | Claude Code hook: session events -> status JSONs |
-| `install.ps1` | installer (hook deploy + settings merge + shortcuts) |
+| `perch.ps1` | the widget (single WPF file) |
+| `hooks/agent-focus-status.ps1` | claude code hook: events → status JSONs |
+| `install.ps1` | installer |
 | `Perch.vbs` | consoleless launcher |
-| `codex-notify-adapter.ps1` | Codex CLI notify -> status adapter |
-| `gen-icon.ps1` | rebuilds `icon.ico` from `logo.png` |
+| `codex-notify-adapter.ps1` | codex notify → status adapter |
+| `gen-icon.ps1` | rebuilds the icon from `logo.png` |
 
-Debug: `perch.ps1 -Probe` prints the session table to the console.
-Runtime logs: `hud-error.log` (survived errors), `hud-boot.log` (startup stages).
+debugging: `perch.ps1 -Probe` prints the session table. `hud-error.log` has survived errors, `hud-boot.log` has startup stages.
 
-## License
+## license
 
-MIT © Zelipt
+MIT. it's a personal tool i made for me — if it's useful to you, cool 🐦
+
+built with [claude code](https://claude.com/claude-code), naturally.

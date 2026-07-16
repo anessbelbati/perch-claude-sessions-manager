@@ -4,6 +4,8 @@
 
 <h1 align="center">perch</h1>
 
+<p align="center"><b>claude sessions manager</b></p>
+
 <p align="center">
   a smol always-on-top bird that watches your claude code sessions<br>
   so you don't have to alt-tab through 10 terminal tabs like a maniac
@@ -39,7 +41,7 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 you need: windows 10/11, windows terminal, and [claude code](https://claude.com/claude-code) (for the live statuses — other CLIs get presence + click-to-focus without any setup).
 
 ```powershell
-git clone https://github.com/anessbelbati/perch
+git clone https://github.com/anessbelbati/perch-claude-sessions-manager perch
 cd perch
 powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 -DesktopShortcut
 ```

@@ -40,11 +40,15 @@ $ProgressPreference = 'SilentlyContinue'
 $RefreshSeconds = 2
 $HideAfterFocus = $false
 $AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
+$script:ChirpOn = $false
+$script:ShowTimers = $true
 try {
     if (Test-Path -LiteralPath $CfgPath) {
         $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json
         if ($cfg.RefreshSeconds) { $RefreshSeconds = [int]$cfg.RefreshSeconds }
         if ($null -ne $cfg.PSObject.Properties['HideAfterFocus']) { $HideAfterFocus = [bool]$cfg.HideAfterFocus }
+        if ($null -ne $cfg.PSObject.Properties['ChirpOnAttention']) { $script:ChirpOn = [bool]$cfg.ChirpOnAttention }
+        if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
         }
@@ -628,6 +632,9 @@ $xaml = @"
                      Foreground="#F4F4F8" VerticalAlignment="Center"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <TextBlock x:Name="GearBtn" Text="&#x2699;" FontSize="12" Padding="5,3"
+                     Style="{StaticResource HudIconButton}" Margin="2,0"
+                     ToolTip="settings"/>
           <TextBlock x:Name="PinBtn" Text="&#x1F4CC;" FontSize="11" Padding="5,3"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="pinned = always on top; unpinned = normal window (attention only flashes the taskbar)"/>
@@ -652,7 +659,9 @@ $script:ChipsPanel  = $Window.FindName('ChipsPanel')
 $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
+$script:GearBtn     = $Window.FindName('GearBtn')
 $script:RootCard    = $Window.FindName('RootCard')
+$script:WorkSince   = @{}
 $script:Dismissed   = @{}
 $script:PrevAttention = @{}
 $script:UiHold      = 0
@@ -808,6 +817,195 @@ function Show-RenameDialog([string]$Current) {
     return $script:RenameResult
 }
 
+function New-DarkCheck([string]$Text, [bool]$Checked) {
+    $cb = New-Object System.Windows.Controls.CheckBox
+    $cb.Content = $Text
+    $cb.IsChecked = $Checked
+    $cb.Foreground = Get-Brush '#E4E4EA'
+    $cb.FontSize = 11.5
+    $cb.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
+    return $cb
+}
+
+function New-DarkLabel([string]$Text) {
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Text
+    $tb.FontSize = 10.5
+    $tb.Foreground = Get-Brush '#8A8A93'
+    $tb.Margin = New-Object System.Windows.Thickness(0, 9, 0, 3)
+    return $tb
+}
+
+function New-DarkTextBox([string]$Text) {
+    $box = New-Object System.Windows.Controls.TextBox
+    $box.Text = $Text
+    $box.FontSize = 12
+    $box.Background = Get-Brush '#14FFFFFF'
+    $box.Foreground = Get-Brush '#F4F4F8'
+    $box.CaretBrush = Get-Brush '#F4F4F8'
+    $box.BorderBrush = Get-Brush '#33FFFFFF'
+    $box.Padding = New-Object System.Windows.Thickness(6, 3, 6, 3)
+    return $box
+}
+
+function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$ProcsRaw) {
+    $script:ChirpOn = $Chirp
+    $script:ShowTimers = $Timers
+    $script:HudHideAfterFocus = $HideAfter
+
+    $refresh = 0
+    if ([int]::TryParse($RefreshRaw.Trim(), [ref]$refresh) -and $refresh -ge 1 -and $refresh -le 60) {
+        $script:RefreshSeconds = $refresh
+        if ($null -ne $script:Timer) { $script:Timer.Interval = [TimeSpan]::FromSeconds($refresh) }
+    }
+
+    $names = @()
+    foreach ($n in ($ProcsRaw -split '[,;\s]+')) {
+        if ($n.Trim().Length -gt 0) { $names += $n.Trim().ToLowerInvariant() }
+    }
+    if ($names.Count -gt 0) {
+        $script:AgentProcNames = $names
+        $script:AgentProcRegex = '^(' + ((@($names) + @('node', 'bun', 'deno', 'python')) -join '|') + ')'
+        $script:UntrackedStamp = [datetime]::MinValue   # rescan with new list soon
+    }
+
+    # start-with-windows = shortcut in the Startup folder
+    try {
+        $lnkPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
+        if ($Startup -and -not (Test-Path -LiteralPath $lnkPath)) {
+            $ws = New-Object -ComObject WScript.Shell
+            $lnk = $ws.CreateShortcut($lnkPath)
+            $lnk.TargetPath = Join-Path $PSScriptRoot 'Perch.vbs'
+            $lnk.WorkingDirectory = $PSScriptRoot
+            $lnk.IconLocation = (Join-Path $PSScriptRoot 'icon.ico') + ',0'
+            $lnk.Description = 'Perch - agent session HUD'
+            $lnk.Save()
+        }
+        elseif (-not $Startup -and (Test-Path -LiteralPath $lnkPath)) {
+            Remove-Item -LiteralPath $lnkPath -Force
+        }
+    }
+    catch { }
+
+    # persist
+    try {
+        $cfg = $null
+        if (Test-Path -LiteralPath $CfgPath) { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json }
+        if ($null -eq $cfg) { $cfg = [pscustomobject]@{} }
+        $cfg | Add-Member -NotePropertyName RefreshSeconds    -NotePropertyValue $script:RefreshSeconds -Force
+        $cfg | Add-Member -NotePropertyName HideAfterFocus    -NotePropertyValue $script:HudHideAfterFocus -Force
+        $cfg | Add-Member -NotePropertyName ChirpOnAttention  -NotePropertyValue $script:ChirpOn -Force
+        $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
+        $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
+        $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
+    }
+    catch { }
+
+    Update-List -Force
+}
+
+function Show-SettingsDialog {
+    $dlg = New-Object System.Windows.Window
+    $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
+    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
+    $dlg.SizeToContent = 'WidthAndHeight'
+    $dlg.WindowStartupLocation = 'CenterOwner'
+    $dlg.Owner = $script:Window
+    $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
+
+    $card = New-Object System.Windows.Controls.Border
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $card.Background = Get-Brush '#F8202029'
+    $card.BorderBrush = Get-Brush '#33FFFFFF'
+    $card.BorderThickness = New-Object System.Windows.Thickness(1)
+    $card.Padding = New-Object System.Windows.Thickness(18, 14, 18, 14)
+
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.Width = 262
+
+    $title = New-Object System.Windows.Controls.TextBlock
+    $title.Text = 'settings'
+    $title.FontSize = 11
+    $title.Foreground = Get-Brush '#8A8A93'
+    $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
+    [void]$stack.Children.Add($title)
+
+    $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
+    $cbChirp   = New-DarkCheck 'chirp when a session needs me'            $script:ChirpOn
+    $cbTimers  = New-DarkCheck 'show how long sessions have been working' $script:ShowTimers
+    $cbHide    = New-DarkCheck 'minimize perch after click-to-focus'      $script:HudHideAfterFocus
+    $cbStartup = New-DarkCheck 'start with windows'                       (Test-Path -LiteralPath $startupLnk)
+    foreach ($cb in @($cbChirp, $cbTimers, $cbHide, $cbStartup)) { [void]$stack.Children.Add($cb) }
+
+    [void]$stack.Children.Add((New-DarkLabel 'refresh every (seconds)'))
+    $tbRefresh = New-DarkTextBox ([string]$script:RefreshSeconds)
+    $tbRefresh.Width = 60
+    $tbRefresh.HorizontalAlignment = 'Left'
+    [void]$stack.Children.Add($tbRefresh)
+
+    [void]$stack.Children.Add((New-DarkLabel 'agent process names (comma separated)'))
+    $tbProcs = New-DarkTextBox ($script:AgentProcNames -join ', ')
+    [void]$stack.Children.Add($tbProcs)
+
+    $btnRow = New-Object System.Windows.Controls.StackPanel
+    $btnRow.Orientation = 'Horizontal'
+    $btnRow.HorizontalAlignment = 'Right'
+    $btnRow.Margin = New-Object System.Windows.Thickness(0, 14, 0, 0)
+    $btnSave = New-Object System.Windows.Controls.Button
+    $btnSave.Content = 'save'
+    $btnSave.FontSize = 11.5
+    $btnSave.Padding = New-Object System.Windows.Thickness(16, 4, 16, 5)
+    $btnSave.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+    $btnSave.Background = Get-Brush '#2EE07B54'
+    $btnSave.Foreground = Get-Brush '#F4F4F8'
+    $btnSave.BorderBrush = Get-Brush '#55E07B54'
+    $btnSave.Cursor = [System.Windows.Input.Cursors]::Hand
+    $btnCancel = New-Object System.Windows.Controls.Button
+    $btnCancel.Content = 'cancel'
+    $btnCancel.FontSize = 11.5
+    $btnCancel.Padding = New-Object System.Windows.Thickness(12, 4, 12, 5)
+    $btnCancel.Background = Get-Brush '#14FFFFFF'
+    $btnCancel.Foreground = Get-Brush '#B8B8C0'
+    $btnCancel.BorderBrush = Get-Brush '#33FFFFFF'
+    $btnCancel.Cursor = [System.Windows.Input.Cursors]::Hand
+    [void]$btnRow.Children.Add($btnSave)
+    [void]$btnRow.Children.Add($btnCancel)
+    [void]$stack.Children.Add($btnRow)
+
+    $card.Child = $stack
+    $dlg.Content = $card
+
+    $dlg.Tag = @{
+        Chirp = $cbChirp; Timers = $cbTimers; Hide = $cbHide; Startup = $cbStartup
+        Refresh = $tbRefresh; Procs = $tbProcs
+    }
+    $btnSave.Tag = $dlg
+    $btnCancel.Tag = $dlg
+    $btnSave.Add_Click({
+        param($s, $e)
+        $c = $s.Tag.Tag
+        Save-PerchSettings ([bool]$c.Chirp.IsChecked) ([bool]$c.Timers.IsChecked) ([bool]$c.Hide.IsChecked) `
+                           ([bool]$c.Startup.IsChecked) ([string]$c.Refresh.Text) ([string]$c.Procs.Text)
+        $s.Tag.Close()
+    })
+    $btnCancel.Add_Click({ param($s, $e) $s.Tag.Close() })
+    $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+
+    $script:UiHold++
+    $script:UiHoldStamp = Get-Date
+    try { [void]$dlg.ShowDialog() }
+    finally { $script:UiHold = [Math]::Max(0, $script:UiHold - 1) }
+}
+
+function Invoke-Chirp {
+    if (-not $script:ChirpOn) { return }
+    try {
+        [Console]::Beep(1568, 70)
+        [Console]::Beep(2093, 90)
+    }
+    catch { }
+}
+
 function New-RowMenu($Sess) {
     $menu = New-Object System.Windows.Controls.ContextMenu
     $menu.Style = $script:Window.FindResource('HudMenu')
@@ -857,6 +1055,7 @@ function New-RowMenu($Sess) {
 function Invoke-AttentionRaise {
     # a session just flipped to "needs you": resurface the HUD (no focus steal)
     try {
+        Invoke-Chirp
         $helper = New-Object System.Windows.Interop.WindowInteropHelper($script:Window)
         if ($script:UserTopmost) {
             # pinned: make sure the HUD is visible above everything (no focus steal)
@@ -975,6 +1174,10 @@ function New-SessionRow($Sess) {
     $snippet = ($Sess.Message -replace '\s+', ' ').Trim()
     if ($snippet.Length -gt 70) { $snippet = $snippet.Substring(0, 70) }
     $label = $meta.Label
+    if ($Sess.Status -eq 'working' -and $script:ShowTimers -and $script:WorkSince.ContainsKey($Sess.Id)) {
+        $workSpan = (Get-Date) - $script:WorkSince[$Sess.Id]
+        if ($workSpan.TotalSeconds -ge 90) { $label = "working $(Format-Age $script:WorkSince[$Sess.Id])" }
+    }
     if ($Sess.Provider -and $Sess.Provider -ne 'claude') { $label = "$($Sess.Provider)$($script:Sep)$label" }
     $sub = New-Object System.Windows.Controls.TextBlock
     $sub.FontSize = 10.5
@@ -1050,6 +1253,21 @@ function Update-List {
         [void]$visible.Add($s)
     }
 
+    # track how long each session has been continuously working
+    $liveIds = @{}
+    foreach ($s in $visible) {
+        $liveIds[$s.Id] = $true
+        if ($s.Status -eq 'working') {
+            if (-not $script:WorkSince.ContainsKey($s.Id)) { $script:WorkSince[$s.Id] = Get-Date }
+        }
+        else {
+            [void]$script:WorkSince.Remove($s.Id)
+        }
+    }
+    foreach ($k in @($script:WorkSince.Keys)) {
+        if (-not $liveIds.ContainsKey($k)) { [void]$script:WorkSince.Remove($k) }
+    }
+
     $script:SessionList.Children.Clear()
     if ($visible.Count -eq 0) {
         $emptyStack = New-Object System.Windows.Controls.StackPanel
@@ -1108,10 +1326,12 @@ function Update-List {
     finally { $script:InTick = $false }
 }
 
-# the pin/close buttons must swallow mouse-down BEFORE it bubbles to the
+# the header buttons must swallow mouse-down BEFORE it bubbles to the
 # header, otherwise DragMove() starts a window drag and eats their click
 $PinBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $CloseBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$GearBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$GearBtn.Add_MouseLeftButtonUp({ Show-SettingsDialog })
 $Header.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
 $ChipsPanel.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
 function Save-HudState {
@@ -1133,10 +1353,10 @@ if (-not $script:UserTopmost) { $PinBtn.Opacity = 0.35 }
 
 $Window.Add_Closing({ Save-HudState })
 
-$timer = New-Object System.Windows.Threading.DispatcherTimer
-$timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
-$timer.Add_Tick({ Update-List })
-$timer.Start()
+$script:Timer = New-Object System.Windows.Threading.DispatcherTimer
+$script:Timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
+$script:Timer.Add_Tick({ Update-List })
+$script:Timer.Start()
 
 # defer the first untracked-process scan: the window must be visible before
 # any potentially slow console probing happens

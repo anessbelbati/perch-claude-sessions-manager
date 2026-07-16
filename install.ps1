@@ -76,6 +76,8 @@ if (-not (Test-Path -LiteralPath $afCfg)) {
     [ordered]@{
         RefreshSeconds    = 2
         HideAfterFocus    = $false
+        ChirpOnAttention  = $false
+        ShowWorkTimers    = $true
         StatusDirectory   = (Join-Path $af 'status')
         AgentProcessNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
     } | ConvertTo-Json | Set-Content -LiteralPath $afCfg -Encoding UTF8

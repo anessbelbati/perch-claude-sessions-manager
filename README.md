@@ -11,6 +11,10 @@
   so you don't have to alt-tab through 10 terminal tabs like a maniac
 </p>
 
+<p align="center">
+  <img src="screenshot.png" width="320" alt="perch watching 7 real sessions">
+</p>
+
 ---
 
 ## why

@@ -66,6 +66,35 @@ function Get-AgentAncestorPid {
     return 0
 }
 
+function Test-IsSubagent {
+    # Walks UP from the AGENT process: an agent-named ancestor (claude spawned
+    # by claude - Task tool / agent teams) means true subagent; reaching the
+    # terminal/shell host first means interactive session. Needed because a
+    # manually-RENAMED WT tab ignores console-title changes, so the marker
+    # dance can't see it - without this check those sessions were mis-flagged
+    # as headless subagents and hidden from viewers.
+    param([int]$AgentPid)
+
+    try {
+        $agentNames = '^(claude|codex|gemini|opencode|aider)'
+        $current = $AgentPid
+        for ($i = 0; $i -lt 8; $i++) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction Stop
+            if ($null -eq $proc) { break }
+            $parentId = [int]$proc.ParentProcessId
+            if ($parentId -le 0) { break }
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+            if ($null -eq $parent) { break }
+            $name = [string]$parent.Name
+            if ($name -match $agentNames) { return $true }
+            if ($name -match '^(WindowsTerminal|explorer|svchost|services|wininit|winlogon)') { return $false }
+            $current = $parentId
+        }
+    }
+    catch { }
+    return $false   # unknown ancestry -> assume interactive (never hide a real session)
+}
+
 function Ensure-NativeWindowType {
     if ("AgentFocus.NativeWindow" -as [type]) {
         return
@@ -291,6 +320,7 @@ function Find-TerminalTabByName {
                         hwnd = $hwnd.ToInt64()
                         process_id = [int]$wtPid
                         window_title = [AgentFocus.NativeWindow]::GetTitle($hwnd)
+                        tab_name = [string]$tab.Current.Name
                         tab_index = $i
                         tab_runtime_id = $rid
                     }
@@ -368,7 +398,7 @@ function Get-ConsoleTabHint {
     # console's title IS the session's tab title), find the matching tab via
     # UI Automation. If the title is not unique across tabs, briefly stamp a
     # unique marker title and find that instead, then restore the title.
-    param([string]$SessionId, [string]$EventName, [int]$AgentPid)
+    param([string]$SessionId, [string]$EventName, [int]$AgentPid, [string]$CwdName)
 
     if ($AgentPid -le 0) { return $null }
     if (-not (Ensure-ConsoleApiType)) { return $null }
@@ -386,6 +416,7 @@ function Get-ConsoleTabHint {
         Write-HookDebug "ev=$EventName attached($AgentPid) title=[$prevTitle]"
 
         $match = $null
+        $capTag = "console"
         if (-not [string]::IsNullOrWhiteSpace($prevTitle)) {
             $candidate = Find-TerminalTabByName -Name $prevTitle
             if ($null -ne $candidate -and $candidate.unique) { $match = $candidate }
@@ -407,13 +438,35 @@ function Get-ConsoleTabHint {
             finally {
                 try { [void][AgentFocus.ConsoleApi]::SetConsoleTitle($prevTitle) } catch { }
             }
-            if ($null -eq $match) {
-                # attach worked but the marker never appeared in any terminal
-                # tab: this agent's console is not a visible tab (agent-team /
-                # subagent claude). Report that explicitly.
-                Write-HookDebug "ev=$EventName marker not found -> headless"
-                return [pscustomobject]@{ headless = $true }
+        }
+
+        if ($null -eq $match -and -not [string]::IsNullOrWhiteSpace($CwdName)) {
+            # manually-RENAMED tabs never show the marker: WT pins the custom
+            # name and ignores console-title changes. People typically rename
+            # the tab to the project name -> match against the cwd folder name.
+            $candidate = Find-TerminalTabByName -Name $CwdName
+            if ($null -ne $candidate -and $candidate.unique) {
+                Write-HookDebug "ev=$EventName marker blocked (renamed tab?) -> cwd-name matched [$($candidate.tab_name)]"
+                $match = $candidate
+                $capTag = "cwdname"
             }
+        }
+
+        if ($null -eq $match) {
+            # attach worked but no tab shows the marker: either a TRUE headless
+            # subagent (hidden console) or an interactive session in a tab
+            # renamed to something we can't correlate. Only flag headless when
+            # the process ancestry says subagent - hiding real sessions is the
+            # worst possible failure mode.
+            $isSub = Test-IsSubagent -AgentPid $AgentPid
+            Write-HookDebug "ev=$EventName marker not found -> subagent=$isSub"
+            return [pscustomobject]@{ headless = $isSub }
+        }
+
+        $tabTitle = $prevTitle
+        if ($null -ne $match.PSObject.Properties['tab_name'] -and
+            -not [string]::IsNullOrWhiteSpace([string]$match.tab_name)) {
+            $tabTitle = [string]$match.tab_name
         }
 
         return [pscustomobject]@{
@@ -422,10 +475,10 @@ function Get-ConsoleTabHint {
             process_name = "WindowsTerminal"
             title = $match.window_title
             parent_title = $match.window_title
-            tab_name = $prevTitle
+            tab_name = $tabTitle
             tab_index = $match.tab_index
             tab_runtime_id = $match.tab_runtime_id
-            captured_event = "$EventName+console"
+            captured_event = "$EventName+$capTag"
         }
     }
     finally {
@@ -540,22 +593,35 @@ try {
         # NOTE: no foreground-window fallback here on purpose. Guessing from
         # the foreground window wrote wrong-tab (even wrong-app) hints when the
         # user tab-hopped. Console capture is deterministic or nothing.
-        $captured = Get-ConsoleTabHint -SessionId $stableId -EventName $eventName -AgentPid $agentPid
+        $cwdLeaf = ""
+        if ($null -ne $existing -and -not [string]::IsNullOrWhiteSpace([string]$existing.cwd_name)) {
+            $cwdLeaf = [string]$existing.cwd_name
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($cwd)) {
+            try { $cwdLeaf = Split-Path -Path $cwd -Leaf } catch { }
+        }
+        $captured = Get-ConsoleTabHint -SessionId $stableId -EventName $eventName -AgentPid $agentPid -CwdName $cwdLeaf
         if ($null -ne $captured) {
             if ($null -ne $captured.PSObject.Properties['tab_runtime_id']) {
                 $window = $captured
                 $headless = $false
             }
             else {
-                $headless = $true
+                # no tab found: headless only if the ancestry says subagent -
+                # interactive sessions in unrecognizably-renamed tabs stay
+                # visible (window-less) rather than vanishing from viewers
+                $headless = [bool]$captured.headless
                 $window = $null
             }
         }
         # $null = attach failed entirely -> keep whatever we had
     }
-    elseif ($null -ne $window -and $eventName -ne "SessionEnd") {
+    elseif ($null -ne $window -and $eventName -ne "SessionEnd" -and
+            ([string]$window.captured_event) -like "*+console") {
         # keep tab_name fresh: the agent console's title IS the live tab title.
         # Viewers use it to re-match the tab even if the runtime id went stale.
+        # (only for title-following tabs: a cwdname-captured tab is RENAMED, its
+        # console title never matches the tab, refreshing would break matching)
         $liveTitle = Get-AgentConsoleTitle -AgentPid $agentPid
         if (-not [string]::IsNullOrWhiteSpace($liveTitle)) {
             $window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveTitle -Force

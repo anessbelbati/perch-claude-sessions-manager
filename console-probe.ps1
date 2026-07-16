@@ -16,7 +16,7 @@ param(
 $dll = Join-Path $env:LOCALAPPDATA 'AgentFocus\AgentFocusNative.dll'
 if (-not (Test-Path -LiteralPath $dll)) { exit 2 }
 Add-Type -Path $dll
-Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PK { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); }'
+Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PK { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max); }'
 $out = [Console]::Out   # bind BEFORE detaching our console
 
 [void][AgentFocus.ConsoleApi]::FreeConsole()
@@ -27,7 +27,13 @@ try {
     $prev = $sb.ToString()
     $cw = [PK]::GetConsoleWindow()
     $cwOut = 0
-    if ($cw -ne [IntPtr]::Zero -and [PK]::IsWindowVisible($cw)) { $cwOut = $cw.ToInt64() }
+    if ($cw -ne [IntPtr]::Zero -and [PK]::IsWindowVisible($cw)) {
+        # ConPTY gives every WT tab a FAKE "PseudoConsoleWindow" that can still
+        # report visible - only a REAL conhost window is a usable click target
+        $csb = New-Object System.Text.StringBuilder(256)
+        [void][PK]::GetClassName($cw, $csb, 256)
+        if ($csb.ToString() -eq 'ConsoleWindowClass') { $cwOut = $cw.ToInt64() }
+    }
     $out.WriteLine($prev)
     $out.WriteLine([string]$cwOut)
     $out.Flush()

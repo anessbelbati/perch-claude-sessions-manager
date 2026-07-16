@@ -174,21 +174,32 @@ function Get-Sessions {
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
 
-        # headless flag: usually a true subagent (hide), but sessions living in
-        # a WT window the OLD hook couldn't see were mis-flagged too. Verify
-        # with our own resolver: if the process's console maps to a real tab,
-        # it's a visible session - rescue it.
+        # headless flag: usually a true subagent (hide), but sessions in tabs
+        # the hook couldn't correlate (second WT window, manually RENAMED tabs
+        # that ignore console titles) get mis-flagged too. Verify with our own
+        # resolver; when even that fails, only hide the session if its process
+        # ancestry says subagent - hiding a real session is the worst failure.
         if ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless) {
             $rescueTab = $null
-            if ($null -ne $proc) { $rescueTab = Resolve-TabForPid -TargetPid $agentPid -Proc $proc }
-            if ($null -eq $rescueTab) { continue }
-            $s | Add-Member -NotePropertyName window -NotePropertyValue ([pscustomobject]@{
-                hwnd           = [long]$rescueTab.Hwnd
-                tab_runtime_id = $rescueTab.Rid
-                tab_name       = $rescueTab.Name
-                tab_index      = $rescueTab.Index
-                captured_event = 'hud-rescue+console'
-            }) -Force
+            if ($null -ne $proc) {
+                $rescueTab = Resolve-TabForPid -TargetPid $agentPid -Proc $proc -CwdName ([string]$s.cwd_name)
+            }
+            if ($null -ne $rescueTab) {
+                $s | Add-Member -NotePropertyName window -NotePropertyValue ([pscustomobject]@{
+                    hwnd           = [long]$rescueTab.Hwnd
+                    tab_runtime_id = $rescueTab.Rid
+                    tab_name       = $rescueTab.Name
+                    tab_index      = $rescueTab.Index
+                    captured_event = 'hud-rescue+console'
+                }) -Force
+            }
+            elseif ($null -eq $proc -or (Test-IsSubagentProc -TargetPid $agentPid)) { continue }
+            else {
+                # interactive session in a tab we can't identify (renamed to
+                # something arbitrary): show it window-less - clicking falls
+                # back to name matching in Invoke-FocusSession
+                $s | Add-Member -NotePropertyName window -NotePropertyValue $null -Force
+            }
         }
 
         $ts = $f.LastWriteTime
@@ -252,6 +263,11 @@ function Get-Sessions {
             $inferred = Get-InferredAgentStatus $liveName
             $u | Add-Member -NotePropertyName Status -NotePropertyValue $inferred -Force
             $u | Add-Member -NotePropertyName Rank -NotePropertyValue ((Get-StatusMeta $inferred).Rank) -Force
+            # keep the row NAME live too: it was snapshotted from whatever the
+            # title said at first resolve, which goes stale/wrong within minutes
+            $dn = Get-NormalizedTabName $liveName
+            if ($dn.Length -gt 34) { $dn = $dn.Substring(0, 34) }
+            if ($dn.Length -gt 0) { $u | Add-Member -NotePropertyName CwdName -NotePropertyValue $dn -Force }
         }
         [void]$kept.Add($u)
     }
@@ -410,6 +426,36 @@ $script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain co
 $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
 $script:ProbeBudget = 4         # console probes allowed this tick (reset in Update-List)
 
+$script:SubagentCache = @{}   # pid -> bool (ancestry never changes for a live pid)
+function Test-IsSubagentProc {
+    # Interactive agents are launched from a shell, so walking UP the parent
+    # chain reaches the terminal host; a subagent (claude spawned by claude -
+    # Task tool / agent teams) hits an agent-named ancestor first.
+    param([int]$TargetPid)
+
+    if ($script:SubagentCache.ContainsKey($TargetPid)) { return $script:SubagentCache[$TargetPid] }
+    $isSub = $false
+    try {
+        $agentNames = '^(' + ((@($AgentProcNames) | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')'
+        $current = $TargetPid
+        for ($i = 0; $i -lt 8; $i++) {
+            $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction Stop
+            if ($null -eq $proc) { break }
+            $parentId = [int]$proc.ParentProcessId
+            if ($parentId -le 0) { break }
+            $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
+            if ($null -eq $parent) { break }
+            $name = [string]$parent.Name
+            if ($name -match $agentNames) { $isSub = $true; break }
+            if ($name -match '^(WindowsTerminal|explorer|svchost|services|wininit|winlogon)') { break }
+            $current = $parentId
+        }
+    }
+    catch { }
+    $script:SubagentCache[$TargetPid] = $isSub
+    return $isSub
+}
+
 function Get-InferredAgentStatus([string]$LiveName) {
     # untracked agents have no hooks, but their console/tab title tells the
     # story: a leading braille spinner glyph (u2800-u28FF) means WORKING
@@ -421,9 +467,10 @@ function Get-InferredAgentStatus([string]$LiveName) {
 
 function Resolve-TabForPid {
     # Map an agent process to its WT tab (cached rid -> unique title match ->
-    # marker dance) OR, for agents in a plain console window with no WT tab,
-    # to that window itself (Rid = ''). Negative results cached 5 min.
-    param([int]$TargetPid, $Proc)
+    # marker dance -> cwd-name match for RENAMED tabs) OR, for agents in a
+    # plain console window with no WT tab, to that window itself (Rid = '').
+    # Negative results cached 5 min.
+    param([int]$TargetPid, $Proc, [string]$CwdName = '')
 
     $tabs = @(Get-AllTerminalTabs)
 
@@ -459,6 +506,16 @@ function Resolve-TabForPid {
         $byName = @($tabs | Where-Object { $_.Norm -eq $norm })
         if ($byName.Count -eq 1) { $match = $byName[0] }
         elseif ($byName.Count -gt 1) { $match = Resolve-TabByMarker -TargetPid $TargetPid }
+    }
+    if ($null -eq $match -and $CwdName.Length -gt 0) {
+        # manually-RENAMED tabs ignore console-title changes, so neither the
+        # live title nor a stamped marker ever appears on them. People usually
+        # rename the tab to the project name -> match the cwd folder name.
+        $wantCwd = Get-NormalizedTabName $CwdName
+        if ($wantCwd.Length -gt 0) {
+            $byCwd = @($tabs | Where-Object { $_.Norm -eq $wantCwd })
+            if ($byCwd.Count -eq 1) { $match = $byCwd[0] }
+        }
     }
     if ($null -eq $match -and $null -ne $info -and $info.ConsoleHwnd -gt 0) {
         # no WT tab anywhere, but the console has its own visible window
@@ -674,6 +731,19 @@ function Invoke-FocusSession($Sess) {
         elseif ($storedHwnd -ne [IntPtr]::Zero -and $tabIndex -ge 0) {
             $inWin = @($tabs | Where-Object { $_.Hwnd -eq $storedHwnd })
             if ($tabIndex -lt $inWin.Count) { $target = $inWin[$tabIndex] }
+        }
+
+        if ($null -eq $target) {
+            # stored hints dead or missing (typical for manually-RENAMED tabs:
+            # they ignore console titles, so hooks may never capture them).
+            # Match the tab against what the row is CALLED - custom name first,
+            # then the project folder name; users rename tabs to exactly these.
+            foreach ($cand in @([string]$Sess.DisplayName, [string]$Sess.CwdName)) {
+                $wantN = Get-NormalizedTabName $cand
+                if ($wantN.Length -eq 0) { continue }
+                $byLabel = @($tabs | Where-Object { $_.Norm -eq $wantN })
+                if ($byLabel.Count -eq 1) { $target = $byLabel[0]; break }
+            }
         }
     }
 

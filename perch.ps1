@@ -817,35 +817,125 @@ function Show-RenameDialog([string]$Current) {
     return $script:RenameResult
 }
 
-function New-DarkCheck([string]$Text, [bool]$Checked) {
-    $cb = New-Object System.Windows.Controls.CheckBox
-    $cb.Content = $Text
-    $cb.IsChecked = $Checked
-    $cb.Foreground = Get-Brush '#E4E4EA'
-    $cb.FontSize = 11.5
-    $cb.Margin = New-Object System.Windows.Thickness(0, 4, 0, 4)
-    return $cb
-}
-
 function New-DarkLabel([string]$Text) {
     $tb = New-Object System.Windows.Controls.TextBlock
     $tb.Text = $Text
     $tb.FontSize = 10.5
     $tb.Foreground = Get-Brush '#8A8A93'
-    $tb.Margin = New-Object System.Windows.Thickness(0, 9, 0, 3)
+    $tb.Margin = New-Object System.Windows.Thickness(2, 10, 0, 4)
     return $tb
 }
 
-function New-DarkTextBox([string]$Text) {
+function Set-Toggle($Toggle, [bool]$On) {
+    $Toggle.Tag = $On
+    if ($On) {
+        $Toggle.Background = Get-Brush '#E07B54'
+        $Toggle.Child.HorizontalAlignment = 'Right'
+    }
+    else {
+        $Toggle.Background = Get-Brush '#33FFFFFF'
+        $Toggle.Child.HorizontalAlignment = 'Left'
+    }
+}
+
+function New-Toggle([bool]$On) {
+    $t = New-Object System.Windows.Controls.Border
+    $t.Width = 34; $t.Height = 18
+    $t.CornerRadius = New-Object System.Windows.CornerRadius(9)
+    $t.VerticalAlignment = 'Center'
+    $thumb = New-Object System.Windows.Shapes.Ellipse
+    $thumb.Width = 12; $thumb.Height = 12
+    $thumb.Fill = Get-Brush '#F4F4F8'
+    $thumb.Margin = New-Object System.Windows.Thickness(3, 0, 3, 0)
+    $thumb.VerticalAlignment = 'Center'
+    $t.Child = $thumb
+    Set-Toggle $t $On
+    return $t
+}
+
+function New-SettingRow([string]$Label, [bool]$On) {
+    # whole row is clickable and hoverable, like session rows. The toggle
+    # lives in $row.Tag; its boolean state in $row.Tag.Tag.
+    $row = New-Object System.Windows.Controls.Border
+    $row.CornerRadius = New-Object System.Windows.CornerRadius(8)
+    $row.Padding = New-Object System.Windows.Thickness(9, 7, 9, 7)
+    $row.Margin = New-Object System.Windows.Thickness(0, 1, 0, 1)
+    $row.Background = [System.Windows.Media.Brushes]::Transparent
+    $row.Cursor = [System.Windows.Input.Cursors]::Hand
+
+    $grid = New-Object System.Windows.Controls.Grid
+    $c0 = New-Object System.Windows.Controls.ColumnDefinition
+    $c0.Width = New-Object System.Windows.GridLength(1, 'Star')
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition
+    $c1.Width = [System.Windows.GridLength]::Auto
+    [void]$grid.ColumnDefinitions.Add($c0)
+    [void]$grid.ColumnDefinitions.Add($c1)
+
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Label
+    $tb.FontSize = 11.5
+    $tb.Foreground = Get-Brush '#E4E4EA'
+    $tb.VerticalAlignment = 'Center'
+    $tb.TextTrimming = 'CharacterEllipsis'
+    $tb.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    [System.Windows.Controls.Grid]::SetColumn($tb, 0)
+    [void]$grid.Children.Add($tb)
+
+    $toggle = New-Toggle $On
+    [System.Windows.Controls.Grid]::SetColumn($toggle, 1)
+    [void]$grid.Children.Add($toggle)
+
+    $row.Child = $grid
+    $row.Tag = $toggle
+    $row.Add_MouseLeftButtonUp({ param($s, $e) Set-Toggle $s.Tag (-not [bool]$s.Tag.Tag) })
+    $row.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#0FFFFFFF' })
+    $row.Add_MouseLeave({ param($s, $e) $s.Background = [System.Windows.Media.Brushes]::Transparent })
+    return $row
+}
+
+function New-InputBox([string]$Text) {
+    # rounded dark input: Border wrapper + borderless TextBox (.Child)
+    $wrap = New-Object System.Windows.Controls.Border
+    $wrap.CornerRadius = New-Object System.Windows.CornerRadius(8)
+    $wrap.Background = Get-Brush '#14FFFFFF'
+    $wrap.BorderBrush = Get-Brush '#26FFFFFF'
+    $wrap.BorderThickness = New-Object System.Windows.Thickness(1)
+    $wrap.Padding = New-Object System.Windows.Thickness(9, 4, 9, 5)
     $box = New-Object System.Windows.Controls.TextBox
     $box.Text = $Text
     $box.FontSize = 12
-    $box.Background = Get-Brush '#14FFFFFF'
+    $box.Background = [System.Windows.Media.Brushes]::Transparent
+    $box.BorderThickness = New-Object System.Windows.Thickness(0)
     $box.Foreground = Get-Brush '#F4F4F8'
-    $box.CaretBrush = Get-Brush '#F4F4F8'
-    $box.BorderBrush = Get-Brush '#33FFFFFF'
-    $box.Padding = New-Object System.Windows.Thickness(6, 3, 6, 3)
-    return $box
+    $box.CaretBrush = Get-Brush '#E07B54'
+    $box.SelectionBrush = Get-Brush '#55E07B54'
+    $wrap.Child = $box
+    return $wrap
+}
+
+function New-DialogButton([string]$Text, [bool]$Primary) {
+    $b = New-Object System.Windows.Controls.Border
+    $b.CornerRadius = New-Object System.Windows.CornerRadius(9)
+    $b.Cursor = [System.Windows.Input.Cursors]::Hand
+    $b.Padding = New-Object System.Windows.Thickness(16, 5, 16, 6)
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Text
+    $tb.FontSize = 11.5
+    $tb.FontWeight = [System.Windows.FontWeights]::SemiBold
+    if ($Primary) {
+        $b.Background = Get-Brush '#E07B54'
+        $tb.Foreground = Get-Brush '#1E1E27'
+        $b.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#EC906F' })
+        $b.Add_MouseLeave({ param($s, $e) $s.Background = Get-Brush '#E07B54' })
+    }
+    else {
+        $b.Background = Get-Brush '#1AFFFFFF'
+        $tb.Foreground = Get-Brush '#C0C0C8'
+        $b.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#26FFFFFF' })
+        $b.Add_MouseLeave({ param($s, $e) $s.Background = Get-Brush '#1AFFFFFF' })
+    }
+    $b.Child = $tb
+    return $b
 }
 
 function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$ProcsRaw) {
@@ -914,60 +1004,79 @@ function Show-SettingsDialog {
     $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
 
     $card = New-Object System.Windows.Controls.Border
-    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
-    $card.Background = Get-Brush '#F8202029'
-    $card.BorderBrush = Get-Brush '#33FFFFFF'
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(14)
+    $grad = New-Object System.Windows.Media.LinearGradientBrush
+    $grad.StartPoint = New-Object System.Windows.Point(0, 0)
+    $grad.EndPoint = New-Object System.Windows.Point(0, 1)
+    [void]$grad.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+        [System.Windows.Media.ColorConverter]::ConvertFromString('#FA1F1F28'), 0.0)))
+    [void]$grad.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+        [System.Windows.Media.ColorConverter]::ConvertFromString('#FA15151A'), 1.0)))
+    $card.Background = $grad
+    $card.BorderBrush = Get-Brush '#2AFFFFFF'
     $card.BorderThickness = New-Object System.Windows.Thickness(1)
-    $card.Padding = New-Object System.Windows.Thickness(18, 14, 18, 14)
+    $card.Padding = New-Object System.Windows.Thickness(14, 12, 14, 14)
+    $shadow = New-Object System.Windows.Media.Effects.DropShadowEffect
+    $shadow.BlurRadius = 16; $shadow.ShadowDepth = 0; $shadow.Opacity = 0.55
+    $card.Effect = $shadow
+    $card.Margin = New-Object System.Windows.Thickness(10)
 
     $stack = New-Object System.Windows.Controls.StackPanel
-    $stack.Width = 262
+    $stack.Width = 266
 
+    # header: bird + title (draggable)
+    $head = New-Object System.Windows.Controls.StackPanel
+    $head.Orientation = 'Horizontal'
+    $head.Margin = New-Object System.Windows.Thickness(2, 0, 0, 10)
+    $head.Background = [System.Windows.Media.Brushes]::Transparent
+    if ($null -ne $script:LogoSource) {
+        $hImg = New-Object System.Windows.Controls.Image
+        $hImg.Source = $script:LogoSource
+        $hImg.Width = 15; $hImg.Height = 15
+        $hImg.Margin = New-Object System.Windows.Thickness(0, 0, 7, 0)
+        [void]$head.Children.Add($hImg)
+    }
     $title = New-Object System.Windows.Controls.TextBlock
     $title.Text = 'settings'
-    $title.FontSize = 11
-    $title.Foreground = Get-Brush '#8A8A93'
-    $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 10)
-    [void]$stack.Children.Add($title)
+    $title.FontSize = 12.5
+    $title.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $title.Foreground = Get-Brush '#F4F4F8'
+    $title.VerticalAlignment = 'Center'
+    [void]$head.Children.Add($title)
+    $head.Tag = $dlg
+    $head.Add_MouseLeftButtonDown({ param($s, $e) try { $s.Tag.DragMove() } catch { } })
+    [void]$stack.Children.Add($head)
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
-    $cbChirp   = New-DarkCheck 'chirp when a session needs me'            $script:ChirpOn
-    $cbTimers  = New-DarkCheck 'show how long sessions have been working' $script:ShowTimers
-    $cbHide    = New-DarkCheck 'minimize perch after click-to-focus'      $script:HudHideAfterFocus
-    $cbStartup = New-DarkCheck 'start with windows'                       (Test-Path -LiteralPath $startupLnk)
-    foreach ($cb in @($cbChirp, $cbTimers, $cbHide, $cbStartup)) { [void]$stack.Children.Add($cb) }
+    $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
+    $rowTimers  = New-SettingRow 'show work timers on busy sessions'  $script:ShowTimers
+    $rowHide    = New-SettingRow 'minimize after click-to-focus'      $script:HudHideAfterFocus
+    $rowStartup = New-SettingRow 'start with windows'                 (Test-Path -LiteralPath $startupLnk)
+    foreach ($r in @($rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
+
+    $sep = New-Object System.Windows.Controls.Border
+    $sep.Height = 1
+    $sep.Background = Get-Brush '#14FFFFFF'
+    $sep.Margin = New-Object System.Windows.Thickness(2, 8, 2, 0)
+    [void]$stack.Children.Add($sep)
 
     [void]$stack.Children.Add((New-DarkLabel 'refresh every (seconds)'))
-    $tbRefresh = New-DarkTextBox ([string]$script:RefreshSeconds)
-    $tbRefresh.Width = 60
-    $tbRefresh.HorizontalAlignment = 'Left'
-    [void]$stack.Children.Add($tbRefresh)
+    $inRefresh = New-InputBox ([string]$script:RefreshSeconds)
+    $inRefresh.Width = 64
+    $inRefresh.HorizontalAlignment = 'Left'
+    [void]$stack.Children.Add($inRefresh)
 
-    [void]$stack.Children.Add((New-DarkLabel 'agent process names (comma separated)'))
-    $tbProcs = New-DarkTextBox ($script:AgentProcNames -join ', ')
-    [void]$stack.Children.Add($tbProcs)
+    [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
+    $inProcs = New-InputBox ($script:AgentProcNames -join ', ')
+    [void]$stack.Children.Add($inProcs)
 
     $btnRow = New-Object System.Windows.Controls.StackPanel
     $btnRow.Orientation = 'Horizontal'
     $btnRow.HorizontalAlignment = 'Right'
-    $btnRow.Margin = New-Object System.Windows.Thickness(0, 14, 0, 0)
-    $btnSave = New-Object System.Windows.Controls.Button
-    $btnSave.Content = 'save'
-    $btnSave.FontSize = 11.5
-    $btnSave.Padding = New-Object System.Windows.Thickness(16, 4, 16, 5)
+    $btnRow.Margin = New-Object System.Windows.Thickness(0, 16, 0, 0)
+    $btnSave = New-DialogButton 'save' $true
     $btnSave.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-    $btnSave.Background = Get-Brush '#2EE07B54'
-    $btnSave.Foreground = Get-Brush '#F4F4F8'
-    $btnSave.BorderBrush = Get-Brush '#55E07B54'
-    $btnSave.Cursor = [System.Windows.Input.Cursors]::Hand
-    $btnCancel = New-Object System.Windows.Controls.Button
-    $btnCancel.Content = 'cancel'
-    $btnCancel.FontSize = 11.5
-    $btnCancel.Padding = New-Object System.Windows.Thickness(12, 4, 12, 5)
-    $btnCancel.Background = Get-Brush '#14FFFFFF'
-    $btnCancel.Foreground = Get-Brush '#B8B8C0'
-    $btnCancel.BorderBrush = Get-Brush '#33FFFFFF'
-    $btnCancel.Cursor = [System.Windows.Input.Cursors]::Hand
+    $btnCancel = New-DialogButton 'cancel' $false
     [void]$btnRow.Children.Add($btnSave)
     [void]$btnRow.Children.Add($btnCancel)
     [void]$stack.Children.Add($btnRow)
@@ -976,19 +1085,19 @@ function Show-SettingsDialog {
     $dlg.Content = $card
 
     $dlg.Tag = @{
-        Chirp = $cbChirp; Timers = $cbTimers; Hide = $cbHide; Startup = $cbStartup
-        Refresh = $tbRefresh; Procs = $tbProcs
+        Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
+        Refresh = $inRefresh.Child; Procs = $inProcs.Child
     }
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
-    $btnSave.Add_Click({
+    $btnSave.Add_MouseLeftButtonUp({
         param($s, $e)
         $c = $s.Tag.Tag
-        Save-PerchSettings ([bool]$c.Chirp.IsChecked) ([bool]$c.Timers.IsChecked) ([bool]$c.Hide.IsChecked) `
-                           ([bool]$c.Startup.IsChecked) ([string]$c.Refresh.Text) ([string]$c.Procs.Text)
+        Save-PerchSettings ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
+                           ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Procs.Text)
         $s.Tag.Close()
     })
-    $btnCancel.Add_Click({ param($s, $e) $s.Tag.Close() })
+    $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
     $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
 
     $script:UiHold++

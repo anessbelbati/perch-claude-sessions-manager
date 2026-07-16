@@ -1,0 +1,1148 @@
+<#
+    Claude HUD v2 - tiny always-on-top viewer for live Claude Code sessions.
+
+    Reads AgentFocus status files (written by Claude Code hooks) and shows one
+    row per live session: glowing status dot + project folder + status + age.
+      - left-click a row   -> focuses its Windows Terminal window AND selects its tab
+      - right-click a row  -> hides it until its status changes again
+      - drag the header    -> move the widget (position is remembered)
+      - pin button         -> toggle always-on-top
+
+    Usage:
+      powershell -NoProfile -ExecutionPolicy Bypass -STA -File hud.ps1
+      powershell -NoProfile -ExecutionPolicy Bypass -File hud.ps1 -Probe   # console dump, no UI
+#>
+param([switch]$Probe)
+
+$ErrorActionPreference = 'Continue'
+
+# log unexpected errors so a hidden-window launch is debuggable.
+# IMPORTANT: continue, don't break - WPF reentrancy (menus, nested message
+# pumps) can stop a running pipeline (PipelineStoppedException) and that must
+# never kill the whole HUD.
+trap {
+    try {
+        "$(Get-Date -Format s)  $($_ | Out-String)" |
+            Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log')
+    }
+    catch { }
+    continue
+}
+
+$AgentFocusDir = Join-Path $env:LOCALAPPDATA 'AgentFocus'
+$StatusDir     = Join-Path $AgentFocusDir 'status'
+$CfgPath       = Join-Path $AgentFocusDir 'settings.json'
+$StatePath     = Join-Path $PSScriptRoot 'hud-state.json'
+$PrefsPath     = Join-Path $PSScriptRoot 'hud-prefs.json'
+$ProgressPreference = 'SilentlyContinue'
+
+# ---------- config ----------
+$RefreshSeconds = 2
+$HideAfterFocus = $false
+$AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
+try {
+    if (Test-Path -LiteralPath $CfgPath) {
+        $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json
+        if ($cfg.RefreshSeconds) { $RefreshSeconds = [int]$cfg.RefreshSeconds }
+        if ($null -ne $cfg.PSObject.Properties['HideAfterFocus']) { $HideAfterFocus = [bool]$cfg.HideAfterFocus }
+        if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
+            $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
+        }
+    }
+}
+catch { }
+# processes that count as "an agent CLI" for liveness + untracked discovery
+$script:AgentProcRegex = '^(' + ((@($AgentProcNames) + @('node', 'bun', 'deno', 'python')) -join '|') + ')'
+
+# ---------- native + UIA ----------
+if (-not ("ClaudeHud.Native" -as [type])) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace ClaudeHud {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FLASHWINFO {
+        public uint cbSize;
+        public IntPtr hwnd;
+        public uint dwFlags;
+        public uint uCount;
+        public uint dwTimeout;
+    }
+
+    public static class Native {
+        [DllImport("user32.dll")] public static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+        public static void Flash(IntPtr hwnd, uint count) {
+            FLASHWINFO fi = new FLASHWINFO();
+            fi.cbSize = (uint)Marshal.SizeOf(typeof(FLASHWINFO));
+            fi.hwnd = hwnd;
+            fi.dwFlags = 3; // FLASHW_CAPTION | FLASHW_TRAY
+            fi.uCount = count;
+            fi.dwTimeout = 0;
+            FlashWindowEx(ref fi);
+        }
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        [DllImport("shell32.dll", SetLastError = true)] public static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string AppID);
+    }
+}
+"@
+}
+Add-Type -AssemblyName UIAutomationClient -ErrorAction SilentlyContinue
+Add-Type -AssemblyName UIAutomationTypes  -ErrorAction SilentlyContinue
+
+# ---------- session model ----------
+$script:StatusMeta = @{
+    'attention' = @{ Rank = 0; Color = '#FF6B6B'; Label = 'needs you' }
+    'error'     = @{ Rank = 1; Color = '#FF6B6B'; Label = 'failed'    }
+    'working'   = @{ Rank = 2; Color = '#FFB84D'; Label = 'working'   }
+    'idle'      = @{ Rank = 3; Color = '#5ED584'; Label = 'done'      }
+    'quiet'     = @{ Rank = 4; Color = '#8FA0C8'; Label = 'quiet'     }
+}
+
+function Get-StatusMeta([string]$Status) {
+    if ($script:StatusMeta.ContainsKey($Status)) { return $script:StatusMeta[$Status] }
+    return @{ Rank = 4; Color = '#71717A'; Label = $Status }
+}
+
+function Format-Age([datetime]$Ts) {
+    $span = (Get-Date) - $Ts
+    if ($span.TotalSeconds -lt 60) { return 'now' }
+    if ($span.TotalMinutes -lt 60) { return ('{0}m' -f [int][math]::Floor($span.TotalMinutes)) }
+    if ($span.TotalHours -lt 24)   { return ('{0}h' -f [int][math]::Floor($span.TotalHours)) }
+    return ('{0}d' -f [int][math]::Floor($span.TotalDays))
+}
+
+function Get-Sessions {
+    $now = Get-Date
+    $sessions = New-Object System.Collections.ArrayList
+    $files = Get-ChildItem -LiteralPath $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue |
+             Where-Object { $_.LastWriteTime -gt $now.AddDays(-7) }
+    foreach ($f in $files) {
+        $s = $null
+        try { $s = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($null -eq $s) { continue }
+
+        $status = [string]$s.status
+        if ($status -eq 'ended' -or [string]::IsNullOrWhiteSpace($status)) { continue }
+
+        # hide headless agent-team / subagent claudes: they have no tab to
+        # jump to and their parent session is already visible
+        if ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless) { continue }
+
+        # liveness: prefer the recorded agent pid, fall back to file freshness.
+        # (files with no pid are pre-upgrade relics; every live session gains a
+        # pid on its first hook event, so the freshness window can be short)
+        $agentPid = 0
+        if ($null -ne $s.PSObject.Properties['agent_pid']) { $agentPid = [int]$s.agent_pid }
+        if ($agentPid -gt 0) {
+            $p = Get-Process -Id $agentPid -ErrorAction SilentlyContinue
+            if ($null -eq $p -or $p.ProcessName -notmatch $script:AgentProcRegex) { continue }
+        }
+        elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
+
+        $ts = $f.LastWriteTime
+        try {
+            $ts = ([datetime]::Parse([string]$s.timestamp, $null,
+                   [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+        }
+        catch { }
+
+        $name = [string]$s.cwd_name
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = '(unknown)' }
+
+        $msg = [string]$s.message
+        if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) + '...' }
+
+        [void]$sessions.Add([pscustomobject]@{
+            Id       = [string]$s.session_id
+            Provider = [string]$s.provider
+            Status   = $status
+            CwdName  = $name
+            Cwd      = [string]$s.cwd
+            Message  = $msg
+            Ts       = $ts
+            AgentPid = $agentPid
+            Window   = $s.window
+            Rank     = (Get-StatusMeta $status).Rank
+        })
+    }
+
+    # dedupe: one agent process = one session row (newest file wins; covers
+    # /clear and restarted conversations that leave older files behind)
+    $seenPid = @{}
+    $kept = New-Object System.Collections.ArrayList
+    foreach ($s in @($sessions | Sort-Object -Property Ts -Descending)) {
+        if ($s.AgentPid -gt 0) {
+            if ($seenPid.ContainsKey($s.AgentPid)) { continue }
+            $seenPid[$s.AgentPid] = $true
+        }
+        [void]$kept.Add($s)
+    }
+
+    # add live claude processes that have NO usable status file (e.g. sessions
+    # idle since before the hook upgrade): identified via their console title
+    foreach ($u in @(Get-UntrackedSessions -Tracked $kept)) {
+        if (-not $seenPid.ContainsKey([int]$u.AgentPid)) { [void]$kept.Add($u) }
+    }
+
+    # apply user prefs: custom names + pinned-to-top
+    foreach ($s in $kept) {
+        $display = $s.CwdName
+        $pinned = $false
+        $key = Get-PrefKey $s
+        if ($script:Prefs.ContainsKey($key)) {
+            $e = $script:Prefs[$key]
+            if ($null -ne $e.PSObject.Properties['name'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$e.name)) { $display = [string]$e.name }
+            if ($null -ne $e.PSObject.Properties['pinned']) { $pinned = [bool]$e.pinned }
+        }
+        $s | Add-Member -NotePropertyName DisplayName -NotePropertyValue $display -Force
+        $s | Add-Member -NotePropertyName Pinned -NotePropertyValue $pinned -Force
+    }
+
+    return @($kept | Sort-Object -Property @{ Expression = 'Pinned'; Descending = $true },
+                                           Rank,
+                                           @{ Expression = 'Ts'; Descending = $true })
+}
+
+# ---------- prefs (rename / pin) ----------
+$script:Prefs = @{}
+function Load-Prefs {
+    $script:Prefs = @{}
+    try {
+        if (Test-Path -LiteralPath $PrefsPath) {
+            $obj = Get-Content -LiteralPath $PrefsPath -Raw | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) { $script:Prefs[$p.Name] = $p.Value }
+        }
+    }
+    catch { }
+}
+
+function Save-Prefs {
+    try {
+        $out = @{}
+        foreach ($k in $script:Prefs.Keys) { $out[$k] = $script:Prefs[$k] }
+        $out | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $PrefsPath -Encoding UTF8
+    }
+    catch { }
+}
+
+function Get-PrefKey($Sess) {
+    # key by project path so renames/pins survive session restarts in a folder
+    if (-not [string]::IsNullOrWhiteSpace($Sess.Cwd)) { return $Sess.Cwd.ToLowerInvariant() }
+    return ('name:' + $Sess.CwdName.ToLowerInvariant())
+}
+
+function Set-Pref($Sess, [string]$Field, $Value) {
+    $key = Get-PrefKey $Sess
+    $entry = $null
+    if ($script:Prefs.ContainsKey($key)) { $entry = $script:Prefs[$key] }
+    if ($null -eq $entry) { $entry = [pscustomobject]@{ name = ''; pinned = $false } }
+    if ($null -eq $entry.PSObject.Properties['name'])   { $entry | Add-Member -NotePropertyName name   -NotePropertyValue '' }
+    if ($null -eq $entry.PSObject.Properties['pinned']) { $entry | Add-Member -NotePropertyName pinned -NotePropertyValue $false }
+    $entry.$Field = $Value
+    $script:Prefs[$key] = $entry
+    Save-Prefs
+}
+
+# ---------- untracked claude scan ----------
+function Ensure-ConsoleApi {
+    if ("AgentFocus.ConsoleApi" -as [type]) { return $true }
+    $dll = Join-Path $env:LOCALAPPDATA 'AgentFocus\AgentFocusNative.dll'
+    if (Test-Path -LiteralPath $dll) {
+        try { Add-Type -Path $dll -ErrorAction Stop; return $true } catch { }
+    }
+    return $false
+}
+
+$script:UntrackedCache = @()
+$script:UntrackedStamp = [datetime]::MinValue
+function Get-UntrackedSessions {
+    # claude.exe processes with no live status file. Attach to each one's
+    # console, read its title (== its tab title), and match it to a real tab.
+    # Headless helpers/subagents have empty or tab-less titles -> skipped.
+    param($Tracked)
+
+    if (((Get-Date) - $script:UntrackedStamp).TotalSeconds -lt 20) { return $script:UntrackedCache }
+    $script:UntrackedStamp = Get-Date
+
+    $found = New-Object System.Collections.ArrayList
+    try {
+        if (-not (Ensure-ConsoleApi)) { $script:UntrackedCache = @(); return @() }
+
+        $trackedPids = @{}
+        $claimedRids = @{}
+        foreach ($t in @($Tracked)) {
+            if ($t.AgentPid -gt 0) { $trackedPids[[int]$t.AgentPid] = $true }
+            if ($null -ne $t.Window -and $t.Window.PSObject.Properties['tab_runtime_id']) {
+                $r = [string]$t.Window.tab_runtime_id
+                if ($r.Length -gt 0) { $claimedRids[$r] = $true }
+            }
+        }
+
+        $candidates = @()
+        foreach ($procName in $AgentProcNames) {
+            $candidates += @(Get-Process -Name $procName -ErrorAction SilentlyContinue |
+                             Where-Object { -not $trackedPids.ContainsKey($_.Id) })
+        }
+        if ($candidates.Count -eq 0) { $script:UntrackedCache = @(); return @() }
+
+        $tabs = @(Get-AllTerminalTabs)
+        foreach ($c in $candidates) {
+            # NEVER touch a suspended process's console: its console server
+            # can't answer and GetConsoleTitle blocks forever (agent-team
+            # workers are routinely suspended) - this froze the whole HUD
+            $suspended = $true
+            try {
+                foreach ($t in $c.Threads) {
+                    if ($t.ThreadState -ne 'Wait' -or $t.WaitReason -ne 'Suspended') { $suspended = $false; break }
+                }
+            }
+            catch { $suspended = $false }
+            if ($suspended) { continue }
+
+            $title = $null
+            try { $title = [AgentFocus.ConsoleApi]::ReadTitleFrom([uint32]$c.Id) } catch { }
+            if ([string]::IsNullOrWhiteSpace($title)) { continue }
+            $norm = Get-NormalizedTabName $title
+            if ($norm.Length -eq 0) { continue }
+
+            $match = $null
+            foreach ($tb in $tabs) {
+                if ($tb.Norm -eq $norm -and -not $claimedRids.ContainsKey($tb.Rid)) { $match = $tb; break }
+            }
+            if ($null -eq $match) { continue }
+            $claimedRids[$match.Rid] = $true
+
+            $dispName = $norm
+            if ($dispName.Length -gt 34) { $dispName = $dispName.Substring(0, 34) }
+            $ts = Get-Date
+            try { $ts = $c.StartTime } catch { }
+
+            [void]$found.Add([pscustomobject]@{
+                Id       = "untracked-$($c.Id)"
+                Provider = $c.ProcessName.ToLowerInvariant()
+                Status   = 'quiet'
+                CwdName  = $dispName
+                Cwd      = ''
+                Message  = 'untracked session (no hook events since the HUD upgrade) - send it any prompt to fully track it'
+                Ts       = $ts
+                AgentPid = [int]$c.Id
+                Window   = [pscustomobject]@{
+                    hwnd           = [long]$match.Hwnd
+                    tab_runtime_id = $match.Rid
+                    tab_name       = $title
+                    tab_index      = $match.Index
+                    captured_event = 'hud-scan+console'
+                }
+                Rank     = (Get-StatusMeta 'quiet').Rank
+            })
+        }
+    }
+    catch { }
+    $script:UntrackedCache = @($found)
+    return $script:UntrackedCache
+}
+
+# ---------- focusing ----------
+function Get-NormalizedTabName([string]$Name) {
+    if ([string]::IsNullOrWhiteSpace($Name)) { return '' }
+    return (($Name -replace '^[^\p{L}\p{Nd}]+', '').Trim().ToLowerInvariant())
+}
+
+function Get-AllTerminalTabs {
+    $list = New-Object System.Collections.ArrayList
+    foreach ($wt in @(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue)) {
+        $hwnd = $wt.MainWindowHandle
+        if ($hwnd -eq [IntPtr]::Zero) { continue }
+        try {
+            $root = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+            if ($null -eq $root) { continue }
+            $cond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                [System.Windows.Automation.ControlType]::TabItem)
+            $tabs = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            for ($i = 0; $i -lt $tabs.Count; $i++) {
+                $tab = $tabs.Item($i)
+                $rid = ''
+                try { $rid = ($tab.GetRuntimeId() -join '.') } catch { }
+                $tname = ''
+                try { $tname = [string]$tab.Current.Name } catch { }
+                [void]$list.Add([pscustomobject]@{
+                    Hwnd    = $hwnd
+                    Rid     = $rid
+                    Name    = $tname
+                    Norm    = Get-NormalizedTabName $tname
+                    Index   = $i
+                    Element = $tab
+                })
+            }
+        }
+        catch { }
+    }
+    return @($list)
+}
+
+function Invoke-FocusSession($Sess) {
+    $w = $Sess.Window
+    $storedHwnd = [IntPtr]::Zero
+    $rid = ''; $tabName = ''; $tabIndex = -1
+    if ($null -ne $w) {
+        if ($w.PSObject.Properties['hwnd'] -and $w.hwnd) { try { $storedHwnd = [IntPtr][long]$w.hwnd } catch { } }
+        if ($w.PSObject.Properties['tab_runtime_id'])    { $rid = [string]$w.tab_runtime_id }
+        if ($w.PSObject.Properties['tab_name'])          { $tabName = [string]$w.tab_name }
+        if ($w.PSObject.Properties['tab_index'] -and $null -ne $w.tab_index) {
+            try { $tabIndex = [int]$w.tab_index } catch { }
+        }
+    }
+
+    # match against the LIVE tab list; the hook refreshes tab_name on every
+    # event, so a fresh title match outranks a possibly-stale runtime id.
+    $tabs = @(Get-AllTerminalTabs)
+    $target = $null
+    if ($tabs.Count -gt 0) {
+        $want = Get-NormalizedTabName $tabName
+        $byName = @($tabs | Where-Object { $want.Length -gt 0 -and $_.Norm -eq $want })
+        $byRid  = @($tabs | Where-Object { $rid.Length -gt 0 -and $_.Rid -eq $rid })
+        $both   = @($byRid | Where-Object { $_.Norm -eq $want -and $want.Length -gt 0 })
+
+        if     ($both.Count -ge 1)   { $target = $both[0] }
+        elseif ($byName.Count -eq 1) { $target = $byName[0] }
+        elseif ($byRid.Count -ge 1)  { $target = $byRid[0] }
+        elseif ($byName.Count -gt 1) {
+            $inWin = @($byName | Where-Object { $_.Hwnd -eq $storedHwnd })
+            if ($inWin.Count -ge 1) { $target = $inWin[0] } else { $target = $byName[0] }
+        }
+        elseif ($storedHwnd -ne [IntPtr]::Zero -and $tabIndex -ge 0) {
+            $inWin = @($tabs | Where-Object { $_.Hwnd -eq $storedHwnd })
+            if ($tabIndex -lt $inWin.Count) { $target = $inWin[$tabIndex] }
+        }
+    }
+
+    if ($null -ne $target) {
+        try {
+            $pattern = $target.Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            $pattern.Select()
+        }
+        catch { }
+        if ([ClaudeHud.Native]::IsIconic($target.Hwnd)) { [void][ClaudeHud.Native]::ShowWindowAsync($target.Hwnd, 9) }
+        [void][ClaudeHud.Native]::SetForegroundWindow($target.Hwnd)
+        return $true
+    }
+
+    # nothing matched: raise the stored window, but ONLY if it is actually a
+    # terminal (old foreground-captured hints could point at any app, e.g.
+    # Spotify, if the user tab-hopped while the hook fired)
+    if ($storedHwnd -ne [IntPtr]::Zero -and [ClaudeHud.Native]::IsWindow($storedHwnd)) {
+        [uint32]$wpid = 0
+        [void][ClaudeHud.Native]::GetWindowThreadProcessId($storedHwnd, [ref]$wpid)
+        $pname = ''
+        if ($wpid -gt 0) { try { $pname = (Get-Process -Id $wpid -ErrorAction Stop).ProcessName } catch { } }
+        if ($pname -match '^(WindowsTerminal|powershell|pwsh|cmd|conhost|OpenConsole|wsl|ubuntu|Code|wezterm|alacritty|Hyper|mintty)$') {
+            if ([ClaudeHud.Native]::IsIconic($storedHwnd)) { [void][ClaudeHud.Native]::ShowWindowAsync($storedHwnd, 9) }
+            [void][ClaudeHud.Native]::SetForegroundWindow($storedHwnd)
+            return $true
+        }
+    }
+    return $false
+}
+
+# ---------- probe mode (no UI) ----------
+Load-Prefs
+if ($Probe) {
+    # NOTE: the untracked scan detaches this process's console (AttachConsole
+    # dance), which resets std handles and breaks the normal output path.
+    # Grab the stdout writer BEFORE the scan so it binds to the real pipe.
+    $stdout = [Console]::Out
+    $rows = @(Get-Sessions | ForEach-Object {
+        $tab = ''
+        if ($null -ne $_.Window -and $_.Window.PSObject.Properties['tab_name']) { $tab = [string]$_.Window.tab_name }
+        [pscustomobject]@{
+            Name   = $_.DisplayName
+            Pin    = $(if ($_.Pinned) { 'pin' } else { '' })
+            Status = $_.Status
+            Age    = Format-Age $_.Ts
+            Pid    = $_.AgentPid
+            Tab    = $tab
+        }
+    })
+    $text = ($rows | Format-Table -AutoSize | Out-String -Width 200)
+    try { $stdout.Write($text); $stdout.Flush() } catch { }
+    exit 0
+}
+
+# ---------- UI ----------
+if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
+    Start-Process powershell.exe -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA',
+        '-WindowStyle', 'Hidden', '-File', $PSCommandPath) | Out-Null
+    exit 0
+}
+
+# single instance: launching again while one is running just exits, so HUDs
+# can never stack invisibly on top of each other at the same corner
+$script:SingleMutex = New-Object System.Threading.Mutex($false, 'Local\PerchSingleton')
+if (-not $script:SingleMutex.WaitOne(0)) { exit 0 }
+
+Set-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) boot pid=$PID" -ErrorAction SilentlyContinue
+
+Add-Type -AssemblyName PresentationFramework
+Add-Type -AssemblyName PresentationCore
+Add-Type -AssemblyName WindowsBase
+
+# own taskbar identity: without this the taskbar groups the HUD under
+# powershell.exe and shows the PowerShell icon instead of our window icon
+try { [void][ClaudeHud.Native]::SetCurrentProcessExplicitAppUserModelID('Zelipt.Perch') } catch { }
+
+# purge status files older than 7 days
+try {
+    Get-ChildItem -LiteralPath $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+        Remove-Item -Force -Confirm:$false -ErrorAction SilentlyContinue
+}
+catch { }
+
+$xaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Perch" WindowStyle="None" AllowsTransparency="True"
+        Background="Transparent" Topmost="True" ShowInTaskbar="True"
+        ResizeMode="NoResize" SizeToContent="Height" Width="324"
+        ShowActivated="False" FontFamily="Segoe UI"
+        TextOptions.TextRenderingMode="ClearType" UseLayoutRounding="True">
+  <Window.Resources>
+    <Style x:Key="HudIconButton" TargetType="TextBlock">
+      <Setter Property="Foreground" Value="#66666E"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="VerticalAlignment" Value="Center"/>
+      <!-- transparent background makes the WHOLE box (incl. padding) clickable,
+           not just the glyph pixels -->
+      <Setter Property="Background" Value="Transparent"/>
+      <Style.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter Property="Foreground" Value="#DCDCE4"/>
+        </Trigger>
+      </Style.Triggers>
+    </Style>
+    <ControlTemplate x:Key="HudScrollThumb" TargetType="Thumb">
+      <Border x:Name="Bg" CornerRadius="3" Background="#26FFFFFF" Margin="1,2"/>
+      <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+          <Setter TargetName="Bg" Property="Background" Value="#4DFFFFFF"/>
+        </Trigger>
+      </ControlTemplate.Triggers>
+    </ControlTemplate>
+    <ControlTemplate x:Key="HudScrollBtn" TargetType="RepeatButton">
+      <Rectangle Fill="Transparent"/>
+    </ControlTemplate>
+    <Style x:Key="HudMenu" TargetType="ContextMenu">
+      <Setter Property="OverridesDefaultStyle" Value="True"/>
+      <Setter Property="SnapsToDevicePixels" Value="True"/>
+      <Setter Property="HasDropShadow" Value="True"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ContextMenu">
+            <Border CornerRadius="10" Background="#FA1F1F29" BorderBrush="#30FFFFFF"
+                    BorderThickness="1" Padding="5" Margin="0,0,8,8">
+              <Border.Effect>
+                <DropShadowEffect BlurRadius="10" ShadowDepth="2" Opacity="0.5"/>
+              </Border.Effect>
+              <StackPanel IsItemsHost="True"/>
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="HudMenuItem" TargetType="MenuItem">
+      <Setter Property="OverridesDefaultStyle" Value="True"/>
+      <Setter Property="Foreground" Value="#EDEDF2"/>
+      <Setter Property="FontSize" Value="11.5"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Border x:Name="Bg" CornerRadius="7" Background="Transparent" Padding="11,6,26,7" Margin="1">
+              <ContentPresenter ContentSource="Header" RecognizesAccessKey="False" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="Bg" Property="Background" Value="#22FFFFFF"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style TargetType="ScrollBar">
+      <Setter Property="Width" Value="6"/>
+      <Setter Property="MinWidth" Value="6"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ScrollBar">
+            <Grid Background="Transparent">
+              <Track x:Name="PART_Track" IsDirectionReversed="True">
+                <Track.DecreaseRepeatButton>
+                  <RepeatButton Template="{StaticResource HudScrollBtn}"
+                                Command="ScrollBar.PageUpCommand" Focusable="False"/>
+                </Track.DecreaseRepeatButton>
+                <Track.Thumb>
+                  <Thumb Template="{StaticResource HudScrollThumb}"/>
+                </Track.Thumb>
+                <Track.IncreaseRepeatButton>
+                  <RepeatButton Template="{StaticResource HudScrollBtn}"
+                                Command="ScrollBar.PageDownCommand" Focusable="False"/>
+                </Track.IncreaseRepeatButton>
+              </Track>
+            </Grid>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </Window.Resources>
+  <Border x:Name="RootCard" CornerRadius="16" BorderBrush="#24FFFFFF" BorderThickness="1" Margin="12">
+    <Border.Background>
+      <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+        <GradientStop Color="#F71E1E27" Offset="0"/>
+        <GradientStop Color="#F7141419" Offset="1"/>
+      </LinearGradientBrush>
+    </Border.Background>
+    <Border.Effect>
+      <DropShadowEffect BlurRadius="18" ShadowDepth="0" Opacity="0.55"/>
+    </Border.Effect>
+    <StackPanel>
+      <Grid x:Name="Header" Margin="16,11,12,7" Background="Transparent">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*"/>
+          <ColumnDefinition Width="Auto"/>
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
+          <Image x:Name="LogoImg" Width="17" Height="17" Margin="0,0,7,0"
+                 RenderOptions.BitmapScalingMode="HighQuality"/>
+          <TextBlock FontSize="13" FontWeight="SemiBold" Text="Perch"
+                     Foreground="#F4F4F8" VerticalAlignment="Center"/>
+        </StackPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <TextBlock x:Name="PinBtn" Text="&#x1F4CC;" FontSize="11" Padding="5,3"
+                     Style="{StaticResource HudIconButton}" Margin="2,0"
+                     ToolTip="pinned = always on top; unpinned = normal window (attention only flashes the taskbar)"/>
+          <TextBlock x:Name="CloseBtn" Text="&#x2715;" FontSize="12" Padding="5,3"
+                     Style="{StaticResource HudIconButton}" Margin="4,0,2,0"/>
+        </StackPanel>
+      </Grid>
+      <StackPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,8" Background="Transparent"/>
+      <Border Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
+      <ScrollViewer MaxHeight="560" VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled">
+        <StackPanel x:Name="SessionList" Margin="8,2,8,10"/>
+      </ScrollViewer>
+    </StackPanel>
+  </Border>
+</Window>
+"@
+
+$script:Window      = [System.Windows.Markup.XamlReader]::Parse($xaml)
+$script:SessionList = $Window.FindName('SessionList')
+$script:ChipsPanel  = $Window.FindName('ChipsPanel')
+$script:Header      = $Window.FindName('Header')
+$script:PinBtn      = $Window.FindName('PinBtn')
+$script:CloseBtn    = $Window.FindName('CloseBtn')
+$script:RootCard    = $Window.FindName('RootCard')
+$script:Dismissed   = @{}
+$script:PrevAttention = @{}
+$script:UiHold      = 0
+$script:UiHoldStamp = [datetime]::MinValue
+$script:InTick      = $false
+$script:InTickStamp = [datetime]::MinValue
+
+# last safety net: a handler exception must never tear the window down
+$Window.Dispatcher.Add_UnhandledException({
+    param($s, $e)
+    try {
+        "$(Get-Date -Format s)  DISPATCHER: $($e.Exception.Message)" |
+            Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log')
+    }
+    catch { }
+    $e.Handled = $true
+})
+$script:BrushCache  = @{}
+$script:Bc          = New-Object System.Windows.Media.BrushConverter
+$script:Sep         = ' ' + [string][char]0x00B7 + ' '
+$script:Dash        = ' ' + [string][char]0x2014 + ' '
+$script:HudHideAfterFocus = $HideAfterFocus
+
+function Get-Brush([string]$Hex) {
+    if (-not $script:BrushCache.ContainsKey($Hex)) {
+        $b = $script:Bc.ConvertFromString($Hex)
+        $b.Freeze()
+        $script:BrushCache[$Hex] = $b
+    }
+    return $script:BrushCache[$Hex]
+}
+
+function Get-RowBaseBrush($Sess) {
+    if ($Sess.Status -eq 'attention' -or $Sess.Status -eq 'error') { return Get-Brush '#14FF6B6B' }
+    return [System.Windows.Media.Brushes]::Transparent
+}
+
+# window/taskbar icon + header logo
+try {
+    $iconPath = Join-Path $PSScriptRoot 'icon.ico'
+    if (Test-Path -LiteralPath $iconPath) {
+        $Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+            (New-Object System.Uri($iconPath)),
+            [System.Windows.Media.Imaging.BitmapCreateOptions]::None,
+            [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+    }
+    $logoPath = Join-Path $PSScriptRoot 'logo.png'
+    $logoImg = $Window.FindName('LogoImg')
+    if ($null -ne $logoImg -and (Test-Path -LiteralPath $logoPath)) {
+        $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bi.BeginInit()
+        $bi.UriSource = New-Object System.Uri($logoPath)
+        $bi.DecodePixelWidth = 128
+        $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bi.EndInit()
+        $bi.Freeze()
+        $logoImg.Source = $bi
+        $script:LogoSource = $bi
+    }
+}
+catch { }
+
+# restore saved position + pin preference (default: top-right, pinned)
+$script:UserTopmost = $true
+$wa = [System.Windows.SystemParameters]::WorkArea
+$Window.Left = $wa.Right - 324 - 8
+$Window.Top  = $wa.Top + 8
+try {
+    if (Test-Path -LiteralPath $StatePath) {
+        $st = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
+        if ($null -ne $st.PSObject.Properties['Topmost']) {
+            $script:UserTopmost = [bool]$st.Topmost
+            $Window.Topmost = $script:UserTopmost
+        }
+        if ($null -ne $st.Left -and $null -ne $st.Top) {
+            $vl = [System.Windows.SystemParameters]::VirtualScreenLeft
+            $vt = [System.Windows.SystemParameters]::VirtualScreenTop
+            $vw = [System.Windows.SystemParameters]::VirtualScreenWidth
+            $vh = [System.Windows.SystemParameters]::VirtualScreenHeight
+            if ($st.Left -ge ($vl - 50) -and $st.Left -lt ($vl + $vw) -and
+                $st.Top  -ge ($vt - 50) -and $st.Top  -lt ($vt + $vh)) {
+                $Window.Left = [double]$st.Left
+                $Window.Top  = [double]$st.Top
+            }
+        }
+    }
+}
+catch { }
+
+function Show-RenameDialog([string]$Current) {
+    $script:RenameResult = $null
+    $dlg = New-Object System.Windows.Window
+    $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
+    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
+    $dlg.SizeToContent = 'WidthAndHeight'
+    $dlg.WindowStartupLocation = 'CenterOwner'
+    $dlg.Owner = $script:Window
+    $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
+
+    $card = New-Object System.Windows.Controls.Border
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $card.Background = Get-Brush '#F8202029'
+    $card.BorderBrush = Get-Brush '#33FFFFFF'
+    $card.BorderThickness = New-Object System.Windows.Thickness(1)
+    $card.Padding = New-Object System.Windows.Thickness(16, 12, 16, 12)
+
+    $stack = New-Object System.Windows.Controls.StackPanel
+    $stack.Width = 230
+
+    $title = New-Object System.Windows.Controls.TextBlock
+    $title.Text = 'rename session'
+    $title.FontSize = 11
+    $title.Foreground = Get-Brush '#8A8A93'
+    $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+    [void]$stack.Children.Add($title)
+
+    $box = New-Object System.Windows.Controls.TextBox
+    $box.Text = $Current
+    $box.FontSize = 12.5
+    $box.Background = Get-Brush '#14FFFFFF'
+    $box.Foreground = Get-Brush '#F4F4F8'
+    $box.CaretBrush = Get-Brush '#F4F4F8'
+    $box.BorderBrush = Get-Brush '#33FFFFFF'
+    $box.Padding = New-Object System.Windows.Thickness(6, 4, 6, 4)
+    $box.Tag = $dlg
+    $box.Add_KeyDown({
+        param($s, $e)
+        if ($e.Key -eq 'Return') {
+            $script:RenameResult = $s.Text
+            $s.Tag.Close()
+        }
+        elseif ($e.Key -eq 'Escape') {
+            $script:RenameResult = $null
+            $s.Tag.Close()
+        }
+    })
+    [void]$stack.Children.Add($box)
+
+    $hint = New-Object System.Windows.Controls.TextBlock
+    $hint.Text = 'Enter = save   empty = reset   Esc = cancel'
+    $hint.FontSize = 10
+    $hint.Foreground = Get-Brush '#6E6E78'
+    $hint.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
+    [void]$stack.Children.Add($hint)
+
+    $card.Child = $stack
+    $dlg.Content = $card
+    $dlg.Add_ContentRendered({ param($s, $e) $s.Content.Child.Children[1].Focus(); $s.Content.Child.Children[1].SelectAll() })
+    $script:UiHold++
+    $script:UiHoldStamp = Get-Date
+    try { [void]$dlg.ShowDialog() }
+    finally { $script:UiHold = [Math]::Max(0, $script:UiHold - 1) }
+    return $script:RenameResult
+}
+
+function New-RowMenu($Sess) {
+    $menu = New-Object System.Windows.Controls.ContextMenu
+    $menu.Style = $script:Window.FindResource('HudMenu')
+    $menu.Add_Opened({ $script:UiHold++; $script:UiHoldStamp = Get-Date })
+    $menu.Add_Closed({ $script:UiHold = [Math]::Max(0, $script:UiHold - 1) })
+    $miStyle = $script:Window.FindResource('HudMenuItem')
+
+    $miPin = New-Object System.Windows.Controls.MenuItem
+    $miPin.Style = $miStyle
+    $miPin.Header = $(if ($Sess.Pinned) { 'Unpin' } else { 'Pin to top' })
+    $miPin.Tag = $Sess
+    $miPin.Add_Click({
+        param($s, $e)
+        Set-Pref $s.Tag 'pinned' (-not [bool]$s.Tag.Pinned)
+        Update-List -Force
+    })
+    [void]$menu.Items.Add($miPin)
+
+    $miRen = New-Object System.Windows.Controls.MenuItem
+    $miRen.Style = $miStyle
+    $miRen.Header = 'Rename...'
+    $miRen.Tag = $Sess
+    $miRen.Add_Click({
+        param($s, $e)
+        $newName = Show-RenameDialog ([string]$s.Tag.DisplayName)
+        if ($null -ne $newName) {
+            Set-Pref $s.Tag 'name' $newName.Trim()
+            Update-List -Force
+        }
+    })
+    [void]$menu.Items.Add($miRen)
+
+    $miHide = New-Object System.Windows.Controls.MenuItem
+    $miHide.Style = $miStyle
+    $miHide.Header = 'Hide until next change'
+    $miHide.Tag = $Sess
+    $miHide.Add_Click({
+        param($s, $e)
+        $script:Dismissed[$s.Tag.Id] = $s.Tag.Ts
+        Update-List -Force
+    })
+    [void]$menu.Items.Add($miHide)
+
+    return $menu
+}
+
+function Invoke-AttentionRaise {
+    # a session just flipped to "needs you": resurface the HUD (no focus steal)
+    try {
+        $helper = New-Object System.Windows.Interop.WindowInteropHelper($script:Window)
+        if ($script:UserTopmost) {
+            # pinned: make sure the HUD is visible above everything (no focus steal)
+            if ($script:Window.WindowState -ne 'Normal') { $script:Window.WindowState = 'Normal' }
+            $script:Window.Topmost = $true
+            if ($helper.Handle -ne [IntPtr]::Zero) {
+                # HWND_TOPMOST, SWP_NOSIZE|SWP_NOMOVE|SWP_NOACTIVATE
+                [void][ClaudeHud.Native]::SetWindowPos($helper.Handle, [IntPtr](-1), 0, 0, 0, 0, 0x13)
+            }
+        }
+        elseif ($helper.Handle -ne [IntPtr]::Zero) {
+            # unpinned: NEVER jump over the user's windows - flash the taskbar
+            [ClaudeHud.Native]::Flash($helper.Handle, 5)
+        }
+        $eff = $script:RootCard.Effect
+        if ($null -ne $eff) {
+            $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))
+            $ca = New-Object System.Windows.Media.Animation.ColorAnimation(
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'),
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#000000'), $dur)
+            $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
+            $eff.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::ColorProperty, $ca)
+            $oa = New-Object System.Windows.Media.Animation.DoubleAnimation(0.95, 0.55, $dur)
+            $oa.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
+            $eff.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $oa)
+        }
+    }
+    catch { }
+}
+
+function New-Chip([string]$Text, [string]$Hex) {
+    $chip = New-Object System.Windows.Controls.Border
+    $chip.CornerRadius = New-Object System.Windows.CornerRadius(9)
+    $chip.Padding = New-Object System.Windows.Thickness(8, 2, 8, 3)
+    $chip.Margin = New-Object System.Windows.Thickness(0, 0, 6, 0)
+    $chip.Background = Get-Brush ('#22' + $Hex.Substring(1))
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Text
+    $tb.FontSize = 10.5
+    $tb.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $tb.Foreground = Get-Brush $Hex
+    $chip.Child = $tb
+    return $chip
+}
+
+function New-SessionRow($Sess) {
+    $meta = Get-StatusMeta $Sess.Status
+
+    $row = New-Object System.Windows.Controls.Border
+    $row.CornerRadius = New-Object System.Windows.CornerRadius(10)
+    $row.Padding = New-Object System.Windows.Thickness(10, 7, 10, 8)
+    $row.Margin = New-Object System.Windows.Thickness(2, 1, 2, 1)
+    $row.Background = Get-RowBaseBrush $Sess
+    $row.Cursor = [System.Windows.Input.Cursors]::Hand
+    $row.Tag = $Sess
+
+    $grid = New-Object System.Windows.Controls.Grid
+    foreach ($wdef in @('Auto', '*')) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        if ($wdef -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
+        else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
+        [void]$grid.ColumnDefinitions.Add($cd)
+    }
+
+    $dot = New-Object System.Windows.Shapes.Ellipse
+    $dot.Width = 8; $dot.Height = 8
+    $dot.Fill = Get-Brush $meta.Color
+    $dot.Margin = New-Object System.Windows.Thickness(1, 5, 10, 0)
+    $dot.VerticalAlignment = 'Top'
+    $glow = New-Object System.Windows.Media.Effects.DropShadowEffect
+    $glow.BlurRadius = 8
+    $glow.ShadowDepth = 0
+    $glow.Opacity = 0.85
+    $glow.Color = [System.Windows.Media.ColorConverter]::ConvertFromString($meta.Color)
+    $dot.Effect = $glow
+    [System.Windows.Controls.Grid]::SetColumn($dot, 0)
+    [void]$grid.Children.Add($dot)
+    if ($Sess.Status -eq 'working' -or $Sess.Status -eq 'attention') {
+        $anim = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.3,
+            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(850))))
+        $anim.AutoReverse = $true
+        $anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+        $dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+    }
+
+    $mid = New-Object System.Windows.Controls.StackPanel
+    [System.Windows.Controls.Grid]::SetColumn($mid, 1)
+
+    # line 1: project name + age
+    $line1 = New-Object System.Windows.Controls.Grid
+    foreach ($wdef in @('*', 'Auto')) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        if ($wdef -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
+        else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
+        [void]$line1.ColumnDefinitions.Add($cd)
+    }
+    $name = New-Object System.Windows.Controls.TextBlock
+    $name.Text = $(if ($Sess.Pinned) { [char]::ConvertFromUtf32(0x1F4CC) + ' ' + $Sess.DisplayName } else { $Sess.DisplayName })
+    $name.FontSize = 12.5
+    $name.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $name.Foreground = Get-Brush '#F4F4F8'
+    $name.TextTrimming = 'CharacterEllipsis'
+    [System.Windows.Controls.Grid]::SetColumn($name, 0)
+    [void]$line1.Children.Add($name)
+    $age = New-Object System.Windows.Controls.TextBlock
+    $age.Text = Format-Age $Sess.Ts
+    $age.FontSize = 10.5
+    $age.Foreground = Get-Brush '#5F5F6A'
+    $age.VerticalAlignment = 'Center'
+    $age.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+    [System.Windows.Controls.Grid]::SetColumn($age, 1)
+    [void]$line1.Children.Add($age)
+    [void]$mid.Children.Add($line1)
+
+    # line 2: colored status + message snippet
+    $snippet = ($Sess.Message -replace '\s+', ' ').Trim()
+    if ($snippet.Length -gt 70) { $snippet = $snippet.Substring(0, 70) }
+    $label = $meta.Label
+    if ($Sess.Provider -and $Sess.Provider -ne 'claude') { $label = "$($Sess.Provider)$($script:Sep)$label" }
+    $sub = New-Object System.Windows.Controls.TextBlock
+    $sub.FontSize = 10.5
+    $sub.TextTrimming = 'CharacterEllipsis'
+    $sub.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
+    $runStatus = New-Object System.Windows.Documents.Run($label)
+    $runStatus.Foreground = Get-Brush $meta.Color
+    $runStatus.FontWeight = [System.Windows.FontWeights]::SemiBold
+    [void]$sub.Inlines.Add($runStatus)
+    if ($snippet.Length -gt 0) {
+        $runMsg = New-Object System.Windows.Documents.Run("$($script:Dash)$snippet")
+        $runMsg.Foreground = Get-Brush '#8B8B95'
+        [void]$sub.Inlines.Add($runMsg)
+    }
+    [void]$mid.Children.Add($sub)
+    [void]$grid.Children.Add($mid)
+
+    $row.Child = $grid
+
+    $tipTab = ''
+    if ($null -ne $Sess.Window -and $Sess.Window.PSObject.Properties['tab_name']) {
+        $tipTab = [string]$Sess.Window.tab_name
+    }
+    $tipCwd = $Sess.Cwd
+    if ([string]::IsNullOrWhiteSpace($tipCwd)) { $tipCwd = '(untracked - folder unknown)' }
+    $row.ToolTip = "$tipCwd`ntab: $tipTab`n`n$($Sess.Message)`n`nclick = focus$($script:Sep)right-click = pin / rename / hide"
+
+    $row.Add_MouseEnter({
+        param($s, $e)
+        if ($s.Tag.Status -eq 'attention' -or $s.Tag.Status -eq 'error') { $s.Background = Get-Brush '#26FF6B6B' }
+        else { $s.Background = Get-Brush '#12FFFFFF' }
+    })
+    $row.Add_MouseLeave({ param($s, $e) $s.Background = Get-RowBaseBrush $s.Tag })
+    $row.Add_MouseLeftButtonUp({
+        param($s, $e)
+        $ok = Invoke-FocusSession $s.Tag
+        if ($ok -and $script:HudHideAfterFocus) { $script:Window.WindowState = 'Minimized' }
+        if (-not $ok) { $s.Background = Get-Brush '#33FF6B6B' }
+    })
+    $row.ContextMenu = New-RowMenu $Sess
+    return $row
+}
+
+function Update-List {
+    # don't rebuild rows while a context menu or dialog is open, and never
+    # re-enter (nested WPF message pumps can overlap timer ticks and stop
+    # each other's pipelines). -Force is for user actions (pin/rename/hide)
+    # that must reflect IMMEDIATELY even though their menu is mid-close.
+    # BOTH guards are time-limited: a PipelineStoppedException can abort a
+    # tick without running its finally, and a stuck flag froze the HUD once -
+    # stale flags are reclaimed instead of trusted forever.
+    param([switch]$Force)
+    if (-not $Force) {
+        if ($script:UiHold -gt 0) {
+            if (((Get-Date) - $script:UiHoldStamp).TotalSeconds -gt 90) { $script:UiHold = 0 }
+            else { return }
+        }
+        if ($script:InTick -and ((Get-Date) - $script:InTickStamp).TotalSeconds -lt 30) { return }
+    }
+    $script:InTick = $true
+    $script:InTickStamp = Get-Date
+    try {
+
+    $sessions = @(Get-Sessions)
+
+    # drop dismissed rows until their status file changes again
+    $visible = New-Object System.Collections.ArrayList
+    foreach ($s in $sessions) {
+        if ($script:Dismissed.ContainsKey($s.Id)) {
+            if ($s.Ts -le $script:Dismissed[$s.Id]) { continue }
+            $script:Dismissed.Remove($s.Id)
+        }
+        [void]$visible.Add($s)
+    }
+
+    $script:SessionList.Children.Clear()
+    if ($visible.Count -eq 0) {
+        $emptyStack = New-Object System.Windows.Controls.StackPanel
+        $emptyStack.HorizontalAlignment = 'Center'
+        $emptyStack.Margin = New-Object System.Windows.Thickness(0, 14, 0, 14)
+        if ($null -ne $script:LogoSource) {
+            $birdImg = New-Object System.Windows.Controls.Image
+            $birdImg.Source = $script:LogoSource
+            $birdImg.Width = 42; $birdImg.Height = 42
+            $birdImg.Opacity = 0.9
+            $birdImg.HorizontalAlignment = 'Center'
+            $birdImg.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+            [void]$emptyStack.Children.Add($birdImg)
+        }
+        $empty = New-Object System.Windows.Controls.TextBlock
+        $empty.Text = 'all quiet' + $script:Dash.TrimEnd() + ' no live sessions'
+        $empty.FontSize = 11.5
+        $empty.Foreground = Get-Brush '#6E6E78'
+        $empty.HorizontalAlignment = 'Center'
+        [void]$emptyStack.Children.Add($empty)
+        [void]$script:SessionList.Children.Add($emptyStack)
+    }
+    else {
+        foreach ($s in $visible) {
+            [void]$script:SessionList.Children.Add((New-SessionRow $s))
+        }
+    }
+
+    $script:ChipsPanel.Children.Clear()
+    $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
+    $work  = @($visible | Where-Object { $_.Status -eq 'working' }).Count
+    $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
+    $quiet = @($visible | Where-Object { $_.Status -eq 'quiet' }).Count
+    if ($att -gt 0)   { [void]$script:ChipsPanel.Children.Add((New-Chip "$att need you" '#FF6B6B')) }
+    if ($work -gt 0)  { [void]$script:ChipsPanel.Children.Add((New-Chip "$work working" '#FFB84D')) }
+    if ($done -gt 0)  { [void]$script:ChipsPanel.Children.Add((New-Chip "$done done" '#5ED584')) }
+    if ($quiet -gt 0) { [void]$script:ChipsPanel.Children.Add((New-Chip "$quiet quiet" '#8FA0C8')) }
+    if ($script:ChipsPanel.Children.Count -eq 0) {
+        [void]$script:ChipsPanel.Children.Add((New-Chip 'all quiet' '#71717A'))
+    }
+
+    # resurface the HUD when a session NEWLY needs attention
+    $curAtt = @{}
+    foreach ($s in $visible) {
+        if ($s.Status -eq 'attention' -or $s.Status -eq 'error') { $curAtt[$s.Id] = $true }
+    }
+    $hasNew = $false
+    foreach ($k in $curAtt.Keys) {
+        if (-not $script:PrevAttention.ContainsKey($k)) { $hasNew = $true; break }
+    }
+    if ($hasNew) { Invoke-AttentionRaise }
+    $script:PrevAttention = $curAtt
+
+    }
+    catch { }
+    finally { $script:InTick = $false }
+}
+
+# the pin/close buttons must swallow mouse-down BEFORE it bubbles to the
+# header, otherwise DragMove() starts a window drag and eats their click
+$PinBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$CloseBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$Header.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
+$ChipsPanel.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
+function Save-HudState {
+    try {
+        @{ Left = $script:Window.Left; Top = $script:Window.Top; Topmost = $script:UserTopmost } |
+            ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
+    }
+    catch { }
+}
+
+$CloseBtn.Add_MouseLeftButtonUp({ $script:Window.Close() })
+$PinBtn.Add_MouseLeftButtonUp({
+    $script:UserTopmost = -not $script:UserTopmost
+    $script:Window.Topmost = $script:UserTopmost
+    if ($script:UserTopmost) { $script:PinBtn.Opacity = 1.0 } else { $script:PinBtn.Opacity = 0.35 }
+    Save-HudState
+})
+if (-not $script:UserTopmost) { $PinBtn.Opacity = 0.35 }
+
+$Window.Add_Closing({ Save-HudState })
+
+$timer = New-Object System.Windows.Threading.DispatcherTimer
+$timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
+$timer.Add_Tick({ Update-List })
+$timer.Start()
+
+# defer the first untracked-process scan: the window must be visible before
+# any potentially slow console probing happens
+$script:UntrackedStamp = Get-Date
+
+Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) first-update" -ErrorAction SilentlyContinue
+Update-List
+Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) showdialog" -ErrorAction SilentlyContinue
+[void]$Window.ShowDialog()

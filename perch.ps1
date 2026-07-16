@@ -79,6 +79,13 @@ namespace ClaudeHud {
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lParam);
         [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder sb, int count);
+
+        public static string GetTitle(IntPtr hWnd) {
+            var sb = new System.Text.StringBuilder(512);
+            GetWindowText(hWnd, sb, sb.Capacity);
+            return sb.ToString();
+        }
 
         // ALL visible top-level windows of a process. Windows Terminal hosts
         // every window in ONE process, so Process.MainWindowHandle misses all
@@ -223,10 +230,30 @@ function Get-Sessions {
         [void]$kept.Add($s)
     }
 
-    # add live claude processes that have NO usable status file (e.g. sessions
-    # idle since before the hook upgrade): identified via their console title
+    # add live agent processes that have NO usable status file (sessions from
+    # before the hooks, codex, gemini, ...): identified via console titles
     foreach ($u in @(Get-UntrackedSessions -Tracked $kept)) {
-        if (-not $seenPid.ContainsKey([int]$u.AgentPid)) { [void]$kept.Add($u) }
+        if ($seenPid.ContainsKey([int]$u.AgentPid)) { continue }
+
+        # LIVE status from the current tab/window title (untracked agents have
+        # no hooks, but a leading spinner glyph in the title means working)
+        $liveName = ''
+        $urid = [string]$u.Window.tab_runtime_id
+        if ($urid.Length -gt 0) {
+            foreach ($tb in @(Get-AllTerminalTabs)) {
+                if ($tb.Rid -eq $urid) { $liveName = [string]$tb.Name; break }
+            }
+        }
+        elseif ([long]$u.Window.hwnd -gt 0) {
+            try { $liveName = [ClaudeHud.Windows]::GetTitle([IntPtr][long]$u.Window.hwnd) } catch { }
+        }
+        if ($liveName.Length -gt 0) {
+            $u.Window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveName -Force
+            $inferred = Get-InferredAgentStatus $liveName
+            $u | Add-Member -NotePropertyName Status -NotePropertyValue $inferred -Force
+            $u | Add-Member -NotePropertyName Rank -NotePropertyValue ((Get-StatusMeta $inferred).Rank) -Force
+        }
+        [void]$kept.Add($u)
     }
 
     # apply user prefs: custom names + pinned-to-top
@@ -331,8 +358,9 @@ function Start-ConsoleProbe {
     try { return [System.Diagnostics.Process]::Start($psi) } catch { return $null }
 }
 
-function Read-ConsoleTitleBounded {
-    # returns the console title of a process, or $null - never blocks > ~2.5s
+function Read-ConsoleInfoBounded {
+    # returns @{ Title; ConsoleHwnd } of a process's console, or $null.
+    # Never blocks longer than ~2.5s (probe child gets killed).
     param([int]$TargetPid)
 
     $p = Start-ConsoleProbe -TargetPid $TargetPid
@@ -343,7 +371,11 @@ function Read-ConsoleTitleBounded {
             return $null
         }
         if ($p.ExitCode -ne 0) { return $null }
-        return $p.StandardOutput.ReadLine()
+        $title = $p.StandardOutput.ReadLine()
+        [long]$hwnd = 0
+        $hwndLine = $p.StandardOutput.ReadLine()
+        if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
+        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd }
     }
     catch { return $null }
     finally { try { $p.Dispose() } catch { } }
@@ -374,13 +406,23 @@ function Resolve-TabByMarker {
 }
 
 $script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance runs once per process)
+$script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain conhost windows, no WT tab)
 $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
-$script:ProbeBudget = 2         # console probes allowed this tick (reset in Update-List)
+$script:ProbeBudget = 4         # console probes allowed this tick (reset in Update-List)
+
+function Get-InferredAgentStatus([string]$LiveName) {
+    # untracked agents have no hooks, but their console/tab title tells the
+    # story: a leading braille spinner glyph (u2800-u28FF) means WORKING
+    if ([string]::IsNullOrWhiteSpace($LiveName)) { return 'quiet' }
+    $c = [int][char]$LiveName[0]
+    if ($c -ge 0x2800 -and $c -le 0x28FF) { return 'working' }
+    return 'quiet'
+}
 
 function Resolve-TabForPid {
-    # Map an agent process to its WT tab: cached rid -> unique title match ->
-    # marker dance. Negative results are cached 5 min so truly headless
-    # processes don't cost a dance on every refresh tick.
+    # Map an agent process to its WT tab (cached rid -> unique title match ->
+    # marker dance) OR, for agents in a plain console window with no WT tab,
+    # to that window itself (Rid = ''). Negative results cached 5 min.
     param([int]$TargetPid, $Proc)
 
     $tabs = @(Get-AllTerminalTabs)
@@ -389,6 +431,15 @@ function Resolve-TabForPid {
         $rid = [string]$script:UntrackedTabMap[$TargetPid]
         foreach ($tb in $tabs) { if ($tb.Rid -eq $rid) { return $tb } }
         [void]$script:UntrackedTabMap.Remove($TargetPid)
+    }
+    if ($script:WinOnlyMap.ContainsKey($TargetPid)) {
+        $h = [IntPtr][long]$script:WinOnlyMap[$TargetPid]
+        if ([ClaudeHud.Native]::IsWindow($h)) {
+            $name = ''
+            try { $name = [ClaudeHud.Windows]::GetTitle($h) } catch { }
+            return [pscustomobject]@{ Hwnd = $h; Rid = ''; Name = $name; Norm = (Get-NormalizedTabName $name); Index = -1; Element = $null }
+        }
+        [void]$script:WinOnlyMap.Remove($TargetPid)
     }
     if ($script:NoTabStamp.ContainsKey($TargetPid)) {
         if (((Get-Date) - $script:NoTabStamp[$TargetPid]).TotalSeconds -lt 300) { return $null }
@@ -401,15 +452,24 @@ function Resolve-TabForPid {
     if ($script:ProbeBudget -le 0) { return $null }
     $script:ProbeBudget--
 
-    $title = Read-ConsoleTitleBounded -TargetPid $TargetPid
+    $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
     $match = $null
-    if (-not [string]::IsNullOrWhiteSpace($title)) {
-        $norm = Get-NormalizedTabName $title
+    if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.Title)) {
+        $norm = Get-NormalizedTabName $info.Title
         $byName = @($tabs | Where-Object { $_.Norm -eq $norm })
         if ($byName.Count -eq 1) { $match = $byName[0] }
         elseif ($byName.Count -gt 1) { $match = Resolve-TabByMarker -TargetPid $TargetPid }
     }
-    if ($null -ne $match) { $script:UntrackedTabMap[$TargetPid] = $match.Rid }
+    if ($null -eq $match -and $null -ne $info -and $info.ConsoleHwnd -gt 0) {
+        # no WT tab anywhere, but the console has its own visible window
+        # (plain conhost / legacy console) - track the window itself
+        $h = [IntPtr][long]$info.ConsoleHwnd
+        $script:WinOnlyMap[$TargetPid] = [long]$info.ConsoleHwnd
+        $match = [pscustomobject]@{ Hwnd = $h; Rid = ''; Name = [string]$info.Title; Norm = (Get-NormalizedTabName $info.Title); Index = -1; Element = $null }
+    }
+    if ($null -ne $match) {
+        if ($match.Rid.Length -gt 0) { $script:UntrackedTabMap[$TargetPid] = $match.Rid }
+    }
     else { $script:NoTabStamp[$TargetPid] = Get-Date }
     return $match
 }
@@ -442,17 +502,10 @@ function Get-UntrackedSessions {
             }
         }
 
-        # path a: by process name
+        # path a: interpreter-hosted agents, detected via command line - these
+        # come FIRST because they are the real TUI (codex.exe is a consoleless
+        # launcher whose node child owns the session)
         $candidates = New-Object System.Collections.ArrayList
-        foreach ($procName in $AgentProcNames) {
-            foreach ($p in @(Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
-                if (-not $trackedPids.ContainsKey($p.Id)) {
-                    [void]$candidates.Add(@{ Proc = $p; Provider = $procName.ToLowerInvariant() })
-                }
-            }
-        }
-
-        # path b: interpreter-hosted agents, detected via command line
         $namePattern = ($AgentProcNames | ForEach-Object { [regex]::Escape($_) }) -join '|'
         $cmdRegex = "[\\/@]($namePattern)[\\/. ]"
         try {
@@ -470,16 +523,34 @@ function Get-UntrackedSessions {
         }
         catch { }
 
+        # path b: by process name
+        foreach ($procName in $AgentProcNames) {
+            foreach ($p in @(Get-Process -Name $procName -ErrorAction SilentlyContinue)) {
+                if (-not $trackedPids.ContainsKey($p.Id)) {
+                    [void]$candidates.Add(@{ Proc = $p; Provider = $procName.ToLowerInvariant() })
+                }
+            }
+        }
+
         if ($candidates.Count -eq 0) { $script:UntrackedCache = @(); return @() }
 
+        $claimedHwnds = @{}
         foreach ($cand in $candidates) {
             $c = $cand.Proc
             $match = Resolve-TabForPid -TargetPid $c.Id -Proc $c
             if ($null -eq $match) { continue }
-            # a tab already claimed by a tracked session or another candidate
-            # (codex.exe launcher + its node child share one console) = skip
-            if ($claimedRids.ContainsKey($match.Rid)) { continue }
-            $claimedRids[$match.Rid] = $true
+            # a tab/window already claimed by a tracked session or another
+            # candidate (codex.exe launcher + its node child share ONE
+            # console) = skip the duplicate
+            if ($match.Rid.Length -gt 0) {
+                if ($claimedRids.ContainsKey($match.Rid)) { continue }
+                $claimedRids[$match.Rid] = $true
+            }
+            else {
+                $hkey = [string][long]$match.Hwnd
+                if ($claimedHwnds.ContainsKey($hkey)) { continue }
+                $claimedHwnds[$hkey] = $true
+            }
 
             $dispName = Get-NormalizedTabName $match.Name
             if ($dispName.Length -eq 0) { $dispName = "$($cand.Provider) session" }
@@ -1527,7 +1598,7 @@ function Update-List {
     }
     $script:InTick = $true
     $script:InTickStamp = Get-Date
-    $script:ProbeBudget = 2
+    $script:ProbeBudget = 4
     try {
 
     $sessions = @(Get-Sessions)

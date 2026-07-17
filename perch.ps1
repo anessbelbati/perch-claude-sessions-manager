@@ -1343,9 +1343,9 @@ $xaml = @"
     <Border x:Name="GlassDome" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
       <Border.Background>
         <RadialGradientBrush Center="0.32,-0.28" GradientOrigin="0.32,-0.28" RadiusX="1.15" RadiusY="0.85">
-          <GradientStop Color="#61FFFFFF" Offset="0"/>
-          <GradientStop Color="#26FFFFFF" Offset="0.4"/>
-          <GradientStop Color="#0AFFFFFF" Offset="0.7"/>
+          <GradientStop Color="#80FFFFFF" Offset="0"/>
+          <GradientStop Color="#30FFFFFF" Offset="0.4"/>
+          <GradientStop Color="#0EFFFFFF" Offset="0.7"/>
           <GradientStop Color="#00FFFFFF" Offset="1"/>
         </RadialGradientBrush>
       </Border.Background>
@@ -1355,13 +1355,13 @@ $xaml = @"
         <LinearGradientBrush StartPoint="0,0" EndPoint="1,0.85">
           <GradientStop Color="#00FFFFFF" Offset="0"/>
           <GradientStop Color="#00FFFFFF" Offset="0.28"/>
-          <GradientStop Color="#12FFFFFF" Offset="0.36"/>
-          <GradientStop Color="#03FFFFFF" Offset="0.44"/>
+          <GradientStop Color="#1CFFFFFF" Offset="0.36"/>
+          <GradientStop Color="#05FFFFFF" Offset="0.44"/>
           <GradientStop Color="#00FFFFFF" Offset="0.52"/>
-          <GradientStop Color="#0BFFFFFF" Offset="0.58"/>
+          <GradientStop Color="#12FFFFFF" Offset="0.58"/>
           <GradientStop Color="#00FFFFFF" Offset="0.66"/>
           <GradientStop Color="#00FFFFFF" Offset="0.90"/>
-          <GradientStop Color="#08FFFFFF" Offset="1"/>
+          <GradientStop Color="#0DFFFFFF" Offset="1"/>
         </LinearGradientBrush>
       </Border.Background>
     </Border>
@@ -1403,23 +1403,23 @@ $xaml = @"
             IsHitTestVisible="False" Visibility="Collapsed">
       <Border.BorderBrush>
         <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
-          <GradientStop Color="#73FFFFFF" Offset="0"/>
-          <GradientStop Color="#17FFFFFF" Offset="0.12"/>
+          <GradientStop Color="#96FFFFFF" Offset="0"/>
+          <GradientStop Color="#1FFFFFFF" Offset="0.12"/>
           <GradientStop Color="#00FFFFFF" Offset="0.45"/>
           <GradientStop Color="#00FFFFFF" Offset="0.85"/>
-          <GradientStop Color="#1CFFFFFF" Offset="1"/>
+          <GradientStop Color="#26FFFFFF" Offset="1"/>
         </LinearGradientBrush>
       </Border.BorderBrush>
     </Border>
-    <Border x:Name="GlassRim" CornerRadius="9" BorderThickness="1.2"
+    <Border x:Name="GlassRim" CornerRadius="9" BorderThickness="1.3"
             IsHitTestVisible="False" Visibility="Collapsed">
       <Border.BorderBrush>
         <LinearGradientBrush StartPoint="0.15,0" EndPoint="0.85,1">
-          <GradientStop Color="#D9FFFFFF" Offset="0"/>
-          <GradientStop Color="#4DFFFFFF" Offset="0.18"/>
-          <GradientStop Color="#1AFFFFFF" Offset="0.5"/>
-          <GradientStop Color="#30FFFFFF" Offset="0.82"/>
-          <GradientStop Color="#73FFFFFF" Offset="1"/>
+          <GradientStop Color="#F5FFFFFF" Offset="0"/>
+          <GradientStop Color="#59FFFFFF" Offset="0.18"/>
+          <GradientStop Color="#24FFFFFF" Offset="0.5"/>
+          <GradientStop Color="#3DFFFFFF" Offset="0.82"/>
+          <GradientStop Color="#8CFFFFFF" Offset="1"/>
         </LinearGradientBrush>
       </Border.BorderBrush>
     </Border>
@@ -1526,9 +1526,10 @@ function Set-GlassBackdrop([bool]$On) {
         if ($h -eq [IntPtr]::Zero) { return }
         if ($On) {
             [ClaudeHud.Glass]::SetRoundCorners($h, $true)
-            # tint is ABGR: ~29% warm near-black. LOW alpha on purpose - the
-            # point is glass you can see through, not fogged plexiglass
-            [ClaudeHud.Glass]::SetAcrylic($h, $true, 0x4A16120E)
+            # tint is ABGR: ~18% warm near-black. As LOW as readability
+            # allows - the more of the world shows through, the more it
+            # reads as actual glass instead of fogged plexiglass
+            [ClaudeHud.Glass]::SetAcrylic($h, $true, 0x2E14100D)
         }
         else {
             [ClaudeHud.Glass]::SetAcrylic($h, $false, 0)
@@ -1554,7 +1555,7 @@ function Apply-Theme {
         $film = New-Object System.Windows.Media.LinearGradientBrush
         $film.StartPoint = New-Object System.Windows.Point(0, 0)
         $film.EndPoint = New-Object System.Windows.Point(0, 1)
-        foreach ($stop in @(@('#17FFFFFF', 0.0), @('#05FFFFFF', 0.55), @('#1F000000', 1.0))) {
+        foreach ($stop in @(@('#1FFFFFFF', 0.0), @('#06FFFFFF', 0.5), @('#12000000', 1.0))) {
             [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
                 [System.Windows.Media.ColorConverter]::ConvertFromString($stop[0]), [double]$stop[1])))
         }

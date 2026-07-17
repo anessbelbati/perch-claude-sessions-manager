@@ -42,6 +42,7 @@ $HideAfterFocus = $false
 $AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
 $script:ChirpOn = $false
 $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
+$script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
 $script:ShowTimers = $true
 $script:ThemeName = 'midnight'   # 'midnight' (classic dark) or 'glass' (liquid acrylic)
 $script:AcctDisclaimerOk = $false
@@ -53,6 +54,7 @@ try {
         if ($null -ne $cfg.PSObject.Properties['HideAfterFocus']) { $HideAfterFocus = [bool]$cfg.HideAfterFocus }
         if ($null -ne $cfg.PSObject.Properties['ChirpOnAttention']) { $script:ChirpOn = [bool]$cfg.ChirpOnAttention }
         if ($null -ne $cfg.PSObject.Properties['ChirpVolume']) { $script:ChirpVolume = [int]$cfg.ChirpVolume }
+        if ($null -ne $cfg.PSObject.Properties['ParkAfterMinutes']) { $script:ParkMinutes = [int]$cfg.ParkAfterMinutes }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($null -ne $cfg.PSObject.Properties['ThemeName']) { $script:ThemeName = [string]$cfg.ThemeName }
         if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
@@ -183,12 +185,13 @@ $script:StatusMeta = @{
     'working'    = @{ Rank = 2; Color = '#FFB84D'; Label = 'working'    }
     'compacting' = @{ Rank = 2; Color = '#B48EF0'; Label = 'compacting' }
     'idle'       = @{ Rank = 3; Color = '#5ED584'; Label = 'done'       }
-    'quiet'      = @{ Rank = 4; Color = '#8FA0C8'; Label = 'quiet'      }
+    'parked'     = @{ Rank = 4; Color = '#9A7B85'; Label = 'parked'     }
+    'quiet'      = @{ Rank = 5; Color = '#8FA0C8'; Label = 'quiet'      }
 }
 
 function Get-StatusMeta([string]$Status) {
     if ($script:StatusMeta.ContainsKey($Status)) { return $script:StatusMeta[$Status] }
-    return @{ Rank = 4; Color = '#71717A'; Label = $Status }
+    return @{ Rank = 5; Color = '#71717A'; Label = $Status }
 }
 
 function Format-Age([datetime]$Ts) {
@@ -441,6 +444,23 @@ function Get-Sessions {
     $script:BusyVerifyQueue = $queue
     try { Invoke-BusyVerify } catch { }
 
+    # a needs-you left hanging past N minutes isn't urgent anymore - you saw
+    # it, you moved on. Demote it to PARKED: muted, below 'done', no pulse,
+    # no chirp - fresh reds keep meaning fresh. A NEW notification (newer
+    # status write) restarts the clock and brings the red back.
+    if ($script:ParkMinutes -gt 0) {
+        foreach ($s in $kept) {
+            $sid = [string]$s.Id
+            if ($s.Status -ne 'attention') { [void]$script:AttnSince.Remove($sid); continue }
+            $seed = $script:AttnSince[$sid]
+            if ($null -eq $seed -or $s.Ts -gt $seed) { $seed = $s.Ts; $script:AttnSince[$sid] = $seed }
+            if (((Get-Date) - $seed).TotalMinutes -ge $script:ParkMinutes) {
+                $s.Status = 'parked'
+                $s.Rank   = (Get-StatusMeta 'parked').Rank
+            }
+        }
+    }
+
     # apply user prefs: custom names + pinned-to-top
     foreach ($s in $kept) {
         $display = $s.CwdName
@@ -635,6 +655,7 @@ $script:BusyPids = @{}          # pids of WORKING sessions - background probing 
 $script:BusyVerify = @{}        # pid -> {FileTs; Stamp; Wait; Misses}: stale-busy verification state
 $script:BusyOverride = @{}      # pid -> {Status; FileTs}: screen-proven correction of a stuck status
 $script:BusyVerifyQueue = @()   # busy rows eligible for verification, rebuilt every tick
+$script:AttnSince = @{}         # session id -> when it started needing you (parked-demotion clock)
 $script:UntrackedPids = @{}     # pids currently shown as untracked rows (screen-state detection)
 $script:FileCache = @{}         # status file path -> {LWT; Skip|Obj} (parse only what changed)
 $script:ProcSnapshot = @{}      # pid -> Process, refreshed at most every 4s
@@ -2465,7 +2486,7 @@ function Update-AccountsPanel {
     [void]$script:AcctPanel.Children.Add($add)
 }
 
-function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
+function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '') {
     if ($Theme -in @('midnight', 'oled', 'glass') -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
         Apply-Theme
@@ -2483,6 +2504,12 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
     $vol = 0
     if ([int]::TryParse($VolumeRaw.Trim(), [ref]$vol) -and $vol -ge 0 -and $vol -le 100) {
         $script:ChirpVolume = $vol
+    }
+
+    $park = 0
+    if ([int]::TryParse($ParkRaw.Trim(), [ref]$park) -and $park -ge 0 -and $park -le 1440) {
+        $script:ParkMinutes = $park
+        if ($park -eq 0) { $script:AttnSince = @{} }   # never park: forget the clocks
     }
 
     $names = @()
@@ -2522,6 +2549,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName HideAfterFocus    -NotePropertyValue $script:HudHideAfterFocus -Force
         $cfg | Add-Member -NotePropertyName ChirpOnAttention  -NotePropertyValue $script:ChirpOn -Force
         $cfg | Add-Member -NotePropertyName ChirpVolume       -NotePropertyValue $script:ChirpVolume -Force
+        $cfg | Add-Member -NotePropertyName ParkAfterMinutes  -NotePropertyValue $script:ParkMinutes -Force
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
@@ -2627,8 +2655,16 @@ function Show-SettingsDialog {
     $inVolume.Width = 64
     $inVolume.HorizontalAlignment = 'Left'
     [void]$colVolume.Children.Add($inVolume)
+    $colPark = New-Object System.Windows.Controls.StackPanel
+    $colPark.Margin = New-Object System.Windows.Thickness(18, 0, 0, 0)
+    [void]$colPark.Children.Add((New-DarkLabel 'park needs-you after (min, 0=never)'))
+    $inPark = New-InputBox ([string]$script:ParkMinutes)
+    $inPark.Width = 64
+    $inPark.HorizontalAlignment = 'Left'
+    [void]$colPark.Children.Add($inPark)
     [void]$numRow.Children.Add($colRefresh)
     [void]$numRow.Children.Add($colVolume)
+    [void]$numRow.Children.Add($colPark)
     [void]$stack.Children.Add($numRow)
 
     [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
@@ -2669,7 +2705,7 @@ function Show-SettingsDialog {
 
     $dlg.Tag = @{
         Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
-        Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child
+        Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child; Park = $inPark.Child
     }
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
@@ -2678,7 +2714,8 @@ function Show-SettingsDialog {
         $c = $s.Tag.Tag
         $script:ThemeSaved = $true
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
-                           ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text)
+                           ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
+                           ([string]$c.Park.Text)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
@@ -3730,7 +3767,7 @@ function Update-List {
     $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
     $work  = @($visible | Where-Object { $_.Status -in @('working', 'compacting', 'retrying') }).Count
     $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
-    $quiet = @($visible | Where-Object { $_.Status -eq 'quiet' }).Count
+    $quiet = @($visible | Where-Object { $_.Status -in @('quiet', 'parked') }).Count
     $chipTexts = @{
         att   = $(if ($att -gt 0) { "$att need you" } else { '' })
         work  = $(if ($work -gt 0) { "$work working" } else { '' })

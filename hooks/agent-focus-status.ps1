@@ -459,6 +459,7 @@ function Get-ConsoleTabHint {
         # kept because it is cheap and correct where it does fire.
         $match = $null
         $capTag = "console"
+        $viaMarker = $false
         $suffix = $SessionId
         if ($suffix.Length -gt 8) { $suffix = $suffix.Substring(0, 8) }
         $marker = "cc-mark-$suffix-$PID"
@@ -470,6 +471,7 @@ function Get-ConsoleTabHint {
             # timeout on SessionStart and lose the status write entirely.
             Start-Sleep -Milliseconds 150
             $match = Find-TerminalTabByName -Name $marker
+            if ($null -ne $match) { $viaMarker = $true }
         }
         catch { $match = $null }
         finally {
@@ -544,8 +546,13 @@ function Get-ConsoleTabHint {
             return [pscustomobject]@{ headless = $isSub }
         }
 
+        # NEVER store the marker as the tab name: when the marker pass matches
+        # (current WT versions DO propagate externally-set titles after all!),
+        # match.tab_name is the transient cc-mark-* text - the tab goes back
+        # to $prevTitle the moment we restore it. Rows were displaying
+        # cc-mark-7514d4e6-16868 as their tab.
         $tabTitle = $prevTitle
-        if ($null -ne $match.PSObject.Properties['tab_name'] -and
+        if (-not $viaMarker -and $null -ne $match.PSObject.Properties['tab_name'] -and
             -not [string]::IsNullOrWhiteSpace([string]$match.tab_name)) {
             $tabTitle = [string]$match.tab_name
         }

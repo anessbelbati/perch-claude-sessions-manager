@@ -41,6 +41,7 @@ $RefreshSeconds = 2
 $HideAfterFocus = $false
 $AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
 $script:ChirpOn = $false
+$script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ShowTimers = $true
 try {
     if (Test-Path -LiteralPath $CfgPath) {
@@ -48,6 +49,7 @@ try {
         if ($cfg.RefreshSeconds) { $RefreshSeconds = [int]$cfg.RefreshSeconds }
         if ($null -ne $cfg.PSObject.Properties['HideAfterFocus']) { $HideAfterFocus = [bool]$cfg.HideAfterFocus }
         if ($null -ne $cfg.PSObject.Properties['ChirpOnAttention']) { $script:ChirpOn = [bool]$cfg.ChirpOnAttention }
+        if ($null -ne $cfg.PSObject.Properties['ChirpVolume']) { $script:ChirpVolume = [int]$cfg.ChirpVolume }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
@@ -1244,6 +1246,9 @@ $xaml = @"
                      Foreground="#F4F4F8" VerticalAlignment="Center"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <TextBlock x:Name="MiniBtn" Text="&#x2013;" FontSize="12" Padding="5,3"
+                     Style="{StaticResource HudIconButton}" Margin="2,0"
+                     ToolTip="compact mode (double-click the header works too)"/>
           <TextBlock x:Name="GearBtn" Text="&#x2699;" FontSize="12" Padding="5,3"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="settings"/>
@@ -1254,9 +1259,9 @@ $xaml = @"
                      Style="{StaticResource HudIconButton}" Margin="4,0,2,0"/>
         </StackPanel>
       </Grid>
-      <StackPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,8" Background="Transparent"/>
-      <Border Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
-      <ScrollViewer MaxHeight="560" VerticalScrollBarVisibility="Auto"
+      <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,8" Background="Transparent"/>
+      <Border x:Name="Divider" Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
+      <ScrollViewer x:Name="RowsScroll" MaxHeight="560" VerticalScrollBarVisibility="Auto"
                     HorizontalScrollBarVisibility="Disabled">
         <StackPanel x:Name="SessionList" Margin="8,2,8,10"/>
       </ScrollViewer>
@@ -1272,6 +1277,9 @@ $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
 $script:GearBtn     = $Window.FindName('GearBtn')
+$script:MiniBtn     = $Window.FindName('MiniBtn')
+$script:Divider     = $Window.FindName('Divider')
+$script:RowsScroll  = $Window.FindName('RowsScroll')
 $script:RootCard    = $Window.FindName('RootCard')
 $script:WorkSince   = @{}
 $script:Dismissed   = @{}
@@ -1336,6 +1344,27 @@ try {
 }
 catch { }
 
+$script:Compact = $false
+function Set-CompactMode([bool]$On) {
+    # compact = a little perch: logo + chips, no session rows. Everything
+    # still lives (chirp, red pulse, taskbar flash) - it just takes no space.
+    $script:Compact = $On
+    if ($On) {
+        $script:RowsScroll.Visibility = 'Collapsed'
+        $script:Divider.Visibility = 'Collapsed'
+        $script:Window.Width = 264
+        $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
+        $script:MiniBtn.ToolTip = 'expand (or double-click the header)'
+    }
+    else {
+        $script:RowsScroll.Visibility = 'Visible'
+        $script:Divider.Visibility = 'Visible'
+        $script:Window.Width = 324
+        $script:MiniBtn.Text = [string][char]0x2013   # minimize glyph
+        $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
+    }
+}
+
 # restore saved position + pin preference (default: top-right, pinned)
 $script:UserTopmost = $true
 $wa = [System.Windows.SystemParameters]::WorkArea
@@ -1347,6 +1376,9 @@ try {
         if ($null -ne $st.PSObject.Properties['Topmost']) {
             $script:UserTopmost = [bool]$st.Topmost
             $Window.Topmost = $script:UserTopmost
+        }
+        if ($null -ne $st.PSObject.Properties['Compact'] -and [bool]$st.Compact) {
+            Set-CompactMode $true
         }
         if ($null -ne $st.Left -and $null -ne $st.Top) {
             $vl = [System.Windows.SystemParameters]::VirtualScreenLeft
@@ -1550,7 +1582,7 @@ function New-DialogButton([string]$Text, [bool]$Primary) {
     return $b
 }
 
-function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$ProcsRaw) {
+function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
     $script:ChirpOn = $Chirp
     $script:ShowTimers = $Timers
     $script:HudHideAfterFocus = $HideAfter
@@ -1559,6 +1591,11 @@ function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool
     if ([int]::TryParse($RefreshRaw.Trim(), [ref]$refresh) -and $refresh -ge 1 -and $refresh -le 60) {
         $script:RefreshSeconds = $refresh
         if ($null -ne $script:Timer) { $script:Timer.Interval = [TimeSpan]::FromSeconds($refresh) }
+    }
+
+    $vol = 0
+    if ([int]::TryParse($VolumeRaw.Trim(), [ref]$vol) -and $vol -ge 0 -and $vol -le 100) {
+        $script:ChirpVolume = $vol
     }
 
     $names = @()
@@ -1597,6 +1634,7 @@ function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool
         $cfg | Add-Member -NotePropertyName RefreshSeconds    -NotePropertyValue $script:RefreshSeconds -Force
         $cfg | Add-Member -NotePropertyName HideAfterFocus    -NotePropertyValue $script:HudHideAfterFocus -Force
         $cfg | Add-Member -NotePropertyName ChirpOnAttention  -NotePropertyValue $script:ChirpOn -Force
+        $cfg | Add-Member -NotePropertyName ChirpVolume       -NotePropertyValue $script:ChirpVolume -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
         $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
@@ -1672,11 +1710,24 @@ function Show-SettingsDialog {
     $sep.Margin = New-Object System.Windows.Thickness(2, 8, 2, 0)
     [void]$stack.Children.Add($sep)
 
-    [void]$stack.Children.Add((New-DarkLabel 'refresh every (seconds)'))
+    $numRow = New-Object System.Windows.Controls.StackPanel
+    $numRow.Orientation = 'Horizontal'
+    $colRefresh = New-Object System.Windows.Controls.StackPanel
+    [void]$colRefresh.Children.Add((New-DarkLabel 'refresh every (seconds)'))
     $inRefresh = New-InputBox ([string]$script:RefreshSeconds)
     $inRefresh.Width = 64
     $inRefresh.HorizontalAlignment = 'Left'
-    [void]$stack.Children.Add($inRefresh)
+    [void]$colRefresh.Children.Add($inRefresh)
+    $colVolume = New-Object System.Windows.Controls.StackPanel
+    $colVolume.Margin = New-Object System.Windows.Thickness(18, 0, 0, 0)
+    [void]$colVolume.Children.Add((New-DarkLabel 'chirp volume (%)'))
+    $inVolume = New-InputBox ([string]$script:ChirpVolume)
+    $inVolume.Width = 64
+    $inVolume.HorizontalAlignment = 'Left'
+    [void]$colVolume.Children.Add($inVolume)
+    [void]$numRow.Children.Add($colRefresh)
+    [void]$numRow.Children.Add($colVolume)
+    [void]$stack.Children.Add($numRow)
 
     [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
     $inProcs = New-InputBox ($script:AgentProcNames -join ', ')
@@ -1698,7 +1749,7 @@ function Show-SettingsDialog {
 
     $dlg.Tag = @{
         Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
-        Refresh = $inRefresh.Child; Procs = $inProcs.Child
+        Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child
     }
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
@@ -1706,7 +1757,7 @@ function Show-SettingsDialog {
         param($s, $e)
         $c = $s.Tag.Tag
         Save-PerchSettings ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
-                           ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Procs.Text)
+                           ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
@@ -1718,9 +1769,29 @@ function Show-SettingsDialog {
     finally { $script:UiHold = [Math]::Max(0, $script:UiHold - 1) }
 }
 
+$script:ChirpPlayer = $null   # one MediaPlayer, reused (has real volume control)
 function Invoke-Chirp {
     if (-not $script:ChirpOn) { return }
+    # a real bird, not a beep: picks a random .wav from sounds/ every time
+    # (drop your own in there; they're not committed - see README). Played
+    # through MediaPlayer because SoundPlayer has NO volume knob and a full-
+    # blast tropical squeak at 2am is a jump scare, not a notification.
     try {
+        $wavs = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'sounds') -Filter '*.wav' -ErrorAction SilentlyContinue)
+        if ($wavs.Count -gt 0) {
+            $pick = $wavs[(Get-Random -Maximum $wavs.Count)]
+            if ($null -eq $script:ChirpPlayer) {
+                $script:ChirpPlayer = New-Object System.Windows.Media.MediaPlayer
+            }
+            $script:ChirpPlayer.Open([Uri]$pick.FullName)
+            $script:ChirpPlayer.Volume = [Math]::Max(0.0, [Math]::Min(1.0, $script:ChirpVolume / 100.0))
+            $script:ChirpPlayer.Play()   # async, never blocks the UI thread
+            return
+        }
+    }
+    catch { }
+    try {
+        # no wavs installed: the trusty old synth chirp
         [Console]::Beep(1568, 70)
         [Console]::Beep(2093, 90)
     }
@@ -2053,12 +2124,29 @@ function Update-List {
 $PinBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $CloseBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $GearBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$script:MiniBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $GearBtn.Add_MouseLeftButtonUp({ Show-SettingsDialog })
-$Header.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
-$ChipsPanel.Add_MouseLeftButtonDown({ try { $script:Window.DragMove() } catch { } })
+$script:MiniBtn.Add_MouseLeftButtonUp({
+    Set-CompactMode (-not $script:Compact)
+    Save-HudState
+})
+# double-click the header or chips row = toggle compact; single click = drag
+$script:HeaderClick = {
+    param($s, $e)
+    if ($e.ClickCount -eq 2) {
+        Set-CompactMode (-not $script:Compact)
+        Save-HudState
+        $e.Handled = $true
+        return
+    }
+    try { $script:Window.DragMove() } catch { }
+}
+$Header.Add_MouseLeftButtonDown($script:HeaderClick)
+$ChipsPanel.Add_MouseLeftButtonDown($script:HeaderClick)
 function Save-HudState {
     try {
-        @{ Left = $script:Window.Left; Top = $script:Window.Top; Topmost = $script:UserTopmost } |
+        @{ Left = $script:Window.Left; Top = $script:Window.Top
+           Topmost = $script:UserTopmost; Compact = $script:Compact } |
             ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
     }
     catch { }

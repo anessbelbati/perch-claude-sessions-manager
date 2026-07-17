@@ -1944,6 +1944,10 @@ $script:Pill5hPct = -1.0
 $script:Pill5hHex = '#5ED584'
 $script:PillPeeked = $false
 $script:AnchorRight = 0.0
+$script:BirdScale = $null       # transforms exist only if the logo loaded
+$script:BirdDozing = $false     # bird leans over asleep when everything's quiet
+$script:PrevDoneCount = 0       # done-count rises -> happy hop
+$script:PillWorkCount = 0       # gates the supervising head-tilt
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 $script:PillBar.Margin = New-Object System.Windows.Thickness(11, 5, 13, 5)
@@ -1973,6 +1977,19 @@ if ($null -ne $script:LogoSource) {
     $pillBird.HorizontalAlignment = 'Center'
     $pillBird.VerticalAlignment = 'Center'
     [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($pillBird, 'HighQuality')
+    # the bird LIVES: scale (perk, squash) + rotate (doze lean, head tilt) +
+    # translate (hop). All render-only, all event-driven moments - no loops,
+    # no idle cost. Origin near the feet so tilts read as LEANING and hops
+    # launch from the ground, not from the belly.
+    $script:BirdScale = New-Object System.Windows.Media.ScaleTransform(1.0, 1.0)
+    $script:BirdRot = New-Object System.Windows.Media.RotateTransform(0.0)
+    $script:BirdShift = New-Object System.Windows.Media.TranslateTransform(0.0, 0.0)
+    $birdTg = New-Object System.Windows.Media.TransformGroup
+    [void]$birdTg.Children.Add($script:BirdScale)
+    [void]$birdTg.Children.Add($script:BirdRot)
+    [void]$birdTg.Children.Add($script:BirdShift)
+    $pillBird.RenderTransform = $birdTg
+    $pillBird.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
     [void]$birdGrid.Children.Add($pillBird)
 }
 [void]$pillRow.Children.Add($birdGrid)
@@ -2050,6 +2067,15 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
     $z = $script:PillCluster['zzz']
     $wantZ = $(if (($Att + $Work + $Done + $Quiet) -eq 0) { 'Visible' } else { 'Collapsed' })
     if ($null -ne $z -and $z.Visibility -ne $wantZ) { $z.Visibility = $wantZ }
+    $script:PillWorkCount = $Work
+    if ($wantZ -eq 'Visible' -and -not $script:BirdDozing) {
+        $script:BirdDozing = $true
+        Invoke-BirdMotion 'doze'
+    }
+    elseif ($wantZ -ne 'Visible' -and $script:BirdDozing) {
+        $script:BirdDozing = $false
+        Invoke-BirdMotion 'wake'
+    }
     if ($script:Compact -and -not $script:PillPeeked) {
         $tip = @()
         if ($Att -gt 0) { $tip += "$Att need you" }
@@ -2060,6 +2086,96 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
     }
+}
+
+function Start-BirdAnim($Target, $Prop, $Anim, [double]$Base) {
+    # every bird motion obeys the HoldEnd law: land on the base value and
+    # RELEASE the property, or held values fight the next motion forever
+    $done = { try { $Target.SetValue($Prop, $Base); $Target.BeginAnimation($Prop, $null) } catch { } }.GetNewClosure()
+    $Anim.Add_Completed($done)
+    $Target.BeginAnimation($Prop, $Anim)
+}
+
+function New-BirdKeyAnim([object[]]$Frames) {
+    # frames: @(value, msFromStart), eased so the motion feels muscular
+    $k = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
+    $ease = New-Object System.Windows.Media.Animation.QuadraticEase
+    $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseInOut
+    foreach ($f in $Frames) {
+        [void]$k.KeyFrames.Add((New-Object System.Windows.Media.Animation.EasingDoubleKeyFrame(
+            [double]$f[0],
+            [System.Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds([int]$f[1])),
+            $ease)))
+    }
+    return $k
+}
+
+function Invoke-BirdMotion([string]$Kind) {
+    # the bird is ALIVE - in moments, not loops. Ephemeral kinds (perk, hop,
+    # tilt, settle) only play when the pill is actually on screen; state
+    # kinds (doze, wake) fall back to setting the resting pose directly so
+    # the bird is already asleep when you fold a quiet HUD into the pill.
+    if ($null -eq $script:BirdScale) { return }
+    try {
+    $vis = ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')
+    $sx = [System.Windows.Media.ScaleTransform]::ScaleXProperty
+    $sy = [System.Windows.Media.ScaleTransform]::ScaleYProperty
+    $ra = [System.Windows.Media.RotateTransform]::AngleProperty
+    $ty = [System.Windows.Media.TranslateTransform]::YProperty
+    switch ($Kind) {
+        'perk' {
+            # something newly needs you: puff up + indignant wiggle
+            if (-not $vis) { return }
+            foreach ($p in @($sx, $sy)) {
+                $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 1.16,
+                    (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(130))))
+                $a.AutoReverse = $true
+                Start-BirdAnim $script:BirdScale $p $a 1.0
+            }
+            Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
+                @(0, 0), @(-9, 110), @(7, 230), @(-3, 320), @(0, 400))) 0.0
+        }
+        'hop' {
+            # work finished: a happy double bounce with a landing squash
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
+                @(0, 0), @(-3.6, 120), @(0, 240), @(-1.4, 330), @(0, 430))) 0.0
+            Start-BirdAnim $script:BirdScale $sy (New-BirdKeyAnim @(
+                @(1.0, 0), @(1.0, 220), @(0.88, 270), @(1.0, 360))) 1.0
+        }
+        'tilt' {
+            # supervising: a slow head-tilt at the work, then back
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
+                @(0, 0), @(6.5, 180), @(6.5, 380), @(0, 560))) 0.0
+        }
+        'settle' {
+            # parked after a drag: a small grounding squash
+            if (-not $vis) { return }
+            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.88,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(110))))
+            $a.AutoReverse = $true
+            Start-BirdAnim $script:BirdScale $sy $a 1.0
+        }
+        'doze' {
+            # everything's quiet: lean over asleep (this pose HOLDS via the
+            # base value, not a held animation)
+            if (-not $vis) { $script:BirdRot.Angle = -10.0; return }
+            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, -10.0,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))))
+            Start-BirdAnim $script:BirdRot $ra $a (-10.0)
+        }
+        'wake' {
+            if (-not $vis) { $script:BirdRot.Angle = 0.0; return }
+            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(-10.0, 0.0,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(240))))
+            Start-BirdAnim $script:BirdRot $ra $a 0.0
+            Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
+                @(0, 240), @(-2.2, 330), @(0, 430))) 0.0
+        }
+    }
+    }
+    catch { }
 }
 
 function Invoke-JumpToAtt {
@@ -2394,6 +2510,17 @@ function Clear-PillAnimations {
         }
         $script:PeekScale.ScaleX = 1.0
         $script:PeekScale.ScaleY = 1.0
+        if ($null -ne $script:BirdScale) {
+            foreach ($bp in @([System.Windows.Media.ScaleTransform]::ScaleXProperty,
+                              [System.Windows.Media.ScaleTransform]::ScaleYProperty)) {
+                $script:BirdScale.BeginAnimation($bp, $null)
+            }
+            $script:BirdScale.ScaleX = 1.0; $script:BirdScale.ScaleY = 1.0
+            $script:BirdRot.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $null)
+            $script:BirdRot.Angle = $(if ($script:BirdDozing) { -10.0 } else { 0.0 })
+            $script:BirdShift.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null)
+            $script:BirdShift.Y = 0.0
+        }
     }
     catch { }
 }
@@ -2434,6 +2561,21 @@ $script:PillCloseTimer.Add_Tick({
     }
     catch { }
 })
+# the supervising head-tilt: while sessions are working, the bird glances
+# at the work every minute or so. One 560ms render-only animation - the
+# cost is nothing, the effect is a coworker
+$script:BirdTiltTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds(52)
+$script:BirdTiltTimer.Add_Tick({
+    try {
+        $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 45 -Maximum 76))
+        if ($script:Compact -and -not $script:BirdDozing -and $script:PillWorkCount -gt 0) {
+            Invoke-BirdMotion 'tilt'
+        }
+    }
+    catch { }
+})
+$script:BirdTiltTimer.Start()
 $script:PillHoverEnter = {
     if ($script:Compact) {
         if (((Get-Date) - $script:PillDragEnd).TotalMilliseconds -lt 400) { return }
@@ -4513,6 +4655,8 @@ function Update-List {
         }
     }
     Update-PillCluster $att $work $done $quiet
+    if ($done -gt $script:PrevDoneCount) { Invoke-BirdMotion 'hop' }   # work finished!
+    $script:PrevDoneCount = $done
 
     # resurface the HUD when a session NEWLY needs attention
     $curAtt = @{}
@@ -4523,7 +4667,10 @@ function Update-List {
     foreach ($k in $curAtt.Keys) {
         if (-not $script:PrevAttention.ContainsKey($k)) { $hasNew = $true; break }
     }
-    if ($hasNew) { Invoke-AttentionRaise }
+    if ($hasNew) {
+        Invoke-AttentionRaise
+        Invoke-BirdMotion 'perk'
+    }
     $script:PrevAttention = $curAtt
 
     }
@@ -4613,6 +4760,7 @@ $Window.Add_MouseMove({
         $script:PillDragEnd = Get-Date
         try { $script:PillPeekTimer.Stop() } catch { }
         Save-HudState   # parked = remembered, even if perch dies uncleanly
+        Invoke-BirdMotion 'settle'
     }
 })
 $Window.Add_MouseLeftButtonUp({

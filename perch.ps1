@@ -2719,16 +2719,28 @@ function Get-OfficialLimits {
         $lims = @()
         if ($null -ne $rl.PSObject.Properties['five_hour'] -and $null -ne $rl.five_hour) {
             $lims += [pscustomobject]@{ label = '5h window'; percent = [double]$rl.five_hour.used_percentage
-                                        severity = 'normal'; resets_at = [string]$rl.five_hour.resets_at }
+                                        severity = 'normal'; resets_at = (ConvertTo-ResetIso $rl.five_hour.resets_at) }
         }
         if ($null -ne $rl.PSObject.Properties['seven_day'] -and $null -ne $rl.seven_day) {
             $lims += [pscustomobject]@{ label = 'week'; percent = [double]$rl.seven_day.used_percentage
-                                        severity = 'normal'; resets_at = [string]$rl.seven_day.resets_at }
+                                        severity = 'normal'; resets_at = (ConvertTo-ResetIso $rl.seven_day.resets_at) }
         }
         if ($lims.Count -gt 0) { return $lims }
     }
     catch { }   # concurrent statusline writers can corrupt a read; next render fixes it
     return $null
+}
+
+function ConvertTo-ResetIso([object]$Value) {
+    # the statusline sends reset times as UNIX EPOCH SECONDS; the oauth
+    # endpoint sends ISO strings. Normalize to ISO so one parser rules all -
+    # unparsed epochs were rendering as broken countdowns on the 5h/week rows
+    $s = [string]$Value
+    [long]$epoch = 0
+    if ([long]::TryParse($s, [ref]$epoch) -and $epoch -gt 1000000000 -and $epoch -lt 100000000000) {
+        return ([System.DateTimeOffset]::FromUnixTimeSeconds($epoch)).UtcDateTime.ToString('o')
+    }
+    return $s
 }
 
 function Update-LimitsPanel {

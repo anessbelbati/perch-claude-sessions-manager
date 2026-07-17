@@ -1685,7 +1685,7 @@ $xaml = @"
   <!-- the resting pill is its OWN tiny card, not a squeezed RootCard: the
        peek morph is a pure crossfade between the two (render-only, no
        per-frame layout, no window-rect animation - THAT was the jank) -->
-  <Border x:Name="PillCard" CornerRadius="23" BorderThickness="1" Margin="8"
+  <Border x:Name="PillCard" CornerRadius="29" BorderThickness="1" Margin="8"
           HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed"/>
   </Grid>
 </Window>
@@ -1950,7 +1950,10 @@ $script:PrevDoneCount = 0       # done-count rises -> happy hop
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
-$script:PillBar.Margin = New-Object System.Windows.Thickness(11, 5, 13, 5)
+# bird-first geometry: left margin 5 puts the ring's center at x=30 - the
+# same center as the capsule's left cap (CR 29), so the bird's ring IS the
+# pill's left end. Everything else orbits him.
+$script:PillBar.Margin = New-Object System.Windows.Thickness(5, 4, 14, 4)
 $script:PillBar.Background = [System.Windows.Media.Brushes]::Transparent
 $script:PillBar.Visibility = 'Collapsed'
 $pillRow = New-Object System.Windows.Controls.StackPanel
@@ -1958,14 +1961,14 @@ $pillRow.Orientation = 'Horizontal'
 $pillRow.VerticalAlignment = 'Center'
 
 $birdGrid = New-Object System.Windows.Controls.Grid
-$birdGrid.Width = 36; $birdGrid.Height = 36
+$birdGrid.Width = 48; $birdGrid.Height = 48
 $script:PillRingTrack = New-Object System.Windows.Shapes.Ellipse
 $script:PillRingTrack.Stroke = Get-Brush '#1EFFFFFF'
-$script:PillRingTrack.StrokeThickness = 2.4
+$script:PillRingTrack.StrokeThickness = 2.8
 [void]$birdGrid.Children.Add($script:PillRingTrack)
 $script:PillRingArc = New-Object System.Windows.Shapes.Path
 $script:PillRingArc.Stroke = Get-Brush '#5ED584'
-$script:PillRingArc.StrokeThickness = 2.4
+$script:PillRingArc.StrokeThickness = 2.8
 $script:PillRingArc.StrokeStartLineCap = 'Round'
 $script:PillRingArc.StrokeEndLineCap = 'Round'
 $script:PillRingArc.Visibility = 'Collapsed'
@@ -1973,7 +1976,7 @@ $script:PillRingArc.Visibility = 'Collapsed'
 if ($null -ne $script:LogoSource) {
     $pillBird = New-Object System.Windows.Controls.Image
     $pillBird.Source = $script:LogoSource
-    $pillBird.Width = 26; $pillBird.Height = 26
+    $pillBird.Width = 38; $pillBird.Height = 38
     $pillBird.HorizontalAlignment = 'Center'
     $pillBird.VerticalAlignment = 'Center'
     [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($pillBird, 'HighQuality')
@@ -2000,7 +2003,7 @@ $pillClusterPanel.VerticalAlignment = 'Center'
 $pillClusterPanel.Margin = New-Object System.Windows.Thickness(9, 0, 0, 0)
 foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED584'))) {
     $t = New-Object System.Windows.Controls.TextBlock
-    $t.FontSize = 12.5
+    $t.FontSize = 13
     $t.FontWeight = [System.Windows.FontWeights]::SemiBold
     $t.Foreground = Get-Brush $cdef[1]
     $t.Margin = New-Object System.Windows.Thickness(0, 0, 7, 0)
@@ -2031,7 +2034,7 @@ foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED58
 }
 $pillZzz = New-Object System.Windows.Controls.TextBlock
 $pillZzz.Text = 'zzz'
-$pillZzz.FontSize = 12
+$pillZzz.FontSize = 13
 $pillZzz.FontStyle = [System.Windows.FontStyles]::Italic
 $pillZzz.Foreground = Get-Brush '#8A8A93'
 $pillZzz.VerticalAlignment = 'Center'
@@ -2139,7 +2142,7 @@ function Invoke-BirdMotion([string]$Kind) {
             # work finished: a happy double bounce with a landing squash
             if (-not $vis) { return }
             Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
-                @(0, 0), @(-3.6, 120), @(0, 240), @(-1.4, 330), @(0, 430))) 0.0
+                @(0, 0), @(-5.0, 120), @(0, 240), @(-2.0, 330), @(0, 430))) 0.0
             Start-BirdAnim $script:BirdScale $sy (New-BirdKeyAnim @(
                 @(1.0, 0), @(1.0, 220), @(0.88, 270), @(1.0, 360))) 1.0
         }
@@ -2148,6 +2151,26 @@ function Invoke-BirdMotion([string]$Kind) {
             if (-not $vis) { return }
             Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
                 @(0, 0), @(6.5, 180), @(6.5, 380), @(0, 560))) 0.0
+        }
+        'bob' {
+            # pecking at the work: two quick dips with a forward lean
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
+                @(0, 0), @(-2.4, 90), @(0.8, 180), @(-2.0, 270), @(0, 380))) 0.0
+            Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
+                @(0, 0), @(4.5, 120), @(4.5, 280), @(0, 400))) 0.0
+        }
+        'greet' {
+            # you hovered: a tiny acknowledging bounce - hi.
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
+                @(0, 0), @(-2.6, 110), @(0, 230))) 0.0
+            foreach ($p in @($sx, $sy)) {
+                $a = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 1.07,
+                    (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(110))))
+                $a.AutoReverse = $true
+                Start-BirdAnim $script:BirdScale $p $a 1.0
+            }
         }
         'settle' {
             # parked after a drag: a small grounding squash
@@ -2158,20 +2181,31 @@ function Invoke-BirdMotion([string]$Kind) {
             Start-BirdAnim $script:BirdScale $sy $a 1.0
         }
         'doze' {
-            # everything's quiet: lean over asleep (this pose HOLDS via the
-            # base value, not a held animation)
+            # everything's quiet: lean over asleep (pose HOLDS via the base
+            # value) and BREATHE - a slow forever scale cycle. The one loop
+            # the perf law tolerates: it only runs when no session is doing
+            # anything, on a ~60px surface. To-only lean = idempotent, so
+            # re-folding a quiet HUD can restart the breath without a snap.
             if (-not $vis) { $script:BirdRot.Angle = -10.0; return }
-            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, -10.0,
+            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(-10.0,
                 (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))))
             Start-BirdAnim $script:BirdRot $ra $a (-10.0)
+            $breath = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 1.035,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(1600))))
+            $breath.AutoReverse = $true
+            $breath.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+            $script:BirdScale.BeginAnimation($sy, $breath)
         }
         'wake' {
+            # stop breathing-in-sleep FIRST, then straighten with a startle hop
+            $script:BirdScale.BeginAnimation($sy, $null)
+            $script:BirdScale.ScaleY = 1.0
             if (-not $vis) { $script:BirdRot.Angle = 0.0; return }
-            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(-10.0, 0.0,
+            $a = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0,
                 (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(240))))
             Start-BirdAnim $script:BirdRot $ra $a 0.0
             Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
-                @(0, 240), @(-2.2, 330), @(0, 430))) 0.0
+                @(0, 240), @(-3.0, 330), @(0, 430))) 0.0
         }
     }
     }
@@ -2210,20 +2244,20 @@ function Update-PillRing {
         return
     }
     $script:PillRingArc.Stroke = Get-Brush $script:Pill5hHex
-    $r = 16.8
+    $r = 22.6
     if ($pct -ge 99.5) {
         # a closed arc is degenerate geometry - full circle gets an ellipse
         $eg = New-Object System.Windows.Media.EllipseGeometry(
-            (New-Object System.Windows.Point(18, 18)), $r, $r)
+            (New-Object System.Windows.Point(24, 24)), $r, $r)
         $eg.Freeze()
         $script:PillRingArc.Data = $eg
     }
     else {
         $ang = [Math]::Max(0.02, $pct / 100.0) * 2.0 * [Math]::PI
         $fig = New-Object System.Windows.Media.PathFigure
-        $fig.StartPoint = New-Object System.Windows.Point(18.0, (18.0 - $r))
+        $fig.StartPoint = New-Object System.Windows.Point(24.0, (24.0 - $r))
         $arc = New-Object System.Windows.Media.ArcSegment(
-            (New-Object System.Windows.Point((18.0 + $r * [Math]::Sin($ang)), (18.0 - $r * [Math]::Cos($ang)))),
+            (New-Object System.Windows.Point((24.0 + $r * [Math]::Sin($ang)), (24.0 - $r * [Math]::Cos($ang)))),
             (New-Object System.Windows.Size($r, $r)),
             0, ($pct -gt 50), 'Clockwise', $true)
         [void]$fig.Segments.Add($arc)
@@ -2384,6 +2418,8 @@ function Set-CompactMode([bool]$On) {
         $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
         $script:MiniBtn.ToolTip = 'expand (or just click the pill)'
+        # folding a quiet HUD: the bird should already be asleep AND breathing
+        if ($script:BirdDozing) { Invoke-BirdMotion 'doze' }
     }
     else {
         $script:PillCard.Visibility = 'Collapsed'
@@ -2472,6 +2508,9 @@ function Set-PillPeek([bool]$On) {
                     $script:RootCard.Visibility = 'Collapsed'   # single hwnd shrink
                     $script:RootCard.Opacity = 1.0
                     $script:RootCard.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                    # Clear-PillAnimations stopped the sleeping breath on peek
+                    # open - if he's still asleep, resume it
+                    if ($script:BirdDozing) { Invoke-BirdMotion 'doze' }
                 }
             }
             catch { }
@@ -2570,15 +2609,23 @@ $script:BirdTiltTimer.Add_Tick({
     try {
         $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 45 -Maximum 76))
         if ($script:Compact -and -not $script:BirdDozing -and $script:PillWorkCount -gt 0) {
-            Invoke-BirdMotion 'tilt'
+            # variety is life: sometimes a head-tilt, sometimes a peck
+            Invoke-BirdMotion $(if ((Get-Random -Minimum 0 -Maximum 2) -eq 0) { 'tilt' } else { 'bob' })
         }
     }
     catch { }
 })
 $script:BirdTiltTimer.Start()
+$script:BirdGreetStamp = [datetime]::MinValue
 $script:PillHoverEnter = {
     if ($script:Compact) {
         if (((Get-Date) - $script:PillDragEnd).TotalMilliseconds -lt 400) { return }
+        # the bird says hi when you come over (unless he's asleep - rude)
+        if (-not $script:PillPeeked -and -not $script:BirdDozing -and
+            ((Get-Date) - $script:BirdGreetStamp).TotalMilliseconds -gt 2200) {
+            $script:BirdGreetStamp = Get-Date
+            Invoke-BirdMotion 'greet'
+        }
         $script:PillCloseTimer.Stop()
         $script:PillPeekTimer.Stop()
         $script:PillPeekTimer.Start()

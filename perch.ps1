@@ -2664,7 +2664,16 @@ function Update-LimitsPanel {
     # network; it only reads the sanitized snapshot the child writes.
     try {
         $now = Get-Date
-        if (($now - $script:UsageFetchStamp).TotalSeconds -gt 180) {
+        # be a polite API citizen: one fetch per 5 minutes (limit windows move
+        # slowly), and when the endpoint looks unreachable (snapshot >30min
+        # stale) back off to 10 - hammering a dead line helps nobody
+        $uProbePath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
+        $cadence = 300
+        if (-not (Test-Path -LiteralPath $uProbePath) -or
+            ([datetime]::UtcNow - (Get-Item -LiteralPath $uProbePath).LastWriteTimeUtc).TotalMinutes -gt 30) {
+            $cadence = 600
+        }
+        if (($now - $script:UsageFetchStamp).TotalSeconds -gt $cadence) {
             $script:UsageFetchStamp = $now
             $probe = Join-Path $PSScriptRoot 'usage-probe.ps1'
             if (Test-Path -LiteralPath $probe) {

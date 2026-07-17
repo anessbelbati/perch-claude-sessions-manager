@@ -1901,6 +1901,154 @@ try {
 }
 catch { }
 
+# ------------------------------------------------------------------ pill --
+# compact mode v2, the dynamic-island treatment: a tiny pill where the bird
+# wears the 5h limit as a RING (green->amber->red arc), next to colored
+# need/work/done counts. Hovering peeks the chips + limit bars in place
+# (the PILLAR/NotchNook interaction people love), double-click expands.
+$script:PillCluster = @{}
+$script:PillRingKey = ''
+$script:Pill5hPct = -1.0
+$script:Pill5hHex = '#5ED584'
+$script:PillPeeked = $false
+$script:AnchorRight = 0.0
+
+$script:PillBar = New-Object System.Windows.Controls.Grid
+$script:PillBar.Margin = New-Object System.Windows.Thickness(11, 5, 13, 5)
+$script:PillBar.Background = [System.Windows.Media.Brushes]::Transparent
+$script:PillBar.Visibility = 'Collapsed'
+$pillRow = New-Object System.Windows.Controls.StackPanel
+$pillRow.Orientation = 'Horizontal'
+$pillRow.VerticalAlignment = 'Center'
+
+$birdGrid = New-Object System.Windows.Controls.Grid
+$birdGrid.Width = 28; $birdGrid.Height = 28
+$script:PillRingTrack = New-Object System.Windows.Shapes.Ellipse
+$script:PillRingTrack.Stroke = Get-Brush '#1EFFFFFF'
+$script:PillRingTrack.StrokeThickness = 2.4
+[void]$birdGrid.Children.Add($script:PillRingTrack)
+$script:PillRingArc = New-Object System.Windows.Shapes.Path
+$script:PillRingArc.Stroke = Get-Brush '#5ED584'
+$script:PillRingArc.StrokeThickness = 2.4
+$script:PillRingArc.StrokeStartLineCap = 'Round'
+$script:PillRingArc.StrokeEndLineCap = 'Round'
+$script:PillRingArc.Visibility = 'Collapsed'
+[void]$birdGrid.Children.Add($script:PillRingArc)
+if ($null -ne $script:LogoSource) {
+    $pillBird = New-Object System.Windows.Controls.Image
+    $pillBird.Source = $script:LogoSource
+    $pillBird.Width = 17; $pillBird.Height = 17
+    $pillBird.HorizontalAlignment = 'Center'
+    $pillBird.VerticalAlignment = 'Center'
+    [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($pillBird, 'HighQuality')
+    [void]$birdGrid.Children.Add($pillBird)
+}
+[void]$pillRow.Children.Add($birdGrid)
+
+$pillClusterPanel = New-Object System.Windows.Controls.StackPanel
+$pillClusterPanel.Orientation = 'Horizontal'
+$pillClusterPanel.VerticalAlignment = 'Center'
+$pillClusterPanel.Margin = New-Object System.Windows.Thickness(9, 0, 0, 0)
+foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED584'))) {
+    $t = New-Object System.Windows.Controls.TextBlock
+    $t.FontSize = 11
+    $t.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $t.Foreground = Get-Brush $cdef[1]
+    $t.Margin = New-Object System.Windows.Thickness(0, 0, 7, 0)
+    $t.Visibility = 'Collapsed'
+    if ($cdef[0] -eq 'att') {
+        # the red count glows - it's the one number the pill exists for
+        $pds = New-Object System.Windows.Media.Effects.DropShadowEffect
+        $pds.BlurRadius = 6; $pds.ShadowDepth = 0; $pds.Opacity = 0.7
+        $pds.Color = [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B')
+        $pds.Freeze()
+        $t.Effect = $pds
+    }
+    $script:PillCluster[$cdef[0]] = $t
+    [void]$pillClusterPanel.Children.Add($t)
+}
+$pillZzz = New-Object System.Windows.Controls.TextBlock
+$pillZzz.Text = 'zzz'
+$pillZzz.FontSize = 10.5
+$pillZzz.FontStyle = [System.Windows.FontStyles]::Italic
+$pillZzz.Foreground = Get-Brush '#8A8A93'
+$pillZzz.VerticalAlignment = 'Center'
+$pillZzz.Margin = New-Object System.Windows.Thickness(1, 0, 2, 0)
+$pillZzz.Visibility = 'Collapsed'
+$script:PillCluster['zzz'] = $pillZzz
+[void]$pillClusterPanel.Children.Add($pillZzz)
+[void]$pillRow.Children.Add($pillClusterPanel)
+[void]$script:PillBar.Children.Add($pillRow)
+try { [void]$script:Header.Parent.Children.Insert(0, $script:PillBar) } catch { }
+
+function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
+    $vals = @{ att = $Att; work = $Work; done = $Done }
+    foreach ($k in @('att', 'work', 'done')) {
+        $t = $script:PillCluster[$k]
+        if ($null -eq $t) { continue }
+        $n = [int]$vals[$k]
+        if ($n -le 0) {
+            if ($t.Visibility -ne 'Collapsed') { $t.Visibility = 'Collapsed' }
+        }
+        else {
+            $txt = [string][char]0x2022 + [string]$n
+            if ($t.Text -ne $txt) { $t.Text = $txt }
+            if ($t.Visibility -ne 'Visible') { $t.Visibility = 'Visible' }
+        }
+    }
+    $z = $script:PillCluster['zzz']
+    $wantZ = $(if (($Att + $Work + $Done + $Quiet) -eq 0) { 'Visible' } else { 'Collapsed' })
+    if ($null -ne $z -and $z.Visibility -ne $wantZ) { $z.Visibility = $wantZ }
+    if ($script:Compact -and -not $script:PillPeeked) {
+        $tip = @()
+        if ($Att -gt 0) { $tip += "$Att need you" }
+        if ($Work -gt 0) { $tip += "$Work working" }
+        if ($Done -gt 0) { $tip += "$Done done" }
+        if ($Quiet -gt 0) { $tip += "$Quiet quiet" }
+        if ($tip.Count -eq 0) { $tip = @('all quiet') }
+        $tipText = ($tip -join $script:Sep) + $script:Dash + 'double-click = full view'
+        if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
+    }
+}
+
+function Update-PillRing {
+    # the bird's halo of consequence: 5h usage as an arc. Rebuilt only when
+    # the rounded pct or color changes - between changes it costs nothing.
+    if ($null -eq $script:PillRingArc) { return }
+    $pct = [double]$script:Pill5hPct
+    $key = ('{0:0}|{1}' -f $pct, $script:Pill5hHex)
+    if ($key -eq $script:PillRingKey) { return }
+    $script:PillRingKey = $key
+    if ($pct -lt 0) {
+        $script:PillRingArc.Visibility = 'Collapsed'
+        return
+    }
+    $script:PillRingArc.Stroke = Get-Brush $script:Pill5hHex
+    $r = 12.8
+    if ($pct -ge 99.5) {
+        # a closed arc is degenerate geometry - full circle gets an ellipse
+        $eg = New-Object System.Windows.Media.EllipseGeometry(
+            (New-Object System.Windows.Point(14, 14)), $r, $r)
+        $eg.Freeze()
+        $script:PillRingArc.Data = $eg
+    }
+    else {
+        $ang = [Math]::Max(0.02, $pct / 100.0) * 2.0 * [Math]::PI
+        $fig = New-Object System.Windows.Media.PathFigure
+        $fig.StartPoint = New-Object System.Windows.Point(14.0, (14.0 - $r))
+        $arc = New-Object System.Windows.Media.ArcSegment(
+            (New-Object System.Windows.Point((14.0 + $r * [Math]::Sin($ang)), (14.0 - $r * [Math]::Cos($ang)))),
+            (New-Object System.Windows.Size($r, $r)),
+            0, ($pct -gt 50), 'Clockwise', $true)
+        [void]$fig.Segments.Add($arc)
+        $geo = New-Object System.Windows.Media.PathGeometry
+        [void]$geo.Figures.Add($fig)
+        $geo.Freeze()
+        $script:PillRingArc.Data = $geo
+    }
+    if ($script:PillRingArc.Visibility -ne 'Visible') { $script:PillRingArc.Visibility = 'Visible' }
+}
+
 function Set-GlassBackdrop([bool]$On) {
     # needs a real hwnd - called again from SourceInitialized for the boot path
     try {
@@ -1993,29 +2141,228 @@ function Apply-Theme {
         }
     }
     catch { }
+    # a theme applied while the pill is up must not un-round the pill
+    if ($script:Compact) { $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(19) }
     Set-GlassBackdrop $glass
 }
 
 $script:Compact = $false
+function Set-PillEdgeAnchor {
+    # island rule: grow AWAY from the screen edge you hug. If the widget
+    # lives on the right half, pin its right edge across the resize; on the
+    # left half, Left already stays put and nothing needs doing.
+    $script:AnchorRight = 0.0
+    if (-not $script:Window.IsLoaded) { return }
+    try {
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $mid = $wa.Left + ($wa.Width / 2.0)
+        if (($script:Window.Left + ($script:Window.ActualWidth / 2.0)) -ge $mid) {
+            $script:AnchorRight = $script:Window.Left + $script:Window.ActualWidth
+        }
+    }
+    catch { }
+}
+
 function Set-CompactMode([bool]$On) {
-    # compact = a little perch: logo + chips, no session rows. Everything
-    # still lives (chirp, red pulse, taskbar flash) - it just takes no space.
+    # compact = THE PILL: the bird wearing its 5h ring + colored counts.
+    # Hover peeks chips + limit bars, double-click expands. Everything
+    # still lives (chirp, red pulse, taskbar flash) - it just takes ~150px.
     $script:Compact = $On
+    Clear-PillAnimations
+    Set-PillEdgeAnchor
     if ($On) {
+        $script:PillPeeked = $false
+        $script:Header.Visibility = 'Collapsed'
+        $script:ChipsPanel.Visibility = 'Collapsed'
+        $script:LimitsPanel.Visibility = 'Collapsed'
         $script:RowsScroll.Visibility = 'Collapsed'
         $script:Divider.Visibility = 'Collapsed'
-        $script:Window.Width = 264
+        $script:PillBar.Visibility = 'Visible'
+        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(19)
+        $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
         $script:MiniBtn.ToolTip = 'expand (or double-click the header)'
     }
     else {
+        $script:PillBar.Visibility = 'Collapsed'
+        $script:Header.Visibility = 'Visible'
+        $script:ChipsPanel.Visibility = 'Visible'
+        $script:LimitsPanel.Visibility = 'Visible'
         $script:RowsScroll.Visibility = 'Visible'
         $script:Divider.Visibility = 'Visible'
+        $script:Window.SizeToContent = 'Height'
         $script:Window.Width = 324
+        Apply-Theme   # restores the theme's own corner radius + backdrop
         $script:MiniBtn.Text = [string][char]0x2013   # minimize glyph
         $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
     }
 }
+
+function Set-PillPeek([bool]$On) {
+    # hover = the island opens in place: chips + limit bars slide in,
+    # session rows stay put (that is what full expand is for).
+    # The open/close is a GLIDE, not a snap: measure the destination size
+    # invisibly, rewind, then run a ~190ms eased one-shot animation on the
+    # window rect. Event-driven and short - the perf audit's enemy was
+    # CONTINUOUS repaints, a 12-frame morph on a 264px window is nothing.
+    if (-not $script:Compact) { return }
+    if ($On -eq $script:PillPeeked) { return }
+    $script:PillPeeked = $On
+    Set-PillEdgeAnchor
+    $w = $script:Window
+    $wProp = [System.Windows.Window]::WidthProperty
+    $hProp = [System.Windows.Window]::HeightProperty
+    $lProp = [System.Windows.Window]::LeftProperty
+
+    # pin the base rect to whatever the eyes currently see (a reversal can
+    # land mid-flight), THEN clear in-flight animations - no snap possible
+    $fromW = $w.ActualWidth; $fromH = $w.ActualHeight; $fromL = $w.Left
+    $w.SizeToContent = 'Manual'
+    $w.Width = $fromW; $w.Height = $fromH
+    foreach ($p in @($wProp, $hProp, $lProp)) { $w.BeginAnimation($p, $null) }
+
+    # measure the destination WITHOUT presenting it: flip the layout state,
+    # force a layout pass, read the answer, rewind - all in this callback,
+    # so no full-size frame ever reaches the screen
+    if ($On) {
+        $script:PillBar.ToolTip = $null   # the open island IS the tooltip
+        $script:ChipsPanel.Visibility = 'Visible'
+        $script:LimitsPanel.Visibility = 'Visible'
+        $script:ChipsPanel.Opacity = 0.0
+        $script:LimitsPanel.Opacity = 0.0
+        $w.SizeToContent = 'Height'
+        $w.Width = 264
+    }
+    else {
+        $script:ChipsPanel.Visibility = 'Collapsed'
+        $script:LimitsPanel.Visibility = 'Collapsed'
+        $w.SizeToContent = 'WidthAndHeight'
+    }
+    $w.UpdateLayout()
+    $toW = $w.ActualWidth; $toH = $w.ActualHeight
+    $w.SizeToContent = 'Manual'
+    $w.Width = $fromW; $w.Height = $fromH
+
+    $anchor = $script:AnchorRight
+    $script:AnchorRight = 0.0   # the glide moves Left itself; keep SizeChanged out of it
+    $toL = $(if ($anchor -gt 0) { $anchor - $toW } else { $fromL })
+    $script:PillAnimFinal = @{ Peek = $On; L = $toL }
+
+    $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(190))
+    $ease = New-Object System.Windows.Media.Animation.CubicEase
+    $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+    $aw = New-Object System.Windows.Media.Animation.DoubleAnimation($fromW, $toW, $dur)
+    $ah = New-Object System.Windows.Media.Animation.DoubleAnimation($fromH, $toH, $dur)
+    $aw.EasingFunction = $ease; $ah.EasingFunction = $ease
+    $aw.Add_Completed({
+        # land exactly, hand the rect back to SizeToContent, drop the anims
+        try {
+            $fin = $script:PillAnimFinal
+            if ($null -eq $fin) { return }
+            $script:PillAnimFinal = $null
+            $script:Window.Left = [double]$fin.L
+            foreach ($p in @([System.Windows.Window]::WidthProperty,
+                             [System.Windows.Window]::HeightProperty,
+                             [System.Windows.Window]::LeftProperty)) {
+                $script:Window.BeginAnimation($p, $null)
+            }
+            if ([bool]$fin.Peek) {
+                $script:Window.SizeToContent = 'Height'
+                $script:Window.Width = 264
+            }
+            else {
+                $script:Window.SizeToContent = 'WidthAndHeight'
+            }
+        }
+        catch { }
+    })
+    $w.BeginAnimation($wProp, $aw)
+    $w.BeginAnimation($hProp, $ah)
+    if ($anchor -gt 0) {
+        $al = New-Object System.Windows.Media.Animation.DoubleAnimation($fromL, $toL, $dur)
+        $al.EasingFunction = $ease
+        $w.BeginAnimation($lProp, $al)
+    }
+    if ($On) {
+        # content breathes in just behind the growing card. The fade must
+        # RELEASE Opacity when done (HoldEnd would forever override the
+        # limits panel's staleness dimming) - completed = clear + base 1
+        $fade = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
+            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(150))))
+        $fade.BeginTime = [TimeSpan]::FromMilliseconds(70)
+        $fade.Add_Completed({
+            try {
+                foreach ($pnl in @($script:ChipsPanel, $script:LimitsPanel)) {
+                    $pnl.Opacity = 1.0
+                    $pnl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                }
+            }
+            catch { }
+        })
+        $script:ChipsPanel.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+        $script:LimitsPanel.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+    }
+}
+
+function Clear-PillAnimations {
+    # a mode change mid-glide must not fight held animations
+    $script:PillAnimFinal = $null
+    try {
+        foreach ($p in @([System.Windows.Window]::WidthProperty,
+                         [System.Windows.Window]::HeightProperty,
+                         [System.Windows.Window]::LeftProperty)) {
+            $script:Window.BeginAnimation($p, $null)
+        }
+        foreach ($pnl in @($script:ChipsPanel, $script:LimitsPanel)) {
+            $pnl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+            $pnl.Opacity = 1.0
+        }
+    }
+    catch { }
+}
+
+# peek opens after a beat (220ms) so drive-by mouse passes don't twitch the
+# pill. Closing is DEBOUNCED too: the open-resize itself fires a spurious
+# MouseLeave mid-layout, and closing on it made the island oscillate
+# open/closed under a perfectly still cursor - the close timer re-checks
+# IsMouseOver after layout settles and only collapses if the mouse is
+# genuinely gone.
+$script:PillPeekTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:PillPeekTimer.Interval = [TimeSpan]::FromMilliseconds(220)
+$script:PillPeekTimer.Add_Tick({
+    $script:PillPeekTimer.Stop()
+    try { if ($script:Compact -and $script:RootCard.IsMouseOver) { Set-PillPeek $true } } catch { }
+})
+$script:PillCloseTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:PillCloseTimer.Interval = [TimeSpan]::FromMilliseconds(260)
+$script:PillCloseTimer.Add_Tick({
+    $script:PillCloseTimer.Stop()
+    try {
+        if ($script:Compact -and -not $script:RootCard.IsMouseOver) { Set-PillPeek $false }
+    }
+    catch { }
+})
+$script:RootCard.Add_MouseEnter({
+    if ($script:Compact) {
+        $script:PillCloseTimer.Stop()
+        $script:PillPeekTimer.Stop()
+        $script:PillPeekTimer.Start()
+    }
+})
+$script:RootCard.Add_MouseLeave({
+    $script:PillPeekTimer.Stop()
+    if ($script:Compact -and $script:PillPeeked) {
+        $script:PillCloseTimer.Stop()
+        $script:PillCloseTimer.Start()
+    }
+})
+$Window.Add_SizeChanged({
+    param($s, $e)
+    if ($script:AnchorRight -gt 0) {
+        try { $script:Window.Left = $script:AnchorRight - $e.NewSize.Width } catch { }
+        $script:AnchorRight = 0.0
+    }
+})
 
 # restore saved position + pin preference (default: top-right, pinned)
 $script:UserTopmost = $true
@@ -3278,6 +3625,8 @@ function Update-LimitsPanel {
             }
         }
         if ($rows.Count -eq 0) {
+            $script:Pill5hPct = -1.0
+            Update-PillRing
             $script:LimitsPanel.Children.Clear()
             # keep the in-terminal statusline honest too: a seeded/stale text
             # would keep claiming numbers we no longer have
@@ -3307,6 +3656,7 @@ function Update-LimitsPanel {
         $script:LimitsRenderStamp = $now
         $script:LimitsPanel.Children.Clear()
         $fetched = $srcStamp
+        $script:Pill5hPct = -1.0   # re-stashed by the 5h row below, if any
 
         foreach ($lim in @($rows)) {
             $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$lim.percent))
@@ -3315,6 +3665,7 @@ function Update-LimitsPanel {
             elseif ($pct -ge 70 -or [string]$lim.severity -match 'warn') { $hex = '#FFB84D' }
 
             $lkey = [string]$lim.label
+            if ($lkey -like '5h*') { $script:Pill5hPct = $pct; $script:Pill5hHex = $hex }
             if ($isNewSample) {
                 if (-not $script:UsageHist.ContainsKey($lkey)) { $script:UsageHist[$lkey] = New-Object System.Collections.ArrayList }
                 $hist = $script:UsageHist[$lkey]
@@ -3425,6 +3776,7 @@ function Update-LimitsPanel {
 
             [void]$script:LimitsPanel.Children.Add($g)
         }
+        Update-PillRing
 
         # staleness in words, not just opacity - a 45% dim was too subtle and
         # old numbers were being read as current
@@ -4033,6 +4385,7 @@ function Update-List {
             if ($chip.Visibility -ne 'Visible') { $chip.Visibility = 'Visible' }
         }
     }
+    Update-PillCluster $att $work $done $quiet
 
     # resurface the HUD when a session NEWLY needs attention
     $curAtt = @{}
@@ -4075,6 +4428,7 @@ $script:HeaderClick = {
 }
 $Header.Add_MouseLeftButtonDown($script:HeaderClick)
 $ChipsPanel.Add_MouseLeftButtonDown($script:HeaderClick)
+$script:PillBar.Add_MouseLeftButtonDown($script:HeaderClick)   # pill: drag or double-click out
 function Save-HudState {
     try {
         @{ Left = $script:Window.Left; Top = $script:Window.Top

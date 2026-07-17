@@ -3283,6 +3283,25 @@ function Update-LimitsPanel {
     catch { }
 }
 
+function Get-PeekDisplayText([string]$T, [int]$Max) {
+    # raw transcript text is hostile to a one-glance tooltip: control chars,
+    # markdown emphasis, box-drawing rules from pasted terminal output, and
+    # blind Substring() that can cut an emoji in half mid-surrogate (the
+    # broken half renders as the classic weird box)
+    if ([string]::IsNullOrWhiteSpace($T)) { return '' }
+    $t = $T -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ''
+    $t = $t -replace '[\u2500-\u259F]+', ' '      # box drawing / block elements
+    $t = $t -replace '```[a-zA-Z]*', ' '          # code fences
+    $t = $t -replace '[`]|\*{1,3}', ''            # backticks / md emphasis
+    $t = ($t -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Max) {
+        $cut = $Max
+        if ([char]::IsHighSurrogate($t[$cut - 1])) { $cut-- }   # never split a pair
+        $t = $t.Substring(0, $cut) + [string][char]0x2026
+    }
+    return $t
+}
+
 $script:PeekCache = @{}   # transcript path -> {LWT; You; Bot} (re-read only on file change)
 function Get-TranscriptPeek([string]$Path) {
     # hover peek: the last thing YOU said and the last thing CLAUDE said,
@@ -3340,8 +3359,8 @@ function Get-TranscriptPeek([string]$Path) {
                 catch { }
             }
         }
-        if ($you.Length -gt 300) { $you = $you.Substring(0, 300) + '...' }
-        if ($bot.Length -gt 420) { $bot = $bot.Substring(0, 420) + '...' }
+        $you = Get-PeekDisplayText $you 300
+        $bot = Get-PeekDisplayText $bot 420
         $res = @{ LWT = $lwt; You = $you; Bot = $bot }
         $script:PeekCache[$Path] = $res
         return $res
@@ -3488,7 +3507,10 @@ function New-SessionRow($Sess) {
     # what you asked + what claude answered, without switching tabs. Content
     # is built lazily on open - hovering costs nothing until you linger.
     $tt = New-Object System.Windows.Controls.ToolTip
-    $tt.Background = Get-Brush '#F520202B'
+    # OPAQUE on purpose: tooltips are separate popup hwnds with no acrylic
+    # backdrop - a translucent brush there blends with whatever's behind the
+    # popup and reads as milky garbage, especially over the glass theme
+    $tt.Background = Get-Brush '#FF201D26'
     $tt.BorderBrush = Get-Brush '#2EFFFFFF'
     $tt.BorderThickness = New-Object System.Windows.Thickness(1)
     $tt.Padding = New-Object System.Windows.Thickness(11, 8, 11, 9)
@@ -3508,7 +3530,7 @@ function New-SessionRow($Sess) {
         try {
             $sess = $s.Tag
             $peek = Get-TranscriptPeek ([string]$sess.Transcript)
-            $fallback = [string]$sess.Message
+            $fallback = Get-PeekDisplayText ([string]$sess.Message) 300
             $hasPeek = ($null -ne $peek -and ($peek.You.Length -gt 0 -or $peek.Bot.Length -gt 0))
             if (-not $hasPeek -and [string]::IsNullOrWhiteSpace($fallback)) {
                 $s.ToolTip.Content = $null   # empty tooltip = never opens (the trap, used on purpose)

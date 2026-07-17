@@ -2809,10 +2809,13 @@ function Update-LimitsPanel {
         $srcStamp = $now
         if ($null -ne $official) {
             $rows = @($official)
-            if (($now - $endpointFetched).TotalMinutes -lt 45) {
+            # the statusline doesn't carry the per-model weekly rows - keep
+            # them from the endpoint snapshot for up to 6h (weekly numbers
+            # drift slowly; a 2h-old fable row beats a vanished fable row)
+            if (($now - $endpointFetched).TotalHours -lt 6) {
                 foreach ($er in $endpointRows) {
-                    if (([string]$er.label) -like 'week *') {
-                        if (([string]$er.label) -ne 'week') { $rows += $er }
+                    if (([string]$er.label) -like 'week *' -and ([string]$er.label) -ne 'week') {
+                        $rows += $er
                     }
                 }
             }

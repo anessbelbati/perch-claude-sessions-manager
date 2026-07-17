@@ -252,6 +252,13 @@ function Get-Sessions {
         if ($agentPid -gt 0) {
             $proc = $script:ProcSnapshot[$agentPid]
             if ($null -eq $proc -or $proc.ProcessName -notmatch $script:AgentProcRegex) { continue }
+            # workers are NOT sessions, even when they capture a tab hint
+            # (they run inside the parent's terminal, so the hook records the
+            # parent's tab and the row shows up as a duplicate). Hide only on
+            # BOTH signals - '--agent' on the cmdline AND an agent ancestor -
+            # so a user-launched 'claude --agent x' keeps its row. Both checks
+            # cache per pid; steady-state cost is a dictionary hit.
+            if ((Test-IsWorkerProc $agentPid) -and (Test-IsSubagentProc -TargetPid $agentPid)) { continue }
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
 
@@ -836,6 +843,22 @@ function Resolve-TabByCycle {
 }
 
 $script:SubagentCache = @{}   # pid -> bool (ancestry never changes for a live pid)
+$script:WorkerCache = @{}     # pid -> bool ('--agent' on the command line = worker)
+
+function Test-IsWorkerProc([int]$TargetPid) {
+    # Task-tool / agent-team workers carry '--agent <type>' on their command
+    # line. Ancestry alone can't tell them from forked background jobs (both
+    # are claude-spawned-by-claude) - the command line can.
+    if ($script:WorkerCache.ContainsKey($TargetPid)) { return $script:WorkerCache[$TargetPid] }
+    $isWorker = $false
+    try {
+        $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId=$TargetPid" -ErrorAction Stop).CommandLine
+        if ($cl -match '\s--agent\s') { $isWorker = $true }
+    }
+    catch { }
+    $script:WorkerCache[$TargetPid] = $isWorker
+    return $isWorker
+}
 function Test-IsSubagentProc {
     # Interactive agents are launched from a shell, so walking UP the parent
     # chain reaches the terminal host; a subagent (claude spawned by claude -
@@ -1976,7 +1999,11 @@ foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED58
         # that's been waiting longest. Transparent bg = whole box clickable,
         # padding fattens the hit target on an 11px glyph.
         $t.Background = [System.Windows.Media.Brushes]::Transparent
-        $t.Padding = New-Object System.Windows.Thickness(2, 2, 2, 2)
+        # horizontal-only padding + compensating margin: fat hit target with
+        # the glyph EXACTLY where its siblings sit - top/bottom padding sank
+        # the red number 2px below the orange/green ones
+        $t.Padding = New-Object System.Windows.Thickness(3, 0, 3, 0)
+        $t.Margin = New-Object System.Windows.Thickness(-3, 0, 4, 0)
         $t.Cursor = [System.Windows.Input.Cursors]::Hand
         $t.ToolTip = 'jump to the session that needs you'
         $t.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })   # don't arm click-vs-drag
@@ -4585,6 +4612,7 @@ $Window.Add_MouseMove({
         $script:PillDragging = $false
         $script:PillDragEnd = Get-Date
         try { $script:PillPeekTimer.Stop() } catch { }
+        Save-HudState   # parked = remembered, even if perch dies uncleanly
     }
 })
 $Window.Add_MouseLeftButtonUp({

@@ -177,11 +177,12 @@ Add-Type -AssemblyName UIAutomationTypes  -ErrorAction SilentlyContinue
 
 # ---------- session model ----------
 $script:StatusMeta = @{
-    'attention' = @{ Rank = 0; Color = '#FF6B6B'; Label = 'needs you' }
-    'error'     = @{ Rank = 1; Color = '#FF6B6B'; Label = 'failed'    }
-    'working'   = @{ Rank = 2; Color = '#FFB84D'; Label = 'working'   }
-    'idle'      = @{ Rank = 3; Color = '#5ED584'; Label = 'done'      }
-    'quiet'     = @{ Rank = 4; Color = '#8FA0C8'; Label = 'quiet'     }
+    'attention'  = @{ Rank = 0; Color = '#FF6B6B'; Label = 'needs you'  }
+    'error'      = @{ Rank = 1; Color = '#FF6B6B'; Label = 'failed'     }
+    'working'    = @{ Rank = 2; Color = '#FFB84D'; Label = 'working'    }
+    'compacting' = @{ Rank = 2; Color = '#B48EF0'; Label = 'compacting' }
+    'idle'       = @{ Rank = 3; Color = '#5ED584'; Label = 'done'       }
+    'quiet'      = @{ Rank = 4; Color = '#8FA0C8'; Label = 'quiet'      }
 }
 
 function Get-StatusMeta([string]$Status) {
@@ -314,6 +315,7 @@ function Get-Sessions {
             Ts       = $ts
             AgentPid = $agentPid
             Window   = $s.window
+            Context  = $(if ($null -ne $s.PSObject.Properties['context_tokens']) { [long]$s.context_tokens } else { 0 })
             Rank     = (Get-StatusMeta $status).Rank
         })
     }
@@ -402,7 +404,7 @@ function Get-Sessions {
     # fingerprint anyway. They get probed when they calm down.
     $script:BusyPids = @{}
     foreach ($s in $kept) {
-        if ($s.Status -eq 'working' -and $s.AgentPid -gt 0) { $script:BusyPids[[int]$s.AgentPid] = $true }
+        if ($s.Status -in @('working', 'compacting') -and $s.AgentPid -gt 0) { $script:BusyPids[[int]$s.AgentPid] = $true }
     }
 
     # apply user prefs: custom names + pinned-to-top
@@ -997,6 +999,7 @@ function Get-UntrackedSessions {
                     tab_index      = $match.Index
                     captured_event = 'hud-scan+console'
                 }
+                Context  = 0
                 Rank     = (Get-StatusMeta 'quiet').Rank
             })
         }
@@ -2672,10 +2675,16 @@ function Update-LimitsPanel {
 
         $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
         if (-not (Test-Path -LiteralPath $uPath)) { $script:LimitsPanel.Children.Clear(); return }
+        # stale data DIMS instead of hiding: when the network flakes for a
+        # while, 30-minute-old numbers are still better than a vanished panel
+        # (which reads as a broken feature)
+        $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
+        $staleMin = ([datetime]::UtcNow - $uLwt).TotalMinutes
+        $wantOpacity = $(if ($staleMin -gt 15) { 0.45 } else { 1.0 })
+        if ($script:LimitsPanel.Opacity -ne $wantOpacity) { $script:LimitsPanel.Opacity = $wantOpacity }
         # rebuild ONLY when the snapshot changed or a minute passed (countdown
         # text) - this used to re-parse the json and rebuild ~33 elements
         # every 2s for data that changes every 3 minutes
-        $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
         if ($uLwt -eq $script:UsageFileLWT -and
             ($now - $script:LimitsRenderStamp).TotalSeconds -lt 60 -and
             $script:LimitsPanel.Children.Count -gt 0) { return }
@@ -2687,7 +2696,6 @@ function Update-LimitsPanel {
         if ($null -eq $u -or $null -eq $u.PSObject.Properties['limits']) { return }
         $fetched = ([datetime]::Parse([string]$u.fetched_at, $null,
                     [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
-        if (($now - $fetched).TotalMinutes -gt 15) { return }   # stale = say nothing
 
         # burn-rate history: one sample per NEW fetch, per limit
         $isNewSample = ([string]$u.fetched_at -ne $script:LastUsageKey)
@@ -2857,7 +2865,7 @@ function New-SessionRow($Sess) {
     [System.Windows.Controls.Grid]::SetColumn($mid, 1)
 
     $line1 = New-Object System.Windows.Controls.Grid
-    foreach ($wdef in @('*', 'Auto')) {
+    foreach ($wdef in @('*', 'Auto', 'Auto')) {
         $cd = New-Object System.Windows.Controls.ColumnDefinition
         if ($wdef -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
         else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
@@ -2870,12 +2878,24 @@ function New-SessionRow($Sess) {
     $name.TextTrimming = 'CharacterEllipsis'
     [System.Windows.Controls.Grid]::SetColumn($name, 0)
     [void]$line1.Children.Add($name)
+    # context meter: how full this session's head is (e.g. 178k). muted while
+    # comfy, amber past 180k, red past 256k - compact when YOU decide to.
+    $ctx = New-Object System.Windows.Controls.TextBlock
+    $ctx.FontSize = 10.5
+    $ctx.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $ctx.Foreground = Get-Brush '#5F5F6A'
+    $ctx.VerticalAlignment = 'Center'
+    $ctx.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+    $ctx.Visibility = 'Collapsed'
+    $ctx.ToolTip = 'context in this session''s head'
+    [System.Windows.Controls.Grid]::SetColumn($ctx, 1)
+    [void]$line1.Children.Add($ctx)
     $age = New-Object System.Windows.Controls.TextBlock
     $age.FontSize = 10.5
     $age.Foreground = Get-Brush '#5F5F6A'
     $age.VerticalAlignment = 'Center'
     $age.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
-    [System.Windows.Controls.Grid]::SetColumn($age, 1)
+    [System.Windows.Controls.Grid]::SetColumn($age, 2)
     [void]$line1.Children.Add($age)
     [void]$mid.Children.Add($line1)
 
@@ -2930,9 +2950,9 @@ function New-SessionRow($Sess) {
     $row.ContextMenu = New-RowMenu $row
 
     $entry = @{
-        Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age
+        Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age; Ctx = $ctx
         RunStatus = $runStatus; RunMsg = $runMsg
-        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''
+        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''
     }
     Update-SessionRow $entry $Sess
     return $entry
@@ -2972,6 +2992,21 @@ function Update-SessionRow($Entry, $Sess) {
 
     $ageTxt = Format-Age $Sess.Ts
     if ($Entry.Age.Text -ne $ageTxt) { $Entry.Age.Text = $ageTxt }
+
+    $ctxVal = [long]$Sess.Context
+    $ctxTxt = $(if ($ctxVal -gt 0) { '{0}k' -f [int][Math]::Round($ctxVal / 1000.0) } else { '' })
+    if ($Entry.CtxKey -ne $ctxTxt) {
+        $Entry.CtxKey = $ctxTxt
+        if ($ctxTxt.Length -eq 0) { $Entry.Ctx.Visibility = 'Collapsed' }
+        else {
+            $Entry.Ctx.Text = $ctxTxt
+            $col = '#5F5F6A'
+            if ($ctxVal -ge 256000) { $col = '#FF6B6B' }
+            elseif ($ctxVal -ge 180000) { $col = '#FFB84D' }
+            $Entry.Ctx.Foreground = Get-Brush $col
+            $Entry.Ctx.Visibility = 'Visible'
+        }
+    }
 
     $snippet = ($Sess.Message -replace '\s+', ' ').Trim()
     if ($snippet.Length -gt 70) { $snippet = $snippet.Substring(0, 70) }
@@ -3148,7 +3183,7 @@ function Update-List {
         }
     }
     $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
-    $work  = @($visible | Where-Object { $_.Status -eq 'working' }).Count
+    $work  = @($visible | Where-Object { $_.Status -in @('working', 'compacting') }).Count
     $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
     $quiet = @($visible | Where-Object { $_.Status -eq 'quiet' }).Count
     $chipTexts = @{

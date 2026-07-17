@@ -27,9 +27,16 @@ try {
     if (-not $tok) { throw 'no token available' }
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $r = Invoke-RestMethod 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec 10 -Headers @{
-        Authorization    = "Bearer $tok"
-        'anthropic-beta' = 'oauth-2025-04-20'
+    $r = $null
+    foreach ($timeout in @(20, 30)) {   # one retry - flaky wifi is a way of life
+        try {
+            $r = Invoke-RestMethod 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec $timeout -Headers @{
+                Authorization    = "Bearer $tok"
+                'anthropic-beta' = 'oauth-2025-04-20'
+            }
+            break
+        }
+        catch { if ($timeout -eq 30) { throw } }
     }
 
     $limits = @()

@@ -334,6 +334,43 @@ function Find-TerminalTabByName {
     $found | Add-Member -NotePropertyName unique -NotePropertyValue ($count -eq 1) -PassThru
 }
 
+function Get-ContextTokens {
+    # current context size = the token usage of the LAST assistant message in
+    # the transcript (input + cache read + cache creation ~ what the model
+    # holds). Reads only the file TAIL - transcripts grow to many MB.
+    param([string]$TranscriptPath)
+
+    if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or
+        -not (Test-Path -LiteralPath $TranscriptPath)) { return 0 }
+    try {
+        $fs = [System.IO.File]::Open($TranscriptPath, 'Open', 'Read', 'ReadWrite')
+        try {
+            $take = [Math]::Min($fs.Length, 262144)
+            $fs.Seek(-$take, [System.IO.SeekOrigin]::End) | Out-Null
+            $buf = New-Object byte[] $take
+            [void]$fs.Read($buf, 0, $take)
+            $text = [System.Text.Encoding]::UTF8.GetString($buf)
+        }
+        finally { $fs.Close() }
+        $lines = $text -split "`n"
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            if ($lines[$i] -notlike '*"usage"*' -or $lines[$i] -notlike '*"input_tokens"*') { continue }
+            try {
+                $obj = $lines[$i] | ConvertFrom-Json
+                $u = $obj.message.usage
+                if ($null -eq $u) { continue }
+                $total = [long]$u.input_tokens
+                if ($null -ne $u.PSObject.Properties['cache_read_input_tokens']) { $total += [long]$u.cache_read_input_tokens }
+                if ($null -ne $u.PSObject.Properties['cache_creation_input_tokens']) { $total += [long]$u.cache_creation_input_tokens }
+                if ($total -gt 0) { return $total }
+            }
+            catch { }
+        }
+    }
+    catch { }
+    return 0
+}
+
 function Write-HookDebug {
     param([string]$Line)
     if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "AgentFocus\debug.on"))) { return }
@@ -550,6 +587,7 @@ try {
         "PreToolUse" { "working"; break }
         "PostToolUse" { "working"; break }
         "UserPromptSubmit" { "working"; break }
+        "PreCompact" { "compacting"; break }
         "Stop" { "idle"; break }
         "StopFailure" { "error"; break }
         "SessionStart" { "idle"; break }
@@ -637,7 +675,7 @@ try {
     # the prompt moment is cheap, human-paced ground truth
     $needCapture = ($eventName -eq "SessionStart") -or
                    ($eventName -eq "UserPromptSubmit") -or
-                   ($eventName -ne "SessionEnd" -and -not $hasConsoleHint -and -not $headless)
+                   ($eventName -notin @("SessionEnd", "PreCompact") -and -not $hasConsoleHint -and -not $headless)
     if ($needCapture) {
         # NOTE: no foreground-window fallback here on purpose. Guessing from
         # the foreground window wrote wrong-tab (even wrong-app) hints when the
@@ -702,6 +740,17 @@ try {
         $cwdName = Split-Path -Path $cwd -Leaf
     }
 
+    # context size: cheap transcript-tail read, refreshed on the human-paced
+    # events; carried forward from the previous record otherwise
+    $contextTokens = 0
+    if ($eventName -in @("UserPromptSubmit", "Stop", "StopFailure", "PreCompact", "Notification")) {
+        $contextTokens = Get-ContextTokens -TranscriptPath $transcriptPath
+    }
+    if ($contextTokens -le 0 -and $null -ne $existing -and
+        $null -ne $existing.PSObject.Properties['context_tokens']) {
+        $contextTokens = [long]$existing.context_tokens
+    }
+
     $message = ""
     if ($eventName -eq "Notification" -and -not [string]::IsNullOrWhiteSpace($notification)) {
         $message = $notification.Trim()
@@ -728,6 +777,7 @@ try {
         message = $message
         agent_pid = $agentPid
         headless = $headless
+        context_tokens = $contextTokens
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         window = $window
     }

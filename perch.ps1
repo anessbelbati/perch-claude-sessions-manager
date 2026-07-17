@@ -202,13 +202,38 @@ function Get-Sessions {
     # follow-the-process learning: map agents to tabs from whatever tab the
     # user happens to have open right now (works on renamed tabs too)
     try { Invoke-PassiveTabLearn } catch { }
+    # ONE process-table snapshot, reused for 4s: every liveness check becomes
+    # a dictionary lookup (the audit counted up to ~60 Get-Process calls/tick;
+    # raw GetProcesses is also ~2.5x cheaper than the Get-Process cmdlet)
+    if (((Get-Date) - $script:ProcSnapStamp).TotalSeconds -ge 4) {
+        $script:ProcSnapshot = @{}
+        foreach ($p in [System.Diagnostics.Process]::GetProcesses()) { $script:ProcSnapshot[[int]$p.Id] = $p }
+        $script:ProcSnapStamp = Get-Date
+    }
+
     $sessions = New-Object System.Collections.ArrayList
     $files = Get-ChildItem -LiteralPath $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue |
              Where-Object { $_.LastWriteTime -gt $now.AddDays(-7) }
     foreach ($f in $files) {
-        $s = $null
-        try { $s = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
-        if ($null -eq $s) { continue }
+        # parse-once cache: a status file is only re-read when its
+        # LastWriteTime changes, and dead files short-circuit forever.
+        # Hooks are human-paced now, so most ticks parse NOTHING.
+        $ck = $f.FullName
+        $cached = $script:FileCache[$ck]
+        if ($null -ne $cached -and $cached.LWT -eq $f.LastWriteTimeUtc) {
+            if ($cached.Skip) { continue }
+            $s = $cached.Obj
+        }
+        else {
+            $s = $null
+            try { $s = [IO.File]::ReadAllText($ck) | ConvertFrom-Json } catch { }
+            if ($null -eq $s -or ([string]$s.status) -eq 'ended' -or
+                [string]::IsNullOrWhiteSpace([string]$s.status)) {
+                $script:FileCache[$ck] = @{ LWT = $f.LastWriteTimeUtc; Skip = $true }
+                continue
+            }
+            $script:FileCache[$ck] = @{ LWT = $f.LastWriteTimeUtc; Skip = $false; Obj = $s }
+        }
 
         $status = [string]$s.status
         if ($status -eq 'ended' -or [string]::IsNullOrWhiteSpace($status)) { continue }
@@ -220,7 +245,7 @@ function Get-Sessions {
         $proc = $null
         if ($null -ne $s.PSObject.Properties['agent_pid']) { $agentPid = [int]$s.agent_pid }
         if ($agentPid -gt 0) {
-            $proc = Get-Process -Id $agentPid -ErrorAction SilentlyContinue
+            $proc = $script:ProcSnapshot[$agentPid]
             if ($null -eq $proc -or $proc.ProcessName -notmatch $script:AgentProcRegex) { continue }
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
@@ -571,6 +596,9 @@ $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
 $script:BusyPids = @{}          # pids of WORKING sessions - background probing leaves them alone
+$script:FileCache = @{}         # status file path -> {LWT; Skip|Obj} (parse only what changed)
+$script:ProcSnapshot = @{}      # pid -> Process, refreshed at most every 4s
+$script:ProcSnapStamp = [datetime]::MinValue
 
 function Invoke-PassiveTabLearn {
     # follow the PROCESS, not names: whatever tab the user has open exposes
@@ -595,21 +623,27 @@ function Invoke-PassiveTabLearn {
     foreach ($apid in @($script:LastScreenMap.Keys)) {
         if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
         if ($script:BusyPids.ContainsKey($apid)) { continue }   # let working TUIs render in peace
-        if ($null -eq (Get-Process -Id $apid -ErrorAction SilentlyContinue)) {
+        if (-not $script:ProcSnapshot.ContainsKey([int]$apid)) {
             [void]$script:LastScreenMap.Remove($apid)
             continue
         }
         $entry = $script:LastScreenMap[$apid]
-        if (((Get-Date) - $entry.Stamp).TotalSeconds -lt 60) { continue }
+        # backoff: an agent that keeps refusing to map gets probed less and
+        # less (60s -> 10min), instead of being hammered forever
+        $wait = 60 * (1 + [Math]::Min([int]$entry.Tries, 9))
+        if (((Get-Date) - $entry.Stamp).TotalSeconds -lt $wait) { continue }
         $fresh = Request-ConsoleInfo -TargetPid $apid
         if ($null -eq $fresh) { continue }   # pending or out of budget - later tick
-        if ($null -ne $fresh.PSObject.Properties['Failed']) { $entry.Stamp = (Get-Date); continue }
+        if ($null -ne $fresh.PSObject.Properties['Failed']) {
+            $entry.Stamp = (Get-Date); $entry.Tries = [int]$entry.Tries + 1
+            continue
+        }
         $script:LastTitleByPid[$apid] = [string]$fresh.Title
         if ([long]$fresh.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$fresh.ConsoleId }
         if (([string]$fresh.Screen).Length -ge 200) {
-            $script:LastScreenMap[$apid] = @{ Text = [string]$fresh.Screen; Stamp = (Get-Date) }
+            $script:LastScreenMap[$apid] = @{ Text = [string]$fresh.Screen; Stamp = (Get-Date); Tries = ([int]$entry.Tries + 1) }
         }
-        else { $entry.Stamp = (Get-Date) }   # don't hammer a mute console
+        else { $entry.Stamp = (Get-Date); $entry.Tries = [int]$entry.Tries + 1 }   # don't hammer a mute console
     }
 
     $claimed = @{}
@@ -833,7 +867,7 @@ function Resolve-TabForPid {
             foreach ($opid in @($script:LastTitleByPid.Keys)) {
                 if ([int]$opid -eq $TargetPid) { continue }
                 if ($ownConsole -gt 0 -and [long]$script:ConsoleIdByPid[$opid] -eq $ownConsole) { continue }
-                if ($null -eq (Get-Process -Id $opid -ErrorAction SilentlyContinue)) { continue }
+                if (-not $script:ProcSnapshot.ContainsKey([int]$opid)) { continue }
                 if ((Get-NormalizedTabName ([string]$script:LastTitleByPid[$opid])) -eq $norm) { $clash = $true; break }
             }
             if (-not $clash) { $match = $byName[0] }
@@ -1028,7 +1062,10 @@ function Get-AllTerminalTabs {
     # per process). Cached for 2s - callers hit this on every refresh tick.
     # -Fresh bypasses the cache (marker dance polls for a just-set title).
     param([switch]$Fresh)
-    if (-not $Fresh -and ((Get-Date) - $script:TabsCacheStamp).TotalMilliseconds -lt 2000) { return $script:TabsCache }
+    # 6s TTL: the tab SET changes rarely; the old 2s TTL equalled the tick
+    # interval, so every tick paid a full UIA tree walk for nothing. Click
+    # paths that need exactness pass -Fresh.
+    if (-not $Fresh -and ((Get-Date) - $script:TabsCacheStamp).TotalMilliseconds -lt 6000) { return $script:TabsCache }
     $list = New-Object System.Collections.ArrayList
     $handles = New-Object System.Collections.ArrayList
     foreach ($wt in @(Get-Process -Name WindowsTerminal -ErrorAction SilentlyContinue)) {
@@ -1331,9 +1368,11 @@ $xaml = @"
         <GradientStop Color="#F7141419" Offset="1"/>
       </LinearGradientBrush>
     </Border.Background>
-    <Border.Effect>
-      <DropShadowEffect BlurRadius="18" ShadowDepth="0" Opacity="0.55"/>
-    </Border.Effect>
+    <!-- NO Border.Effect here, ever again: an Effect on the root card forces
+         the ENTIRE window subtree through a software blur on every dirty
+         pixel, and with AllowsTransparency each frame is also a GPU-to-CPU
+         readback. The audit measured this as the single biggest reason the
+         widget felt slow. Depth now comes from the border + themes. -->
     <Grid>
     <!-- glass theme optics, bottom to top: a DOME of light falling from
          above the top edge (radial - glass is curved, light is not linear),
@@ -1372,9 +1411,13 @@ $xaml = @"
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
         <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-          <Image x:Name="LogoImg" Width="17" Height="17" Margin="0,0,7,0"
-                 RenderOptions.BitmapScalingMode="HighQuality"/>
-          <TextBlock FontSize="13" FontWeight="SemiBold" Text="Perch"
+          <Image x:Name="LogoImg" Width="24" Height="24" Margin="0,0,8,0"
+                 RenderOptions.BitmapScalingMode="HighQuality">
+            <Image.Effect>
+              <DropShadowEffect BlurRadius="7" ShadowDepth="0" Opacity="0.55" Color="#E07B54"/>
+            </Image.Effect>
+          </Image>
+          <TextBlock FontSize="13.5" FontWeight="SemiBold" Text="Perch"
                      Foreground="#F4F4F8" VerticalAlignment="Center"/>
         </StackPanel>
         <StackPanel Grid.Column="1" Orientation="Horizontal">
@@ -1436,6 +1479,8 @@ $script:UsageFetchStamp = [datetime]::MinValue
 $script:UsageHist = @{}      # limit label -> samples of (T, Pct) for burn-rate math
 $script:LimitAlerted = @{}   # limit label -> chirped-at-90 flag (cleared on reset)
 $script:LastUsageKey = ''
+$script:UsageFileLWT = [datetime]::MinValue
+$script:LimitsRenderStamp = [datetime]::MinValue
 $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
@@ -1463,6 +1508,7 @@ $script:LastFocusId = ''
 $script:LastFocusStamp = [datetime]::MinValue
 $script:RowCache    = @{}    # session id -> persistent row elements (diff rendering)
 $script:EmptyEl     = $null
+$script:ChipSet     = $null  # the 4+1 status chips, created once
 
 # last safety net: a handler exception must never tear the window down
 $Window.Dispatcher.Add_UnhandledException({
@@ -2569,34 +2615,33 @@ function Invoke-AttentionRaise {
             # unpinned: NEVER jump over the user's windows - flash the taskbar
             [ClaudeHud.Native]::Flash($helper.Handle, 5)
         }
-        $eff = $script:RootCard.Effect
-        if ($null -ne $eff) {
-            $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))
-            $ca = New-Object System.Windows.Media.Animation.ColorAnimation(
-                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'),
-                [System.Windows.Media.ColorConverter]::ConvertFromString('#000000'), $dur)
-            $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
-            $eff.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::ColorProperty, $ca)
-            $oa = New-Object System.Windows.Media.Animation.DoubleAnimation(0.95, 0.55, $dur)
-            $oa.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
-            $eff.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $oa)
-        }
-        elseif ($script:ThemeName -eq 'glass' -and $null -ne $script:GlassRim) {
-            # glass has no drop shadow to pulse - flash the rim red instead,
-            # then hand the light back to the white gradient
-            $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))
-            $pulse = New-Object System.Windows.Media.SolidColorBrush(
-                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'))
+        # attention pulse = a red flash of the border (rim in glass). Cheap:
+        # animating a border brush repaints a thin ring, not a full-card blur.
+        $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))
+        $pulse = New-Object System.Windows.Media.SolidColorBrush(
+            [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'))
+        $ca = New-Object System.Windows.Media.Animation.ColorAnimation(
+            [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'),
+            [System.Windows.Media.ColorConverter]::ConvertFromString('#30FFFFFF'), $dur)
+        $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
+        $ca.SetValue([System.Windows.Media.Animation.Timeline]::DesiredFrameRateProperty, 15)
+        if ($script:ThemeName -eq 'glass' -and $null -ne $script:GlassRim) {
             $script:GlassRim.BorderBrush = $pulse
-            $ca = New-Object System.Windows.Media.Animation.ColorAnimation(
-                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'),
-                [System.Windows.Media.ColorConverter]::ConvertFromString('#30FFFFFF'), $dur)
-            $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
             $ca.Add_Completed({
                 try { $script:GlassRim.BorderBrush = $script:RimGradient } catch { }
             })
-            $pulse.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $ca)
         }
+        else {
+            $script:RootCard.BorderBrush = $pulse
+            $ca.Add_Completed({
+                try {
+                    $script:RootCard.BorderBrush = Get-Brush $(
+                        if ($script:ThemeName -eq 'oled') { '#2BFFFFFF' } else { '#24FFFFFF' })
+                }
+                catch { }
+            })
+        }
+        $pulse.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $ca)
     }
     catch { }
 }
@@ -2625,9 +2670,19 @@ function Update-LimitsPanel {
             }
         }
 
-        $script:LimitsPanel.Children.Clear()
         $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
-        if (-not (Test-Path -LiteralPath $uPath)) { return }
+        if (-not (Test-Path -LiteralPath $uPath)) { $script:LimitsPanel.Children.Clear(); return }
+        # rebuild ONLY when the snapshot changed or a minute passed (countdown
+        # text) - this used to re-parse the json and rebuild ~33 elements
+        # every 2s for data that changes every 3 minutes
+        $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
+        if ($uLwt -eq $script:UsageFileLWT -and
+            ($now - $script:LimitsRenderStamp).TotalSeconds -lt 60 -and
+            $script:LimitsPanel.Children.Count -gt 0) { return }
+        $script:UsageFileLWT = $uLwt
+        $script:LimitsRenderStamp = $now
+
+        $script:LimitsPanel.Children.Clear()
         $u = Get-Content -LiteralPath $uPath -Raw | ConvertFrom-Json
         if ($null -eq $u -or $null -eq $u.PSObject.Properties['limits']) { return }
         $fetched = ([datetime]::Parse([string]$u.fetched_at, $null,
@@ -2899,6 +2954,10 @@ function Update-SessionRow($Entry, $Sess) {
                 (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(850))))
             $anim.AutoReverse = $true
             $anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+            # 8fps: a Forever animation defaults to ~60fps, and on a layered
+            # window EVERY frame is a full present+readback. The pulse reads
+            # the same at 8.
+            $anim.SetValue([System.Windows.Media.Animation.Timeline]::DesiredFrameRateProperty, 8)
             $Entry.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
         }
         else {
@@ -2961,6 +3020,25 @@ function Update-List {
     $script:InTick = $true
     $script:InTickStamp = Get-Date
     $script:ProbeBudget = 3
+
+    # reap probe children unconditionally: before this sweep, a probe whose
+    # pid stopped being interesting was never collected - hung children kept
+    # a conhost attached forever and Process objects leaked
+    foreach ($k in @($script:ProbeJobs.Keys)) {
+        $job = $script:ProbeJobs[$k]
+        $age = ((Get-Date) - $job.Started).TotalSeconds
+        if (-not $job.Proc.HasExited) {
+            if ($age -gt 8) {
+                try { $job.Proc.Kill() } catch { }
+                try { $job.Proc.Dispose() } catch { }
+                [void]$script:ProbeJobs.Remove($k)
+            }
+        }
+        elseif ($age -gt 30) {
+            try { $job.Proc.Dispose() } catch { }
+            [void]$script:ProbeJobs.Remove($k)
+        }
+    }
     try {
 
     $sessions = @(Get-Sessions)
@@ -3056,17 +3134,40 @@ function Update-List {
 
     Update-LimitsPanel
 
-    $script:ChipsPanel.Children.Clear()
+    # chips are created ONCE; per tick we only flip text/visibility when a
+    # count actually changed (the old clear+rebuild invalidated layout every
+    # tick and re-triggered window-level measure for nothing)
+    if ($null -eq $script:ChipSet) {
+        $script:ChipSet = @{}
+        foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED584'),
+                            @('quiet', '#8FA0C8'), @('all', '#71717A'))) {
+            $chip = New-Chip '' $cdef[1]
+            $chip.Visibility = 'Collapsed'
+            $script:ChipSet[$cdef[0]] = $chip
+            [void]$script:ChipsPanel.Children.Add($chip)
+        }
+    }
     $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
     $work  = @($visible | Where-Object { $_.Status -eq 'working' }).Count
     $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
     $quiet = @($visible | Where-Object { $_.Status -eq 'quiet' }).Count
-    if ($att -gt 0)   { [void]$script:ChipsPanel.Children.Add((New-Chip "$att need you" '#FF6B6B')) }
-    if ($work -gt 0)  { [void]$script:ChipsPanel.Children.Add((New-Chip "$work working" '#FFB84D')) }
-    if ($done -gt 0)  { [void]$script:ChipsPanel.Children.Add((New-Chip "$done done" '#5ED584')) }
-    if ($quiet -gt 0) { [void]$script:ChipsPanel.Children.Add((New-Chip "$quiet quiet" '#8FA0C8')) }
-    if ($script:ChipsPanel.Children.Count -eq 0) {
-        [void]$script:ChipsPanel.Children.Add((New-Chip 'all quiet' '#71717A'))
+    $chipTexts = @{
+        att   = $(if ($att -gt 0) { "$att need you" } else { '' })
+        work  = $(if ($work -gt 0) { "$work working" } else { '' })
+        done  = $(if ($done -gt 0) { "$done done" } else { '' })
+        quiet = $(if ($quiet -gt 0) { "$quiet quiet" } else { '' })
+        all   = $(if (($att + $work + $done + $quiet) -eq 0) { 'all quiet' } else { '' })
+    }
+    foreach ($ck in $chipTexts.Keys) {
+        $chip = $script:ChipSet[$ck]
+        $txt = [string]$chipTexts[$ck]
+        if ($txt.Length -eq 0) {
+            if ($chip.Visibility -ne 'Collapsed') { $chip.Visibility = 'Collapsed' }
+        }
+        else {
+            if ($chip.Child.Text -ne $txt) { $chip.Child.Text = $txt }
+            if ($chip.Visibility -ne 'Visible') { $chip.Visibility = 'Visible' }
+        }
     }
 
     # resurface the HUD when a session NEWLY needs attention

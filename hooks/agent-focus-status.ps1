@@ -460,7 +460,17 @@ function Get-ConsoleTabHint {
                         if ($otherPid -le 0 -or $otherPid -eq $AgentPid) { continue }
                         if ([string]$other.status -eq 'ended') { continue }
                         if ($null -eq (Get-Process -Id $otherPid -ErrorAction SilentlyContinue)) { continue }
-                        $otherTitle = Get-AgentConsoleTitle -AgentPid $otherPid
+                        # compare against the other session's CACHED title
+                        # (refreshed within 15s by its own hooks) - live
+                        # AttachConsole from here contended with that
+                        # session's rendering and could hang on a hosed
+                        # conhost with no child-process isolation
+                        $otherTitle = ''
+                        if ($null -ne $other.PSObject.Properties['window'] -and $null -ne $other.window -and
+                            ([string]$other.window.captured_event) -like '*+console' -and
+                            $null -ne $other.window.PSObject.Properties['tab_name']) {
+                            $otherTitle = [string]$other.window.tab_name
+                        }
                         if (-not [string]::IsNullOrWhiteSpace($otherTitle) -and
                             (Get-NormalizedTitle $otherTitle) -eq $normTitle) { $clash = $true; break }
                     }
@@ -616,7 +626,10 @@ try {
     $hasConsoleHint = $false
     if ($null -ne $window -and
         -not [string]::IsNullOrWhiteSpace([string]$window.tab_runtime_id) -and
-        ([string]$window.captured_event) -like "*+console") {
+        ([string]$window.captured_event) -match '\+(console|cwdname)$') {
+        # +cwdname captures (manually renamed tabs) are REAL captures. They
+        # used to fail this check on a technicality, which re-ran the whole
+        # expensive capture on every event - seconds of tax per tool call.
         $hasConsoleHint = $true
     }
     # UserPromptSubmit recaptures even when a hint EXISTS: a wrong hint (twin

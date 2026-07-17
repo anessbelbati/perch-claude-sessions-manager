@@ -32,10 +32,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $af 'status') | Out-Null
 Copy-Item (Join-Path $repo 'hooks\agent-focus-status.ps1') (Join-Path $af 'hooks\agent-focus-status.ps1') -Force
 Write-Host "  [ok] hook deployed"
 
-# 2. native console helper (AttachConsole etc.)
+# 2. native console helper (AttachConsole + probe kit). Compiled ONCE here -
+# the probe children just Add-Type -Path the dll (~10ms) instead of invoking
+# the C# compiler on every single spawn (~500ms + a csc.exe process each).
 $dll = Join-Path $af 'AgentFocusNative.dll'
-if (-not (Test-Path -LiteralPath $dll)) {
-    $src = @'
+$src = @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
@@ -61,13 +62,50 @@ namespace AgentFocus {
             } finally { FreeConsole(); }
         }
     }
+
+    public static class ProbeKit {
+        [DllImport("kernel32.dll")]
+        public static extern IntPtr GetConsoleWindow();
+        [DllImport("user32.dll")]
+        public static extern bool IsWindowVisible(IntPtr h);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassName(IntPtr h, StringBuilder sb, int max);
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+        [DllImport("kernel32.dll")]
+        public static extern bool CloseHandle(IntPtr h);
+
+        [StructLayout(LayoutKind.Sequential)] public struct COORD { public short X; public short Y; }
+        [StructLayout(LayoutKind.Sequential)] public struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; }
+        [StructLayout(LayoutKind.Sequential)] public struct CSBI {
+            public COORD dwSize; public COORD dwCursorPosition; public ushort wAttributes;
+            public SMALL_RECT srWindow; public COORD dwMaximumWindowSize;
+        }
+        [DllImport("kernel32.dll")]
+        public static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI info);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        public static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] buf, uint len, COORD coord, out uint read);
+    }
 }
 '@
+$needBuild = $true
+if (Test-Path -LiteralPath $dll) {
+    try {
+        Add-Type -Path $dll -ErrorAction Stop
+        if ("AgentFocus.ProbeKit" -as [type]) { $needBuild = $false }
+    }
+    catch { }
+}
+if ($needBuild) {
+    try { Remove-Item -LiteralPath $dll -Force -Confirm:$false -ErrorAction Stop } catch { }
     Add-Type -TypeDefinition $src -OutputAssembly $dll
-    Write-Host "  [ok] AgentFocusNative.dll compiled"
+    Write-Host "  [ok] AgentFocusNative.dll compiled (with ProbeKit)"
 }
 else {
-    Write-Host "  [ok] AgentFocusNative.dll already present"
+    Write-Host "  [ok] AgentFocusNative.dll already current"
 }
 
 # 3. AgentFocus settings

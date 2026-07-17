@@ -1,5 +1,6 @@
-# Generates icon.ico for Perch from logo.png (the cute bird), composed onto
-# the dark rounded card at every icon size.
+# Generates icon.ico for Perch from logo.png (the cute bird) - JUST the bird
+# on a transparent background at every icon size (no card: taskbars and tabs
+# already give icons their own backdrop, a baked-in card looks like a sticker).
 Add-Type -AssemblyName System.Drawing
 
 $logoPath = Join-Path $PSScriptRoot 'logo.png'
@@ -36,21 +37,8 @@ function New-IconPngBytes([int]$Size) {
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
     $g.Clear([System.Drawing.Color]::Transparent)
 
-    # dark rounded card
-    $pad = [Math]::Max(1, [int]($Size * 0.03))
-    $r = [Math]::Max(2, [int]($Size * 0.24))
-    $w = $Size - (2 * $pad)
-    $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $path.AddArc($pad, $pad, $r, $r, 180, 90)
-    $path.AddArc($pad + $w - $r, $pad, $r, $r, 270, 90)
-    $path.AddArc($pad + $w - $r, $pad + $w - $r, $r, $r, 0, 90)
-    $path.AddArc($pad, $pad + $w - $r, $r, $r, 90, 90)
-    $path.CloseFigure()
-    $bg = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 30, 30, 39))
-    $g.FillPath($bg, $path)
-
-    # bird, centered, ~82% of the card
-    $inner = [float]($Size * 0.82)
+    # bird only, centered, ~96% of the canvas - transparent background
+    $inner = [float]($Size * 0.96)
     $scale = [Math]::Min($inner / $srcRect.Width, $inner / $srcRect.Height)
     $dw = [float]($srcRect.Width * $scale)
     $dh = [float]($srcRect.Height * $scale)

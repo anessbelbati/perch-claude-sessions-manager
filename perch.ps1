@@ -334,8 +334,10 @@ function Get-Sessions {
 
     # add live agent processes that have NO usable status file (sessions from
     # before the hooks, codex, gemini, ...): identified via console titles
+    $script:UntrackedPids = @{}
     foreach ($u in @(Get-UntrackedSessions -Tracked $kept)) {
         if ($seenPid.ContainsKey([int]$u.AgentPid)) { continue }
+        $script:UntrackedPids[[int]$u.AgentPid] = $true
 
         # LIVE status from the current tab/window title (untracked agents have
         # no hooks, but a leading spinner glyph in the title means working)
@@ -351,7 +353,7 @@ function Get-Sessions {
         }
         if ($liveName.Length -gt 0) {
             $u.Window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveName -Force
-            $inferred = Get-InferredAgentStatus $liveName
+            $inferred = Get-ScreenInferredStatus ([int]$u.AgentPid) (Get-InferredAgentStatus $liveName)
             $u | Add-Member -NotePropertyName Status -NotePropertyValue $inferred -Force
             $u | Add-Member -NotePropertyName Rank -NotePropertyValue ((Get-StatusMeta $inferred).Rank) -Force
             # keep the row NAME live too: it was snapshotted from whatever the
@@ -598,6 +600,7 @@ $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
 $script:BusyPids = @{}          # pids of WORKING sessions - background probing leaves them alone
+$script:UntrackedPids = @{}     # pids currently shown as untracked rows (screen-state detection)
 $script:FileCache = @{}         # status file path -> {LWT; Skip|Obj} (parse only what changed)
 $script:ProcSnapshot = @{}      # pid -> Process, refreshed at most every 4s
 $script:ProcSnapStamp = [datetime]::MinValue
@@ -623,7 +626,11 @@ function Invoke-PassiveTabLearn {
     # forcing the (visible) click-time tab walk to do the job instead.
     # Probes are ASYNC (results arrive on a later tick) - zero UI blocking.
     foreach ($apid in @($script:LastScreenMap.Keys)) {
-        if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
+        # mapped pids normally leave the refresh loop - EXCEPT live untracked
+        # agents (codex &co): their screen fingerprint doubles as hookless
+        # needs-you detection, so it must stay reasonably fresh
+        $isUntrackedRow = $script:UntrackedPids.ContainsKey([int]$apid)
+        if ($script:UntrackedTabMap.ContainsKey($apid) -and -not $isUntrackedRow) { continue }
         if ($script:BusyPids.ContainsKey($apid)) { continue }   # let working TUIs render in peace
         if (-not $script:ProcSnapshot.ContainsKey([int]$apid)) {
             [void]$script:LastScreenMap.Remove($apid)
@@ -631,8 +638,9 @@ function Invoke-PassiveTabLearn {
         }
         $entry = $script:LastScreenMap[$apid]
         # backoff: an agent that keeps refusing to map gets probed less and
-        # less (60s -> 10min), instead of being hammered forever
+        # less (60s -> 10min); live untracked rows stay at a steady 90s
         $wait = 60 * (1 + [Math]::Min([int]$entry.Tries, 9))
+        if ($isUntrackedRow) { $wait = 90 }
         if (((Get-Date) - $entry.Stamp).TotalSeconds -lt $wait) { continue }
         $fresh = Request-ConsoleInfo -TargetPid $apid
         if ($null -eq $fresh) { continue }   # pending or out of budget - later tick
@@ -807,6 +815,38 @@ function Get-InferredAgentStatus([string]$LiveName) {
     $c = [int][char]$LiveName[0]
     if ($c -ge 0x2800 -and $c -le 0x28FF) { return 'working' }
     return 'quiet'
+}
+
+# screen-content state patterns, stolen with love from ccmanager's per-agent
+# detectors. Our screen fingerprints are normalized to lowercase alnum, so
+# the patterns are too. Order matters: needs-you outranks busy.
+$script:ScreenNeedsYou = @(
+    'pressentertoconfirmoresctocancel'   # codex confirm bar
+    'entertosubmitanswer'                # codex question
+    'allowcommand'                       # codex permission
+    'doyouwanttoproceed'                 # gemini / generic permission box
+    'waitingforuserconfirmation'         # gemini
+    'applythischange'                    # gemini diff prompt
+    'wouldyouliketo'                     # generic permission phrasing
+)
+$script:ScreenBusy = @(
+    'esctointerrupt'                     # claude/codex busy hint
+    'ctrlctointerrupt'
+)
+
+function Get-ScreenInferredStatus([int]$AgentPid, [string]$Fallback) {
+    # sharpen a title-inferred status using the last screen fingerprint (if
+    # fresh): hookless agents get a REAL needs-you state instead of sitting
+    # at quiet while a permission prompt rots unanswered
+    $entry = $script:LastScreenMap[$AgentPid]
+    if ($null -eq $entry) { return $Fallback }
+    if (((Get-Date) - $entry.Stamp).TotalMinutes -gt 3) { return $Fallback }
+    $txt = [string]$entry.Text
+    foreach ($p in $script:ScreenNeedsYou) { if ($txt.Contains($p)) { return 'attention' } }
+    if ($Fallback -eq 'quiet') {
+        foreach ($p in $script:ScreenBusy) { if ($txt.Contains($p)) { return 'working' } }
+    }
+    return $Fallback
 }
 
 function Resolve-TabForPid {
@@ -1484,6 +1524,11 @@ $script:LimitAlerted = @{}   # limit label -> chirped-at-90 flag (cleared on res
 $script:LastUsageKey = ''
 $script:UsageFileLWT = [datetime]::MinValue
 $script:LimitsRenderStamp = [datetime]::MinValue
+$script:UsageParsed = $null            # cached endpoint snapshot (parse once per file write)
+$script:LastOfficial = $null           # last good statusline-sourced limits
+$script:LastOfficialStamp = [datetime]::MinValue
+$script:LimitsKey = ''                 # content key: rebuild only on real change
+$script:SlTextKey = ''                 # last text pushed to the statusline echo file
 $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
@@ -2657,22 +2702,59 @@ function Format-ResetIn([datetime]$At) {
     return ('{0}m' -f [int][Math]::Ceiling($d.TotalMinutes))
 }
 
+function Get-OfficialLimits {
+    # THE steal of the research run: claude itself (>= 2.1.80) pushes its
+    # OFFICIAL rate-limit numbers into the statusline command's stdin on
+    # every render. Our statusline command tees that json to a file -
+    # server-truth percentages with ZERO api calls, fresh whenever any
+    # session is alive. (The oauth endpoint remains as calibration + the
+    # per-model weekly rows, at a gentle cadence.)
+    $sPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\statusline.json'
+    if (-not (Test-Path -LiteralPath $sPath)) { return $null }
+    if (([datetime]::UtcNow - (Get-Item -LiteralPath $sPath).LastWriteTimeUtc).TotalMinutes -gt 3) { return $null }
+    try {
+        $j = Get-Content -LiteralPath $sPath -Raw | ConvertFrom-Json
+        if ($null -eq $j -or $null -eq $j.PSObject.Properties['rate_limits']) { return $null }
+        $rl = $j.rate_limits
+        $lims = @()
+        if ($null -ne $rl.PSObject.Properties['five_hour'] -and $null -ne $rl.five_hour) {
+            $lims += [pscustomobject]@{ label = '5h window'; percent = [double]$rl.five_hour.used_percentage
+                                        severity = 'normal'; resets_at = [string]$rl.five_hour.resets_at }
+        }
+        if ($null -ne $rl.PSObject.Properties['seven_day'] -and $null -ne $rl.seven_day) {
+            $lims += [pscustomobject]@{ label = 'week'; percent = [double]$rl.seven_day.used_percentage
+                                        severity = 'normal'; resets_at = [string]$rl.seven_day.resets_at }
+        }
+        if ($lims.Count -gt 0) { return $lims }
+    }
+    catch { }   # concurrent statusline writers can corrupt a read; next render fixes it
+    return $null
+}
+
 function Update-LimitsPanel {
-    # account limit bars (same data as the CLI's /usage screen): how much of
-    # the 5h window / weekly caps is burned and when they reset. Fetched by a
-    # fire-and-forget child every 3 min - the UI thread never touches the
-    # network; it only reads the sanitized snapshot the child writes.
+    # account limit bars. Source priority: statusline capture (official, free,
+    # live) -> oauth endpoint snapshot (per-model rows + fallback) -> stale
+    # data shown dimmed with its age. The UI thread never touches the network.
     try {
         $now = Get-Date
-        # be a polite API citizen: one fetch per 5 minutes, gated on the FILE
-        # age (not an in-memory stamp - restarts used to trigger an immediate
-        # fetch each time, and a day of debugging restarts got us 429'd), and
-        # never while a rate-limit cooldown is active
-        $uProbePath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
+
+        # source 1: statusline capture, with a short memory so one corrupted
+        # read (concurrent writers) doesn't flicker the panel to fallback
+        $official = Get-OfficialLimits
+        if ($null -ne $official) { $script:LastOfficial = $official; $script:LastOfficialStamp = $now }
+        elseif ($null -ne $script:LastOfficial -and ($now - $script:LastOfficialStamp).TotalMinutes -lt 3) {
+            $official = $script:LastOfficial
+        }
+
+        # source 2: the oauth endpoint. 30min cadence while the statusline
+        # feed is alive (it only contributes the per-model weekly rows then),
+        # 5min when it's our only source; file-age gated; never during a 429
+        # cooldown (Retry-After honored by the probe)
+        $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
         $coolPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage-cooldown.txt'
         $fileAge = 1e9
-        if (Test-Path -LiteralPath $uProbePath) {
-            $fileAge = ([datetime]::UtcNow - (Get-Item -LiteralPath $uProbePath).LastWriteTimeUtc).TotalSeconds
+        if (Test-Path -LiteralPath $uPath) {
+            $fileAge = ([datetime]::UtcNow - (Get-Item -LiteralPath $uPath).LastWriteTimeUtc).TotalSeconds
         }
         $coolActive = $false
         if (Test-Path -LiteralPath $coolPath) {
@@ -2683,7 +2765,8 @@ function Update-LimitsPanel {
             }
             catch { }
         }
-        if (-not $coolActive -and $fileAge -gt 300 -and
+        $cadence = $(if ($null -ne $official) { 1800 } else { 300 })
+        if (-not $coolActive -and $fileAge -gt $cadence -and
             ($now - $script:UsageFetchStamp).TotalSeconds -gt 60) {
             $script:UsageFetchStamp = $now
             $probe = Join-Path $PSScriptRoot 'usage-probe.ps1'
@@ -2693,35 +2776,73 @@ function Update-LimitsPanel {
             }
         }
 
-        $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
-        if (-not (Test-Path -LiteralPath $uPath)) { $script:LimitsPanel.Children.Clear(); return }
-        # stale data DIMS instead of hiding: when the network flakes for a
-        # while, 30-minute-old numbers are still better than a vanished panel
-        # (which reads as a broken feature)
-        $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
-        $staleMin = ([datetime]::UtcNow - $uLwt).TotalMinutes
+        # endpoint snapshot rows (cached parse keyed on file write time)
+        $endpointRows = @()
+        $endpointFetched = [datetime]::MinValue
+        if (Test-Path -LiteralPath $uPath) {
+            $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
+            if ($uLwt -ne $script:UsageFileLWT -or $null -eq $script:UsageParsed) {
+                try {
+                    $u = Get-Content -LiteralPath $uPath -Raw | ConvertFrom-Json
+                    if ($null -ne $u -and $null -ne $u.PSObject.Properties['limits']) {
+                        $script:UsageParsed = $u
+                        $script:UsageFileLWT = $uLwt
+                    }
+                }
+                catch { }
+            }
+            if ($null -ne $script:UsageParsed) {
+                $endpointRows = @($script:UsageParsed.limits)
+                try {
+                    $endpointFetched = ([datetime]::Parse([string]$script:UsageParsed.fetched_at, $null,
+                                        [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+                }
+                catch { }
+            }
+        }
+
+        # assemble: official 5h/week first; endpoint contributes the scoped
+        # per-model weekly rows (statusline doesn't carry those) if reasonably
+        # fresh; endpoint alone when no statusline feed exists
+        $rows = @()
+        $staleMin = 0.0
+        $srcStamp = $now
+        if ($null -ne $official) {
+            $rows = @($official)
+            if (($now - $endpointFetched).TotalMinutes -lt 45) {
+                foreach ($er in $endpointRows) {
+                    if (([string]$er.label) -like 'week *') {
+                        if (([string]$er.label) -ne 'week') { $rows += $er }
+                    }
+                }
+            }
+        }
+        else {
+            $rows = $endpointRows
+            if ($endpointFetched -gt [datetime]::MinValue) { $staleMin = ($now - $endpointFetched).TotalMinutes }
+            else { $staleMin = 999 }
+            $srcStamp = $endpointFetched
+        }
+        if ($rows.Count -eq 0) { $script:LimitsPanel.Children.Clear(); return }
+
         $wantOpacity = $(if ($staleMin -gt 15) { 0.45 } else { 1.0 })
         if ($script:LimitsPanel.Opacity -ne $wantOpacity) { $script:LimitsPanel.Opacity = $wantOpacity }
-        # rebuild ONLY when the snapshot changed or a minute passed (countdown
-        # text) - this used to re-parse the json and rebuild ~33 elements
-        # every 2s for data that changes every 3 minutes
-        if ($uLwt -eq $script:UsageFileLWT -and
+
+        # rebuild only when the CONTENT changed (rounded pct / reset) or a
+        # minute passed - the statusline file updates every render, so a
+        # file-time gate would rebuild every tick
+        $ckParts = foreach ($lim in $rows) { '{0}:{1:0}:{2}' -f [string]$lim.label, [double]$lim.percent, [string]$lim.resets_at }
+        $contentKey = ($ckParts -join '|') + '|' + [int]$staleMin
+        if ($contentKey -eq $script:LimitsKey -and
             ($now - $script:LimitsRenderStamp).TotalSeconds -lt 60 -and
             $script:LimitsPanel.Children.Count -gt 0) { return }
-        $script:UsageFileLWT = $uLwt
+        $isNewSample = ($contentKey -ne $script:LimitsKey)
+        $script:LimitsKey = $contentKey
         $script:LimitsRenderStamp = $now
-
         $script:LimitsPanel.Children.Clear()
-        $u = Get-Content -LiteralPath $uPath -Raw | ConvertFrom-Json
-        if ($null -eq $u -or $null -eq $u.PSObject.Properties['limits']) { return }
-        $fetched = ([datetime]::Parse([string]$u.fetched_at, $null,
-                    [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+        $fetched = $srcStamp
 
-        # burn-rate history: one sample per NEW fetch, per limit
-        $isNewSample = ([string]$u.fetched_at -ne $script:LastUsageKey)
-        if ($isNewSample) { $script:LastUsageKey = [string]$u.fetched_at }
-
-        foreach ($lim in @($u.limits)) {
+        foreach ($lim in @($rows)) {
             $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$lim.percent))
             $hex = '#5ED584'
             if ($pct -ge 90 -or [string]$lim.severity -match 'exceeded|blocked') { $hex = '#FF6B6B' }
@@ -2843,6 +2964,23 @@ function Update-LimitsPanel {
                         $(if ($coolActive) { ' (rate-limited, backing off)' } else { ', retrying' })
             [void]$script:LimitsPanel.Children.Add($old)
         }
+
+        # feed the statusline: the capture command echoes this file back into
+        # every session's statusline - usage at the bottom of each terminal,
+        # maintained by perch, costing the render one tiny file read
+        try {
+            $slParts = foreach ($lim in @($rows)) {
+                if (([string]$lim.label) -in @('5h window', 'week')) {
+                    ('{0} {1:0}%' -f ((([string]$lim.label) -replace '5h window', '5h') -replace 'week', 'wk'), [double]$lim.percent)
+                }
+            }
+            $slText = 'perch: ' + (($slParts | Where-Object { $_ }) -join ' | ')
+            if ($slText -ne $script:SlTextKey) {
+                $script:SlTextKey = $slText
+                $slText | Set-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'AgentFocus\statusline-text.txt') -Encoding ASCII
+            }
+        }
+        catch { }
     }
     catch { }
 }

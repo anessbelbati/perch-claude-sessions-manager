@@ -39,12 +39,24 @@ try {
     }
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    # identify as the CLI (CodexBar's trick): same UA the real client sends,
+    # so we get the rate-limit treatment the CLI gets
+    $ua = 'claude-code/2.1.212'
+    try {
+        $exe = Get-Command claude.exe -ErrorAction SilentlyContinue
+        if ($null -ne $exe) {
+            $v = [string](& $exe.Source --version 2>$null)
+            if ($v -match '(\d+\.\d+\.\d+)') { $ua = "claude-code/$($Matches[1])" }
+        }
+    }
+    catch { }
     # ONE attempt, no retry: a failed request costs nothing to wait out, and
     # retrying into a 429 digs the hole deeper
     try {
         $r = Invoke-RestMethod 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec 20 -Headers @{
             Authorization    = "Bearer $tok"
             'anthropic-beta' = 'oauth-2025-04-20'
+            'User-Agent'     = $ua
         }
     }
     catch {

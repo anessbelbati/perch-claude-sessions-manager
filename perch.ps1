@@ -1277,31 +1277,33 @@ $xaml = @"
       <DropShadowEffect BlurRadius="18" ShadowDepth="0" Opacity="0.55"/>
     </Border.Effect>
     <Grid>
-    <!-- glass theme overlays: top-light sheen + diagonal reflection streaks
-         (under the content) and a light-catching rim (over everything).
-         Collapsed in the midnight theme. -->
-    <Border x:Name="GlassSheen" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
+    <!-- glass theme optics, bottom to top: a DOME of light falling from
+         above the top edge (radial - glass is curved, light is not linear),
+         soft diagonal reflection streaks, then the content, then a bright
+         INNER highlight edge and a light-catching outer rim. Collapsed in
+         the other themes. -->
+    <Border x:Name="GlassDome" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
       <Border.Background>
-        <LinearGradientBrush StartPoint="0.1,0" EndPoint="0.5,1">
-          <GradientStop Color="#3DFFFFFF" Offset="0"/>
-          <GradientStop Color="#14FFFFFF" Offset="0.18"/>
-          <GradientStop Color="#05FFFFFF" Offset="0.42"/>
-          <GradientStop Color="#00FFFFFF" Offset="0.65"/>
-          <GradientStop Color="#0AFFFFFF" Offset="1"/>
-        </LinearGradientBrush>
+        <RadialGradientBrush Center="0.32,-0.28" GradientOrigin="0.32,-0.28" RadiusX="1.15" RadiusY="0.85">
+          <GradientStop Color="#61FFFFFF" Offset="0"/>
+          <GradientStop Color="#26FFFFFF" Offset="0.4"/>
+          <GradientStop Color="#0AFFFFFF" Offset="0.7"/>
+          <GradientStop Color="#00FFFFFF" Offset="1"/>
+        </RadialGradientBrush>
       </Border.Background>
     </Border>
     <Border x:Name="GlassStreak" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
       <Border.Background>
-        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0.9">
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0.85">
           <GradientStop Color="#00FFFFFF" Offset="0"/>
-          <GradientStop Color="#00FFFFFF" Offset="0.30"/>
-          <GradientStop Color="#17FFFFFF" Offset="0.37"/>
-          <GradientStop Color="#00FFFFFF" Offset="0.46"/>
-          <GradientStop Color="#00FFFFFF" Offset="0.55"/>
-          <GradientStop Color="#0DFFFFFF" Offset="0.60"/>
-          <GradientStop Color="#00FFFFFF" Offset="0.68"/>
-          <GradientStop Color="#00FFFFFF" Offset="1"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.28"/>
+          <GradientStop Color="#12FFFFFF" Offset="0.36"/>
+          <GradientStop Color="#03FFFFFF" Offset="0.44"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.52"/>
+          <GradientStop Color="#0BFFFFFF" Offset="0.58"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.66"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.90"/>
+          <GradientStop Color="#08FFFFFF" Offset="1"/>
         </LinearGradientBrush>
       </Border.Background>
     </Border>
@@ -1338,15 +1340,27 @@ $xaml = @"
         <StackPanel x:Name="SessionList" Margin="8,2,8,10"/>
       </ScrollViewer>
     </StackPanel>
-    <Border x:Name="GlassRim" CornerRadius="9" BorderThickness="1.4"
+    <Border x:Name="GlassInner" CornerRadius="7.5" BorderThickness="1" Margin="1.8"
             IsHitTestVisible="False" Visibility="Collapsed">
       <Border.BorderBrush>
-        <LinearGradientBrush StartPoint="0.2,0" EndPoint="0.8,1">
-          <GradientStop Color="#A8FFFFFF" Offset="0"/>
-          <GradientStop Color="#30FFFFFF" Offset="0.22"/>
-          <GradientStop Color="#12FFFFFF" Offset="0.55"/>
-          <GradientStop Color="#26FFFFFF" Offset="0.85"/>
-          <GradientStop Color="#59FFFFFF" Offset="1"/>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+          <GradientStop Color="#73FFFFFF" Offset="0"/>
+          <GradientStop Color="#17FFFFFF" Offset="0.12"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.45"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.85"/>
+          <GradientStop Color="#1CFFFFFF" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.BorderBrush>
+    </Border>
+    <Border x:Name="GlassRim" CornerRadius="9" BorderThickness="1.2"
+            IsHitTestVisible="False" Visibility="Collapsed">
+      <Border.BorderBrush>
+        <LinearGradientBrush StartPoint="0.15,0" EndPoint="0.85,1">
+          <GradientStop Color="#D9FFFFFF" Offset="0"/>
+          <GradientStop Color="#4DFFFFFF" Offset="0.18"/>
+          <GradientStop Color="#1AFFFFFF" Offset="0.5"/>
+          <GradientStop Color="#30FFFFFF" Offset="0.82"/>
+          <GradientStop Color="#73FFFFFF" Offset="1"/>
         </LinearGradientBrush>
       </Border.BorderBrush>
     </Border>
@@ -1366,8 +1380,9 @@ $script:MiniBtn     = $Window.FindName('MiniBtn')
 $script:Divider     = $Window.FindName('Divider')
 $script:RowsScroll  = $Window.FindName('RowsScroll')
 $script:RootCard    = $Window.FindName('RootCard')
-$script:GlassSheen  = $Window.FindName('GlassSheen')
+$script:GlassDome   = $Window.FindName('GlassDome')
 $script:GlassStreak = $Window.FindName('GlassStreak')
+$script:GlassInner  = $Window.FindName('GlassInner')
 $script:GlassRim    = $Window.FindName('GlassRim')
 $script:RimGradient = $script:GlassRim.BorderBrush          # restored after pulse animations
 $script:CardGradient = $script:RootCard.Background          # midnight look, restored on theme switch
@@ -1442,9 +1457,9 @@ function Set-GlassBackdrop([bool]$On) {
         if ($h -eq [IntPtr]::Zero) { return }
         if ($On) {
             [ClaudeHud.Glass]::SetRoundCorners($h, $true)
-            # tint is ABGR: ~35% warm near-black. LOW alpha on purpose - the
+            # tint is ABGR: ~29% warm near-black. LOW alpha on purpose - the
             # point is glass you can see through, not fogged plexiglass
-            [ClaudeHud.Glass]::SetAcrylic($h, $true, 0x59120E0C)
+            [ClaudeHud.Glass]::SetAcrylic($h, $true, 0x4A16120E)
         }
         else {
             [ClaudeHud.Glass]::SetAcrylic($h, $false, 0)
@@ -1456,9 +1471,11 @@ function Set-GlassBackdrop([bool]$On) {
 
 function Apply-Theme {
     $glass = ($script:ThemeName -eq 'glass')
+    $overlays = @($script:GlassDome, $script:GlassStreak, $script:GlassInner, $script:GlassRim)
     if ($glass) {
-        # liquid glass: REAL backdrop blur (acrylic) + a barely-there white
-        # film, lit by a sheen, two reflection streaks and a bright rim.
+        # liquid glass: REAL backdrop blur (acrylic) + layered optics - a
+        # radial dome of light, reflection streaks, a bright inner highlight
+        # edge and a light-catching outer rim over a barely-there film.
         # margin 0 because the acrylic covers the whole hwnd rect - any
         # transparent margin would show a square blur slab around the card.
         $script:RootCard.Margin = New-Object System.Windows.Thickness(0)
@@ -1468,16 +1485,24 @@ function Apply-Theme {
         $film = New-Object System.Windows.Media.LinearGradientBrush
         $film.StartPoint = New-Object System.Windows.Point(0, 0)
         $film.EndPoint = New-Object System.Windows.Point(0, 1)
-        [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
-            [System.Windows.Media.ColorConverter]::ConvertFromString('#1CFFFFFF'), 0.0)))
-        [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
-            [System.Windows.Media.ColorConverter]::ConvertFromString('#08FFFFFF'), 1.0)))
+        foreach ($stop in @(@('#17FFFFFF', 0.0), @('#05FFFFFF', 0.55), @('#1F000000', 1.0))) {
+            [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+                [System.Windows.Media.ColorConverter]::ConvertFromString($stop[0]), [double]$stop[1])))
+        }
         $film.Freeze()
         $script:RootCard.Background = $film
-        $script:GlassSheen.Visibility = 'Visible'
-        $script:GlassStreak.Visibility = 'Visible'
-        $script:GlassRim.Visibility = 'Visible'
+        foreach ($o in $overlays) { $o.Visibility = 'Visible' }
         $script:GlassRim.BorderBrush = $script:RimGradient
+    }
+    elseif ($script:ThemeName -eq 'oled') {
+        # pure black, hairline border - for people whose desktop is already
+        # a void and want the HUD to disappear into it
+        $script:RootCard.Margin = New-Object System.Windows.Thickness(12)
+        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(16)
+        $script:RootCard.Effect = $script:CardShadow
+        $script:RootCard.BorderBrush = Get-Brush '#2BFFFFFF'
+        $script:RootCard.Background = Get-Brush '#FF060608'
+        foreach ($o in $overlays) { $o.Visibility = 'Collapsed' }
     }
     else {
         $script:RootCard.Margin = New-Object System.Windows.Thickness(12)
@@ -1485,9 +1510,7 @@ function Apply-Theme {
         $script:RootCard.Effect = $script:CardShadow
         $script:RootCard.BorderBrush = Get-Brush '#24FFFFFF'
         $script:RootCard.Background = $script:CardGradient
-        $script:GlassSheen.Visibility = 'Collapsed'
-        $script:GlassStreak.Visibility = 'Collapsed'
-        $script:GlassRim.Visibility = 'Collapsed'
+        foreach ($o in $overlays) { $o.Visibility = 'Collapsed' }
     }
     Set-GlassBackdrop $glass
 }
@@ -1708,6 +1731,80 @@ function New-InputBox([string]$Text) {
     return $wrap
 }
 
+function New-ThemeSwatch([string]$Name) {
+    # a little preview card in the settings dialog: click = LIVE preview of
+    # the theme on the actual widget behind the dialog. cancel reverts.
+    $wrap = New-Object System.Windows.Controls.StackPanel
+    $wrap.Margin = New-Object System.Windows.Thickness(0, 2, 10, 0)
+    $wrap.Cursor = [System.Windows.Input.Cursors]::Hand
+    $wrap.Tag = $Name
+
+    $ring = New-Object System.Windows.Controls.Border
+    $ring.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $ring.BorderThickness = New-Object System.Windows.Thickness(2)
+    $ring.Padding = New-Object System.Windows.Thickness(2)
+    $ring.BorderBrush = [System.Windows.Media.Brushes]::Transparent
+
+    $prev = New-Object System.Windows.Controls.Border
+    $prev.CornerRadius = New-Object System.Windows.CornerRadius(8)
+    $prev.Width = 66; $prev.Height = 42
+    $prev.BorderThickness = New-Object System.Windows.Thickness(1)
+    switch ($Name) {
+        'glass' {
+            $g = New-Object System.Windows.Media.LinearGradientBrush
+            $g.StartPoint = New-Object System.Windows.Point(0.2, 0)
+            $g.EndPoint = New-Object System.Windows.Point(0.8, 1)
+            foreach ($stop in @(@('#52FFFFFF', 0.0), @('#1AFFFFFF', 0.45), @('#0DFFFFFF', 1.0))) {
+                [void]$g.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString($stop[0]), [double]$stop[1])))
+            }
+            $prev.Background = $g
+            $prev.BorderBrush = Get-Brush '#8CFFFFFF'
+        }
+        'oled' {
+            $prev.Background = Get-Brush '#FF060608'
+            $prev.BorderBrush = Get-Brush '#2BFFFFFF'
+        }
+        default {
+            $prev.Background = $script:CardGradient
+            $prev.BorderBrush = Get-Brush '#33FFFFFF'
+        }
+    }
+    $dot = New-Object System.Windows.Shapes.Ellipse
+    $dot.Width = 7; $dot.Height = 7
+    $dot.Fill = Get-Brush '#E07B54'
+    $dot.HorizontalAlignment = 'Left'; $dot.VerticalAlignment = 'Top'
+    $dot.Margin = New-Object System.Windows.Thickness(7, 7, 0, 0)
+    $prev.Child = $dot
+    $ring.Child = $prev
+    [void]$wrap.Children.Add($ring)
+
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = $Name
+    $lbl.FontSize = 10
+    $lbl.Foreground = Get-Brush '#8A8A93'
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+    [void]$wrap.Children.Add($lbl)
+
+    $script:ThemePickRings[$Name] = $ring
+    if ($Name -eq $script:PickTheme) { $ring.BorderBrush = Get-Brush '#E07B54' }
+
+    $wrap.Add_MouseLeftButtonDown({
+        param($s, $e)
+        $script:PickTheme = [string]$s.Tag
+        foreach ($k in @($script:ThemePickRings.Keys)) {
+            $script:ThemePickRings[$k].BorderBrush = $(
+                if ($k -eq $script:PickTheme) { Get-Brush '#E07B54' }
+                else { [System.Windows.Media.Brushes]::Transparent })
+        }
+        $script:ThemeName = $script:PickTheme
+        Apply-Theme   # live preview on the real widget
+        $e.Handled = $true
+    })
+    return $wrap
+}
+
 function New-DialogButton([string]$Text, [bool]$Primary) {
     $b = New-Object System.Windows.Controls.Border
     $b.CornerRadius = New-Object System.Windows.CornerRadius(9)
@@ -1733,10 +1830,9 @@ function New-DialogButton([string]$Text, [bool]$Primary) {
     return $b
 }
 
-function Save-PerchSettings([bool]$Glass, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
-    $newTheme = $(if ($Glass) { 'glass' } else { 'midnight' })
-    if ($newTheme -ne $script:ThemeName) {
-        $script:ThemeName = $newTheme
+function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
+    if ($Theme -in @('midnight', 'oled', 'glass') -and $Theme -ne $script:ThemeName) {
+        $script:ThemeName = $Theme
         Apply-Theme
     }
     $script:ChirpOn = $Chirp
@@ -1854,13 +1950,26 @@ function Show-SettingsDialog {
     $head.Add_MouseLeftButtonDown({ param($s, $e) try { $s.Tag.DragMove() } catch { } })
     [void]$stack.Children.Add($head)
 
+    # theme picker: swatches, live preview, cancel reverts
+    $script:PickTheme = $script:ThemeName
+    $script:ThemeOrig = $script:ThemeName
+    $script:ThemeSaved = $false
+    $script:ThemePickRings = @{}
+    [void]$stack.Children.Add((New-DarkLabel 'theme'))
+    $themeRow = New-Object System.Windows.Controls.StackPanel
+    $themeRow.Orientation = 'Horizontal'
+    $themeRow.Margin = New-Object System.Windows.Thickness(2, 0, 0, 6)
+    foreach ($tn in @('midnight', 'oled', 'glass')) {
+        [void]$themeRow.Children.Add((New-ThemeSwatch $tn))
+    }
+    [void]$stack.Children.Add($themeRow)
+
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
-    $rowGlass   = New-SettingRow 'liquid glass theme'                 ($script:ThemeName -eq 'glass')
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
     $rowTimers  = New-SettingRow 'show work timers on busy sessions'  $script:ShowTimers
     $rowHide    = New-SettingRow 'minimize after click-to-focus'      $script:HudHideAfterFocus
     $rowStartup = New-SettingRow 'start with windows'                 (Test-Path -LiteralPath $startupLnk)
-    foreach ($r in @($rowGlass, $rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
+    foreach ($r in @($rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
 
     $sep = New-Object System.Windows.Controls.Border
     $sep.Height = 1
@@ -1906,7 +2015,7 @@ function Show-SettingsDialog {
     $dlg.Content = $card
 
     $dlg.Tag = @{
-        Glass = $rowGlass.Tag; Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
+        Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
         Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child
     }
     $btnSave.Tag = $dlg
@@ -1914,12 +2023,20 @@ function Show-SettingsDialog {
     $btnSave.Add_MouseLeftButtonUp({
         param($s, $e)
         $c = $s.Tag.Tag
-        Save-PerchSettings ([bool]$c.Glass.Tag) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
+        $script:ThemeSaved = $true
+        Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
     $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
+    $dlg.Add_Closed({
+        # closed without saving: undo any live theme preview
+        if (-not $script:ThemeSaved -and $script:ThemeName -ne $script:ThemeOrig) {
+            $script:ThemeName = $script:ThemeOrig
+            try { Apply-Theme } catch { }
+        }
+    })
 
     $script:UiHold++
     $script:UiHoldStamp = Get-Date

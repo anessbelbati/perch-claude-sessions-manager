@@ -306,8 +306,9 @@ function Get-Sessions {
         $name = [string]$s.cwd_name
         if ([string]::IsNullOrWhiteSpace($name)) { $name = '(unknown)' }
 
-        $msg = [string]$s.message
-        if ($msg.Length -gt 400) { $msg = $msg.Substring(0, 400) + '...' }
+        # same soap the peek tooltip gets: heal legacy mojibake, strip
+        # markdown/box-drawing/control junk, cut surrogate-safely
+        $msg = Get-PeekDisplayText (Repair-Mojibake ([string]$s.message)) 400
 
         [void]$sessions.Add([pscustomobject]@{
             Id       = [string]$s.session_id
@@ -1623,7 +1624,7 @@ $xaml = @"
                      Style="{StaticResource HudIconButton}" Margin="4,0,2,0"/>
         </StackPanel>
       </Grid>
-      <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,8" Background="Transparent"/>
+      <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,4" Background="Transparent"/>
       <StackPanel x:Name="LimitsPanel" Margin="16,0,16,9" Background="Transparent"/>
       <Border x:Name="Divider" Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
       <ScrollViewer x:Name="RowsScroll" MaxHeight="560" VerticalScrollBarVisibility="Auto"
@@ -1764,7 +1765,7 @@ function New-ScanlineBrush {
     $dg = New-Object System.Windows.Media.DrawingGroup
     foreach ($r in @(
             @('#00000000', 0, 3),     # transparent filler keeps the tile bounds
-            @('#0D000000', 2, 1))) {  # the line itself
+            @('#10000000', 2, 1))) {  # the line itself
         $gd = New-Object System.Windows.Media.GeometryDrawing
         $gd.Brush = Get-Brush ([string]$r[0])
         $gd.Geometry = New-Object System.Windows.Media.RectangleGeometry(
@@ -1779,20 +1780,27 @@ function New-ScanlineBrush {
     return $b
 }
 
-function New-HorizonGlow {
-    # synthwave: a neon sun setting just below the card's bottom edge -
-    # magenta core cooling toward cyan as it fades out
+function New-DomeGlow([double[]]$Center, [double[]]$Radii, [object[]]$Stops) {
+    # a radial light source parked off one edge of the card - the same
+    # trick GlassDome plays, reusable for any hue
     $rg = New-Object System.Windows.Media.RadialGradientBrush
-    $rg.Center = New-Object System.Windows.Point(0.5, 1.22)
+    $rg.Center = New-Object System.Windows.Point($Center[0], $Center[1])
     $rg.GradientOrigin = $rg.Center
-    $rg.RadiusX = 0.95
-    $rg.RadiusY = 0.78
-    foreach ($s in @(@('#3CFF41B0', 0.0), @('#1A7A5CFF', 0.55), @('#0033E0FF', 1.0))) {
+    $rg.RadiusX = $Radii[0]
+    $rg.RadiusY = $Radii[1]
+    foreach ($s in $Stops) {
         [void]$rg.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
             [System.Windows.Media.ColorConverter]::ConvertFromString($s[0]), [double]$s[1])))
     }
     $rg.Freeze()
     return $rg
+}
+
+function New-HorizonGlow {
+    # synthwave: a neon sun setting just below the card's bottom edge -
+    # magenta core cooling toward cyan as it fades out
+    return New-DomeGlow @(0.5, 1.22) @(0.95, 0.78) @(
+        @('#4AFF41B0', 0.0), @('#207A5CFF', 0.55), @('#0033E0FF', 1.0))
 }
 
 $script:ThemeSpecs = [ordered]@{
@@ -1802,19 +1810,48 @@ $script:ThemeSpecs = [ordered]@{
     oled       = @{ Bg = (Get-Brush '#FF060608')
                     BorderBrush = (Get-Brush '#2BFFFFFF'); Glow = '#E07B54' }
     glass      = @{ Glow = '#E07B54' }   # special-cased in Apply-Theme (acrylic + optics)
-    # the fun ones
-    phosphor   = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F70B150D', 0), @('#F7060F08', 1)))
-                    BorderBrush = (Get-Brush '#383EDC78'); Glow = '#3EDC78'
+    # the fun ones. each one tells the same light story glass does, tinted:
+    # a light SOURCE (FxUnder), an inner top GLINT (FxUnderEdge), walls that
+    # darken away from the light (Bg), and a border that's bright where the
+    # light falls (BorderBrush gradient). flat hex walls looked like shit.
+    phosphor   = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F70D1F12', 0), @('#F7081409', 0.55), @('#F7040B05', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#6E45E683', 0), @('#28245C36', 1)))
+                    Glow = '#3EDC78'
+                    FxUnder = (New-DomeGlow @(0.5, -0.2) @(1.05, 0.75) @(
+                        @('#2E3EDC78', 0), @('#12246E3C', 0.55), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#66CFFFDC', 0), @('#1A3EDC78', 0.10), @('#00000000', 0.5), @('#123EDC78', 1)))
                     FxOver = (New-ScanlineBrush) }
-    nord       = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F72E3440', 0), @('#F7262B36', 1)))
-                    BorderBrush = (Get-Brush '#3E88C0D0'); Glow = '#88C0D0' }
-    catppuccin = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F71E1E2E', 0), @('#F7181825', 1)))
-                    BorderBrush = (Get-Brush '#45CBA6F7'); Glow = '#CBA6F7' }
-    synthwave  = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F7261442', 0), @('#F7130B26', 1)))
+    nord       = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F7353C4B', 0), @('#F72B303E', 0.55), @('#F7222733', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#7A93C5D6', 0), @('#2E46586B', 1)))
+                    Glow = '#88C0D0'
+                    # the aurora: teal -> green -> purple, draped across the top
+                    FxUnder = (New-GradBrush @(0, 0) @(1, 0.6) @(
+                        @('#2488C0D0', 0), @('#18A3BE8C', 0.35), @('#14B48EAD', 0.65), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#78DFF1F5', 0), @('#1E88C0D0', 0.10), @('#00000000', 0.5), @('#1281A1C1', 1))) }
+    catppuccin = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F7272738', 0), @('#F71E1E2E', 0.55), @('#F7151521', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#6EC9ABF2', 0), @('#2A55436E', 1)))
+                    Glow = '#CBA6F7'
+                    # pastel dawn: mauve -> pink -> peach wash from the top corner
+                    FxUnder = (New-GradBrush @(0, 0) @(1, 0.6) @(
+                        @('#22CBA6F7', 0), @('#16F5C2E7', 0.4), @('#10FAB387', 0.75), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#70EBDFFB', 0), @('#1CCBA6F7', 0.10), @('#00000000', 0.5), @('#12B4BEFE', 1))) }
+    synthwave  = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F72F1A52', 0), @('#F71E1038', 0.5), @('#F7140B28', 1)))
                     BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
-                        @('#7DFF41B0', 0), @('#557A5CFF', 0.5), @('#7D33E0FF', 1)))
+                        @('#96FF41B0', 0), @('#5C7A5CFF', 0.5), @('#8C33E0FF', 1)))
                     Glow = '#FF41B0'
-                    FxUnder = (New-HorizonGlow) }
+                    FxUnder = (New-HorizonGlow)
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#7AFFD1EC', 0), @('#22FF41B0', 0.10), @('#00000000', 0.5), @('#1633E0FF', 1))) }
 }
 
 # two code-made overlay layers for theme effects: one under the content
@@ -1823,10 +1860,14 @@ $script:ThemeSpecs = [ordered]@{
 $script:ThemeFxUnder = New-Object System.Windows.Controls.Border
 $script:ThemeFxOver  = New-Object System.Windows.Controls.Border
 foreach ($fx in @($script:ThemeFxUnder, $script:ThemeFxOver)) {
-    $fx.CornerRadius = New-Object System.Windows.CornerRadius(15)
     $fx.IsHitTestVisible = $false
     $fx.Visibility = 'Collapsed'
 }
+# the under-layer doubles as the inner GLINT: inset 1.2 so its 1px border
+# sits just inside the card's own border, like GlassInner does for glass
+$script:ThemeFxUnder.Margin = New-Object System.Windows.Thickness(1.2)
+$script:ThemeFxUnder.CornerRadius = New-Object System.Windows.CornerRadius(14.8)
+$script:ThemeFxOver.CornerRadius = New-Object System.Windows.CornerRadius(15)
 try {
     $cardGrid = $script:RootCard.Child
     $cardGrid.Children.Insert(2, $script:ThemeFxUnder)   # above glass optics, below content
@@ -1918,12 +1959,23 @@ function Apply-Theme {
         $script:RootCard.BorderBrush = $spec.BorderBrush
         $script:RootCard.Background = $spec.Bg
         foreach ($o in $overlays) { $o.Visibility = 'Collapsed' }
-        foreach ($pair in @(
-                , @($script:ThemeFxUnder, $spec.FxUnder)
-                , @($script:ThemeFxOver, $spec.FxOver))) {
-            if ($null -ne $pair[1]) { $pair[0].Background = $pair[1]; $pair[0].Visibility = 'Visible' }
-            else { $pair[0].Visibility = 'Collapsed' }
+        # under-layer: light source as background + inner glint as border
+        $script:ThemeFxUnder.Background = $spec.FxUnder
+        if ($null -ne $spec.FxUnderEdge) {
+            $script:ThemeFxUnder.BorderBrush = $spec.FxUnderEdge
+            $script:ThemeFxUnder.BorderThickness = New-Object System.Windows.Thickness(1)
         }
+        else {
+            $script:ThemeFxUnder.BorderBrush = $null
+            $script:ThemeFxUnder.BorderThickness = New-Object System.Windows.Thickness(0)
+        }
+        $script:ThemeFxUnder.Visibility = $(
+            if ($null -ne $spec.FxUnder -or $null -ne $spec.FxUnderEdge) { 'Visible' } else { 'Collapsed' })
+        if ($null -ne $spec.FxOver) {
+            $script:ThemeFxOver.Background = $spec.FxOver
+            $script:ThemeFxOver.Visibility = 'Visible'
+        }
+        else { $script:ThemeFxOver.Visibility = 'Collapsed' }
     }
     # the bird's halo matches the room
     try {
@@ -3304,7 +3356,15 @@ function Update-LimitsPanel {
                             [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
             }
             catch { }
-            $willCap = ($capsAt -gt [datetime]::MinValue -and $capsAt -lt $resetAt)
+            # a caps claim must BEAT a reset we can actually see: no known
+            # reset time = no claim (a prediction that outlives the real
+            # reset is worse than none), reset already due = the reset wins,
+            # and a hit >12h out is rate noise, not a warning
+            $willCap = ($capsAt -gt [datetime]::MinValue -and
+                        $resetAt -lt [datetime]::MaxValue -and
+                        $resetAt -gt $now -and
+                        $capsAt -lt $resetAt -and
+                        ($capsAt - $now).TotalHours -lt 12)
             if ($willCap -and $hex -eq '#5ED584') { $hex = '#FFB84D' }
 
             $g = New-Object System.Windows.Controls.Grid
@@ -3400,6 +3460,25 @@ function Update-LimitsPanel {
     catch { }
 }
 
+function Repair-Mojibake([string]$T) {
+    # the hook used to read stdin with the OEM codepage, so UTF-8 punctuation
+    # arrived as CP850 mojibake (em-dash = 'ΓÇö'). Reverse it: re-encode as
+    # CP850, re-decode as STRICT UTF-8 - both steps throw unless the text
+    # really is mojibake, so organic text (even actual Greek) survives intact.
+    if ([string]::IsNullOrEmpty($T) -or $T.IndexOf([char]0x0393) -lt 0) { return $T }
+    foreach ($cp in @(437, 850)) {   # 'Γ' at 0xE2 is CP437; 850 kept as spare
+        try {
+            $enc = [System.Text.Encoding]::GetEncoding($cp,
+                (New-Object System.Text.EncoderExceptionFallback),
+                (New-Object System.Text.DecoderExceptionFallback))
+            $bytes = $enc.GetBytes($T)
+            return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+        }
+        catch { }
+    }
+    return $T
+}
+
 function Get-PeekDisplayText([string]$T, [int]$Max) {
     # raw transcript text is hostile to a one-glance tooltip: control chars,
     # markdown emphasis, box-drawing rules from pasted terminal output, and
@@ -3489,7 +3568,9 @@ function New-Chip([string]$Text, [string]$Hex) {
     $chip = New-Object System.Windows.Controls.Border
     $chip.CornerRadius = New-Object System.Windows.CornerRadius(9)
     $chip.Padding = New-Object System.Windows.Thickness(8, 2, 8, 3)
-    $chip.Margin = New-Object System.Windows.Thickness(0, 0, 6, 0)
+    # vertical 2+2 so WRAPPED chip rows breathe (quiet used to sit glued
+    # under need-you); the panel margin below drops 8->4 to compensate
+    $chip.Margin = New-Object System.Windows.Thickness(0, 2, 6, 2)
     $chip.Background = Get-Brush ('#22' + $Hex.Substring(1))
     $tb = New-Object System.Windows.Controls.TextBlock
     $tb.Text = $Text

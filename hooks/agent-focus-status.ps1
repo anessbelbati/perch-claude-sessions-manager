@@ -575,7 +575,18 @@ function Get-ConsoleTabHint {
 }
 
 try {
-    $raw = [Console]::In.ReadToEnd()
+    # read stdin as UTF-8 BYTES, not through [Console]::In - the console
+    # reader decodes with the OEM codepage (CP850 here), which turned every
+    # em-dash / curly quote in last_assistant_message into mojibake that we
+    # then stored and displayed ('ΓÇö' all over the session rows)
+    $raw = $null
+    try {
+        $stdinReader = New-Object System.IO.StreamReader(
+            [Console]::OpenStandardInput(), (New-Object System.Text.UTF8Encoding($false)))
+        $raw = $stdinReader.ReadToEnd()
+    }
+    catch { }
+    if ($null -eq $raw) { $raw = [Console]::In.ReadToEnd() }
     if ([string]::IsNullOrWhiteSpace($raw)) {
         Write-HookSuccess
     }

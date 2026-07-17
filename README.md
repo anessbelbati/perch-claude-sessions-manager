@@ -120,6 +120,7 @@ things that bit me so they don't have to bite you:
 - **process-hunting by command-line substring matches your own diagnostic process.** i killed my own kill-script mid-run more than once.
 - **no hook fires on esc.** claude code's `Stop` hook deliberately skips user interrupts, and `/compact` has a `PreCompact` but no post — two officially invisible transitions that left rows painted "working" forever. the console screen is the only witness.
 - **the TUI's hint line rotates.** "esc to interrupt" vanishes every few seconds in favor of random tips — a session 9 minutes into a bash call showed only a tip. deciding a session stopped because that hint is absent flips live sessions to done; trust the elapsed-timer/token row and the title's spinner glyph instead, and demand two clean sightings before believing anything.
+- **`[Console]::In` decodes stdin with the OEM codepage.** claude pipes UTF-8 JSON into hooks; the console reader read it as CP437, so every em-dash and curly quote stored from assistant messages became `ΓÇö`-style mojibake in the session rows. read `OpenStandardInput()` through a UTF-8 StreamReader instead — and the widget carries a strict round-trip reverse-repair (re-encode CP437, strict-decode UTF-8, keep only if both succeed) that heals records written before the fix without ever touching organic text.
 
 ## stolen with love
 

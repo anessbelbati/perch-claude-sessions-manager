@@ -1,0 +1,15 @@
+bird chirps bundled as perch's notification sounds.
+
+source: https://mixkit.co/free-sound-effects/bird/
+license: Mixkit Sound Effects Free License
+         https://mixkit.co/license/#sfxFree
+         (free for commercial and non-commercial use as part of a project;
+         these files ship here solely as perch's app assets, not as a
+         sound library)
+
+chirp-1.wav  <- mixkit-tropical-bird-squeak-27.wav
+chirp-2.wav  <- mixkit-little-bird-calling-chirp-23.wav
+chirp-3.wav  <- mixkit-melodic-songbird-chirp-67.wav
+
+don't like these birds? drop any .wav files in this folder - perch picks
+one at random per chirp.

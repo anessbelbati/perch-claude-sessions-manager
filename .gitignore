@@ -6,5 +6,4 @@ hud-boot.log
 icon-preview.png
 .osgrep
 
-# bird sounds are not redistributable (mixkit license) - bring your own
-sounds/
+# (bird chirps now ship in sounds/ - mixkit free license, see ATTRIBUTION)

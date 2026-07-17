@@ -3492,6 +3492,9 @@ function New-SessionRow($Sess) {
     $tt.BorderBrush = Get-Brush '#2EFFFFFF'
     $tt.BorderThickness = New-Object System.Windows.Thickness(1)
     $tt.Padding = New-Object System.Windows.Thickness(11, 8, 11, 9)
+    # placeholder content is LOAD-BEARING: WPF never opens an empty ToolTip,
+    # so ToolTipOpening (where the real content gets built) would never fire
+    $tt.Content = [string][char]0x2026
     $row.ToolTip = $tt
     [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($row, 700)
     [System.Windows.Controls.ToolTipService]::SetShowDuration($row, 60000)

@@ -121,6 +121,19 @@ things that bit me so they don't have to bite you:
 - **no hook fires on esc.** claude code's `Stop` hook deliberately skips user interrupts, and `/compact` has a `PreCompact` but no post — two officially invisible transitions that left rows painted "working" forever. the console screen is the only witness.
 - **the TUI's hint line rotates.** "esc to interrupt" vanishes every few seconds in favor of random tips — a session 9 minutes into a bash call showed only a tip. deciding a session stopped because that hint is absent flips live sessions to done; trust the elapsed-timer/token row and the title's spinner glyph instead, and demand two clean sightings before believing anything.
 
+## stolen with love
+
+perch is windows-native and proud, but a bunch of its best tricks were shamelessly studied from the macOS / terminal crowd. i literally cloned their repos, read their source, and took notes like a magpie:
+
+- [ccusage](https://github.com/ryoppippi/ccusage) — the 5-hour billing-block model and the "transcripts are append-only, parse incrementally" insight. the offline `5h ~local` bars are this idea wearing a PowerShell trench coat.
+- [Claude-Code-Usage-Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor) — P90 *learn your limit from your own history* thinking, and burn-rate → predicted cutoff ("caps ~15:40").
+- [ccmanager](https://github.com/kbwo/ccmanager) — the screen-content state detectors ("press enter to confirm…", "esc to interrupt") that power hookless needs-you detection. best pattern list in the business.
+- [CodexBar](https://github.com/steipete/CodexBar) — the *identify yourself as the CLI* User-Agent trick on the usage endpoint. one header, night and day difference in how you get rate-limited.
+- [ccseva](https://github.com/Iamshankhadeep/ccseva) and the rest of the menubar companion crowd — the conviction that a tiny always-visible meter beats a dashboard you have to open, plus the hover prompt-peek.
+- [claude-squad](https://github.com/smtg-ai/claude-squad) — not robbed yet, but the git-worktree session spawning is on the list.
+
+no code was copied — everything here is hand-rolled PowerShell 5.1 (their stacks are TypeScript/Python/Go/Swift anyway, the trench coat wouldn't fit). *ideas*, however, were taken without hesitation, and a few came out upgraded: their 5h blocks floor to the hour, ours snap to the server's actual reset time; their caps are plan presets or P90 guesses, ours calibrate against official percentages. that's the deal with building in the open — thanks for doing it 🐦
+
 ## files
 
 | file | what |

@@ -444,35 +444,19 @@ function Read-ConsoleInfoBounded {
         if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
         $screen = $p.StandardOutput.ReadLine()
         if ($null -eq $screen) { $screen = '' }
-        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen }
+        [long]$conPid = 0
+        $conLine = $p.StandardOutput.ReadLine()
+        if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
+        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid }
     }
     catch { return $null }
     finally { try { $p.Dispose() } catch { } }
 }
 
-function Resolve-TabByMarker {
-    # Uniquely identify which tab hosts a process's console: a bounded child
-    # stamps a marker title for ~900ms while we watch which tab shows it.
-    param([int]$TargetPid)
-
-    $marker = "perch-$TargetPid"
-    $p = Start-ConsoleProbe -TargetPid $TargetPid -Marker $marker
-    if ($null -eq $p) { return $null }
-    try {
-        $match = $null
-        $normMarker = Get-NormalizedTabName $marker
-        for ($i = 0; $i -lt 12; $i++) {
-            Start-Sleep -Milliseconds 150
-            $match = @(Get-AllTerminalTabs -Fresh) | Where-Object { $_.Norm -eq $normMarker } | Select-Object -First 1
-            if ($null -ne $match) { break }
-            if ($p.HasExited -and $i -gt 1) { break }
-        }
-        if (-not $p.WaitForExit(3000)) { try { $p.Kill() } catch { } }
-        return $match
-    }
-    catch { return $null }
-    finally { try { $p.Dispose() } catch { } }
-}
+# (a marker-title dance used to live here: stamp a unique title on the
+# agent's console, watch which tab shows it. TRUE ownership proof - except
+# ConPTY never propagates externally-set titles to WT tabs, verified live,
+# so it never fired. Content matching via Resolve-TabByCycle is its heir.)
 
 $script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance runs once per process)
 $script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain conhost windows, no WT tab)
@@ -481,6 +465,9 @@ $script:ProbeBudget = 4         # console probes allowed this tick (reset in Upd
 $script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel for the passive learner)
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
+$script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found nothing (30s cooldown)
+$script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
+$script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
 
 function Invoke-PassiveTabLearn {
     # follow the PROCESS, not names: whatever tab the user has open exposes
@@ -497,6 +484,30 @@ function Invoke-PassiveTabLearn {
     if (-not $unmapped) { return }
     $tabs = @(Get-AllTerminalTabs)
     if ($tabs.Count -eq 0) { return }
+
+    # keep candidate screens FRESH: agents redraw constantly, so a stale
+    # fingerprint never matches the live pane and the learner goes blind -
+    # forcing the (visible) click-time tab walk to do the job instead
+    foreach ($apid in @($script:LastScreenMap.Keys)) {
+        if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
+        if ($null -eq (Get-Process -Id $apid -ErrorAction SilentlyContinue)) {
+            [void]$script:LastScreenMap.Remove($apid)
+            continue
+        }
+        $entry = $script:LastScreenMap[$apid]
+        if (((Get-Date) - $entry.Stamp).TotalSeconds -lt 30) { continue }
+        if ($script:ProbeBudget -le 0) { break }
+        $script:ProbeBudget--
+        $fresh = Read-ConsoleInfoBounded -TargetPid $apid
+        if ($null -ne $fresh) {
+            $script:LastTitleByPid[$apid] = [string]$fresh.Title
+            if ([long]$fresh.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$fresh.ConsoleId }
+        }
+        if ($null -ne $fresh -and ([string]$fresh.Screen).Length -ge 200) {
+            $script:LastScreenMap[$apid] = @{ Text = [string]$fresh.Screen; Stamp = (Get-Date) }
+        }
+        else { $entry.Stamp = (Get-Date) }   # don't hammer a mute console
+    }
 
     $claimed = @{}
     foreach ($v in $script:UntrackedTabMap.Values) { $claimed[[string]$v] = $true }
@@ -515,7 +526,7 @@ function Invoke-PassiveTabLearn {
         $best = $null; $bestScore = 0; $second = 0
         foreach ($apid in @($script:LastScreenMap.Keys)) {
             if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
-            $sc = Get-ScreenMatchScore -S ([string]$script:LastScreenMap[$apid]) -T $paneText
+            $sc = Get-ScreenMatchScore -S ([string]$script:LastScreenMap[$apid].Text) -T $paneText
             if ($sc -gt $bestScore) { $second = $bestScore; $bestScore = $sc; $best = $apid }
             elseif ($sc -gt $second) { $second = $sc }
         }
@@ -535,12 +546,18 @@ function Resolve-TabByCycle {
     # called from a user click (the user asked to switch tabs; flipping
     # through a few on the way is fine). The result is cached, so this runs
     # at most once per process.
-    param([int]$TargetPid)
+    param([int]$TargetPid, [string[]]$PreferredNorms = @())
+
+    if ($script:CycleFailStamp.ContainsKey($TargetPid)) {
+        # a double-click must not run the whole light show twice in a row
+        if (((Get-Date) - $script:CycleFailStamp[$TargetPid]).TotalSeconds -lt 30) { return $null }
+        [void]$script:CycleFailStamp.Remove($TargetPid)
+    }
 
     $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
     if ($null -eq $info -or ([string]$info.Screen).Length -lt 200) { return $null }
     $s = [string]$info.Screen
-    $script:LastScreenMap[$TargetPid] = $s
+    $script:LastScreenMap[$TargetPid] = @{ Text = $s; Stamp = (Get-Date) }
 
     $tabs = @(Get-AllTerminalTabs -Fresh)
     if ($tabs.Count -eq 0) { return $null }
@@ -550,13 +567,29 @@ function Resolve-TabByCycle {
         if ($tb.Selected -and -not $original.ContainsKey($hk)) { $original[$hk] = $tb }
     }
 
-    # score EVERY tab and require a decisive winner: freshly restarted twin
-    # sessions show near-identical screens, and stopping at the first
+    # tabs OWNED by other sessions (ownership-proven mappings) are not
+    # candidates: fewer visible flips and no way to land on a busy neighbor
+    $claimed = @{}
+    foreach ($r in @($script:KnownRidClaims.Keys)) {
+        if ([int]$script:KnownRidClaims[$r] -ne $TargetPid) { $claimed[[string]$r] = $true }
+    }
+    foreach ($k in @($script:UntrackedTabMap.Keys)) {
+        if ([int]$k -ne $TargetPid) { $claimed[[string]$script:UntrackedTabMap[$k]] = $true }
+    }
+    $cands = @($tabs | Where-Object { $null -ne $_.Element -and $_.Rid.Length -gt 0 -and -not $claimed.ContainsKey($_.Rid) })
+    if ($cands.Count -eq 0) { return $null }
+    if ($PreferredNorms.Count -gt 0) {
+        # most-likely first (tab named like the row): the walk usually ends
+        # on flip #1 instead of touring the whole strip
+        $cands = @($cands | Sort-Object -Property @{ Expression = { if ($PreferredNorms -contains $_.Norm) { 0 } else { 1 } } })
+    }
+
+    # score every candidate and require a decisive winner: freshly restarted
+    # twin sessions show near-identical screens, and stopping at the first
     # plausible match once sent a click to the WRONG session's tab
     $best = $null; $bestScore = 0; $second = 0
     try {
-        foreach ($tb in $tabs) {
-            if ($null -eq $tb.Element -or $tb.Rid.Length -eq 0) { continue }
+        foreach ($tb in $cands) {
             try {
                 $pat = $tb.Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
                 $pat.Select()
@@ -585,6 +618,7 @@ function Resolve-TabByCycle {
         catch { }
         return $best
     }
+    $script:CycleFailStamp[$TargetPid] = Get-Date
     foreach ($hk in @($original.Keys)) {
         # no decisive winner: put the user back on the tab they were on -
         # doing nothing beats jumping to the wrong session
@@ -672,14 +706,35 @@ function Resolve-TabForPid {
 
     $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
     $match = $null
-    if ($null -ne $info -and ([string]$info.Screen).Length -ge 200) {
-        $script:LastScreenMap[$TargetPid] = [string]$info.Screen   # fuels the passive learner
-    }
     if ($null -ne $info) {
-        # ownership-proven marker dance, NEVER by-title matching: titles are
-        # values, not ownership - freshly restarted twin sessions briefly share
-        # identical titles and title matching once cross-mapped two sessions
-        $match = Resolve-TabByMarker -TargetPid $TargetPid
+        if (([string]$info.Screen).Length -ge 200) {
+            $script:LastScreenMap[$TargetPid] = @{ Text = [string]$info.Screen; Stamp = (Get-Date) }   # fuels the passive learner
+        }
+        $script:LastTitleByPid[$TargetPid] = [string]$info.Title
+        if ([long]$info.ConsoleId -gt 0) { $script:ConsoleIdByPid[$TargetPid] = [long]$info.ConsoleId }
+    }
+    if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.Title)) {
+        # TWIN-PROOF title matching. A title is a value, not ownership: two
+        # freshly restarted sessions briefly share identical titles and plain
+        # title matching once cross-mapped them (click on A focused B). The
+        # match only counts when NO other known console currently shows the
+        # same title - processes sharing OUR console (codex.exe launcher +
+        # its node TUI) are the same session and don't count as twins.
+        # (A stamped marker WOULD be true ownership proof, but ConPTY never
+        # propagates externally-set titles to the WT tab - verified live.)
+        $norm = Get-NormalizedTabName $info.Title
+        $byName = @($tabs | Where-Object { $_.Norm -eq $norm })
+        if ($byName.Count -eq 1) {
+            $ownConsole = [long]$script:ConsoleIdByPid[$TargetPid]
+            $clash = $false
+            foreach ($opid in @($script:LastTitleByPid.Keys)) {
+                if ([int]$opid -eq $TargetPid) { continue }
+                if ($ownConsole -gt 0 -and [long]$script:ConsoleIdByPid[$opid] -eq $ownConsole) { continue }
+                if ($null -eq (Get-Process -Id $opid -ErrorAction SilentlyContinue)) { continue }
+                if ((Get-NormalizedTabName ([string]$script:LastTitleByPid[$opid])) -eq $norm) { $clash = $true; break }
+            }
+            if (-not $clash) { $match = $byName[0] }
+        }
     }
     if ($null -eq $match -and $CwdName.Length -gt 0) {
         # manually-RENAMED tabs ignore console-title changes, so neither the
@@ -963,7 +1018,12 @@ function Invoke-FocusSession($Sess) {
             # Follow the PROCESS itself: probe its console screen and cycle
             # tabs until the pane CONTENT matches decisively. Stronger evidence
             # than any name. Runs once per process (cached), only on clicks.
-            $target = Resolve-TabByCycle -TargetPid ([int]$Sess.AgentPid)
+            $prefNorms = @()
+            foreach ($cand in @([string]$Sess.DisplayName, [string]$Sess.CwdName)) {
+                $n = Get-NormalizedTabName $cand
+                if ($n.Length -gt 0 -and $prefNorms -notcontains $n) { $prefNorms += $n }
+            }
+            $target = Resolve-TabByCycle -TargetPid ([int]$Sess.AgentPid) -PreferredNorms $prefNorms
         }
 
         if ($null -eq $target) {

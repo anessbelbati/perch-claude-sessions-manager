@@ -415,12 +415,11 @@ function Get-ConsoleTabHint {
         $prevTitle = $sb.ToString()
         Write-HookDebug "ev=$EventName attached($AgentPid) title=[$prevTitle]"
 
-        # NOTE: deliberately NO by-title tab matching here. A title is a VALUE,
-        # not ownership: two just-started sessions briefly show identical
-        # titles, and a batch restart once cross-captured two sessions (both
-        # status files ended up with the SAME tab id - clicking session A
-        # focused session B's tab). The marker is ownership-proven: only OUR
-        # console can ever display it.
+        # marker first: IF the tab shows it, that is true ownership proof
+        # (only our console can display it). In practice ConPTY does not
+        # propagate externally-set titles to WT tabs (verified live), so this
+        # usually fails fast and the hardened passes below do the real work -
+        # kept because it is cheap and correct where it does fire.
         $match = $null
         $capTag = "console"
         $suffix = $SessionId
@@ -437,6 +436,41 @@ function Get-ConsoleTabHint {
         catch { $match = $null }
         finally {
             try { [void][AgentFocus.ConsoleApi]::SetConsoleTitle($prevTitle) } catch { }
+        }
+
+        if ($null -eq $match -and -not [string]::IsNullOrWhiteSpace($prevTitle)) {
+            # TWIN-PROOF title matching. A title is a VALUE, not ownership:
+            # batch-restarted sessions briefly show identical titles, and
+            # plain title matching once cross-captured two sessions (both
+            # status files stored the SAME tab id - clicking session A focused
+            # session B). Only match when no OTHER live session's console
+            # shows this title right now.
+            $candidate = Find-TerminalTabByName -Name $prevTitle
+            if ($null -ne $candidate -and $candidate.unique) {
+                $normTitle = Get-NormalizedTitle $prevTitle
+                $clash = $false
+                try {
+                    $statusDir = Join-Path $env:LOCALAPPDATA "AgentFocus\status"
+                    foreach ($f in @(Get-ChildItem -LiteralPath $statusDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
+                        if ($f.LastWriteTime -lt (Get-Date).AddDays(-2)) { continue }
+                        $other = $null
+                        try { $other = Get-Content -LiteralPath $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+                        if ($null -eq $other -or $null -eq $other.PSObject.Properties['agent_pid']) { continue }
+                        $otherPid = [int]$other.agent_pid
+                        if ($otherPid -le 0 -or $otherPid -eq $AgentPid) { continue }
+                        if ([string]$other.status -eq 'ended') { continue }
+                        if ($null -eq (Get-Process -Id $otherPid -ErrorAction SilentlyContinue)) { continue }
+                        $otherTitle = Get-AgentConsoleTitle -AgentPid $otherPid
+                        if (-not [string]::IsNullOrWhiteSpace($otherTitle) -and
+                            (Get-NormalizedTitle $otherTitle) -eq $normTitle) { $clash = $true; break }
+                    }
+                }
+                catch { $clash = $true }   # cannot verify -> do not trust
+                if ($clash) {
+                    Write-HookDebug "ev=$EventName title match REFUSED (twin clash on [$prevTitle])"
+                }
+                else { $match = $candidate }
+            }
         }
 
         if ($null -eq $match -and -not [string]::IsNullOrWhiteSpace($CwdName)) {
@@ -585,8 +619,11 @@ try {
         ([string]$window.captured_event) -like "*+console") {
         $hasConsoleHint = $true
     }
+    # UserPromptSubmit recaptures even when a hint EXISTS: a wrong hint (twin
+    # cross-capture) would otherwise survive until the session restarts, and
+    # the prompt moment is cheap, human-paced ground truth
     $needCapture = ($eventName -eq "SessionStart") -or
-                   ($eventName -eq "UserPromptSubmit" -and -not $hasConsoleHint) -or
+                   ($eventName -eq "UserPromptSubmit") -or
                    ($eventName -ne "SessionEnd" -and -not $hasConsoleHint -and -not $headless)
     if ($needCapture) {
         # NOTE: no foreground-window fallback here on purpose. Guessing from

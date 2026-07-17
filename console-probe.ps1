@@ -10,6 +10,9 @@
 #                letters+digits (single line, capped) - lets the parent match
 #                a session to a WT tab by CONTENT via UIA TextPattern, which
 #                works even for manually renamed tabs that ignore titles.
+# stdout line 4: the conhost pid that OWNS this console (identity key: the
+#                codex.exe launcher and its node TUI share one console, and
+#                the parent must know they are the same session, not twins).
 # With -Marker: also stamps the marker title for MarkerMs (parent watches
 # which WT tab shows it) and restores.
 param(
@@ -28,6 +31,7 @@ public static class PK {
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
@@ -54,6 +58,14 @@ try {
     $prev = $sb.ToString()
     $cw = [PK]::GetConsoleWindow()
     $cwOut = 0
+    $conPid = 0
+    if ($cw -ne [IntPtr]::Zero) {
+        # owner of the console window (real OR the ConPTY fake one) = the
+        # conhost/OpenConsole hosting this console = stable session identity
+        [uint32]$wp = 0
+        [void][PK]::GetWindowThreadProcessId($cw, [ref]$wp)
+        $conPid = [long]$wp
+    }
     if ($cw -ne [IntPtr]::Zero -and [PK]::IsWindowVisible($cw)) {
         # ConPTY gives every WT tab a FAKE "PseudoConsoleWindow" that can still
         # report visible - only a REAL conhost window is a usable click target
@@ -94,6 +106,7 @@ try {
     $out.WriteLine($prev)
     $out.WriteLine([string]$cwOut)
     $out.WriteLine($screen)
+    $out.WriteLine([string]$conPid)
     $out.Flush()
     if ($Marker.Length -gt 0) {
         [void][AgentFocus.ConsoleApi]::SetConsoleTitle($Marker)

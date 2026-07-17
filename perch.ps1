@@ -1685,7 +1685,7 @@ $xaml = @"
   <!-- the resting pill is its OWN tiny card, not a squeezed RootCard: the
        peek morph is a pure crossfade between the two (render-only, no
        per-frame layout, no window-rect animation - THAT was the jank) -->
-  <Border x:Name="PillCard" CornerRadius="19" BorderThickness="1" Margin="8"
+  <Border x:Name="PillCard" CornerRadius="23" BorderThickness="1" Margin="8"
           HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed"/>
   </Grid>
 </Window>
@@ -1958,7 +1958,7 @@ $pillRow.Orientation = 'Horizontal'
 $pillRow.VerticalAlignment = 'Center'
 
 $birdGrid = New-Object System.Windows.Controls.Grid
-$birdGrid.Width = 28; $birdGrid.Height = 28
+$birdGrid.Width = 36; $birdGrid.Height = 36
 $script:PillRingTrack = New-Object System.Windows.Shapes.Ellipse
 $script:PillRingTrack.Stroke = Get-Brush '#1EFFFFFF'
 $script:PillRingTrack.StrokeThickness = 2.4
@@ -1973,7 +1973,7 @@ $script:PillRingArc.Visibility = 'Collapsed'
 if ($null -ne $script:LogoSource) {
     $pillBird = New-Object System.Windows.Controls.Image
     $pillBird.Source = $script:LogoSource
-    $pillBird.Width = 17; $pillBird.Height = 17
+    $pillBird.Width = 26; $pillBird.Height = 26
     $pillBird.HorizontalAlignment = 'Center'
     $pillBird.VerticalAlignment = 'Center'
     [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($pillBird, 'HighQuality')
@@ -2000,7 +2000,7 @@ $pillClusterPanel.VerticalAlignment = 'Center'
 $pillClusterPanel.Margin = New-Object System.Windows.Thickness(9, 0, 0, 0)
 foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED584'))) {
     $t = New-Object System.Windows.Controls.TextBlock
-    $t.FontSize = 11
+    $t.FontSize = 12.5
     $t.FontWeight = [System.Windows.FontWeights]::SemiBold
     $t.Foreground = Get-Brush $cdef[1]
     $t.Margin = New-Object System.Windows.Thickness(0, 0, 7, 0)
@@ -2031,7 +2031,7 @@ foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED58
 }
 $pillZzz = New-Object System.Windows.Controls.TextBlock
 $pillZzz.Text = 'zzz'
-$pillZzz.FontSize = 10.5
+$pillZzz.FontSize = 12
 $pillZzz.FontStyle = [System.Windows.FontStyles]::Italic
 $pillZzz.Foreground = Get-Brush '#8A8A93'
 $pillZzz.VerticalAlignment = 'Center'
@@ -2210,20 +2210,20 @@ function Update-PillRing {
         return
     }
     $script:PillRingArc.Stroke = Get-Brush $script:Pill5hHex
-    $r = 12.8
+    $r = 16.8
     if ($pct -ge 99.5) {
         # a closed arc is degenerate geometry - full circle gets an ellipse
         $eg = New-Object System.Windows.Media.EllipseGeometry(
-            (New-Object System.Windows.Point(14, 14)), $r, $r)
+            (New-Object System.Windows.Point(18, 18)), $r, $r)
         $eg.Freeze()
         $script:PillRingArc.Data = $eg
     }
     else {
         $ang = [Math]::Max(0.02, $pct / 100.0) * 2.0 * [Math]::PI
         $fig = New-Object System.Windows.Media.PathFigure
-        $fig.StartPoint = New-Object System.Windows.Point(14.0, (14.0 - $r))
+        $fig.StartPoint = New-Object System.Windows.Point(18.0, (18.0 - $r))
         $arc = New-Object System.Windows.Media.ArcSegment(
-            (New-Object System.Windows.Point((14.0 + $r * [Math]::Sin($ang)), (14.0 - $r * [Math]::Cos($ang)))),
+            (New-Object System.Windows.Point((18.0 + $r * [Math]::Sin($ang)), (18.0 - $r * [Math]::Cos($ang)))),
             (New-Object System.Windows.Size($r, $r)),
             0, ($pct -gt 50), 'Clockwise', $true)
         [void]$fig.Segments.Add($arc)

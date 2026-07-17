@@ -658,9 +658,23 @@ try {
         # Viewers use it to re-match the tab even if the runtime id went stale.
         # (only for title-following tabs: a cwdname-captured tab is RENAMED, its
         # console title never matches the tab, refreshing would break matching)
-        $liveTitle = Get-AgentConsoleTitle -AgentPid $agentPid
-        if (-not [string]::IsNullOrWhiteSpace($liveTitle)) {
-            $window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveTitle -Force
+        # THROTTLED to 15s: AttachConsole is a conhost RPC that contends with
+        # the agent's own rendering, and this used to run on EVERY tool call.
+        $needFresh = $true
+        if ($null -ne $window.PSObject.Properties['tab_name_at']) {
+            try {
+                $lastAt = [datetime]::Parse([string]$window.tab_name_at, $null,
+                          [System.Globalization.DateTimeStyles]::RoundtripKind)
+                if (((Get-Date).ToUniversalTime() - $lastAt.ToUniversalTime()).TotalSeconds -lt 15) { $needFresh = $false }
+            }
+            catch { }
+        }
+        if ($needFresh) {
+            $liveTitle = Get-AgentConsoleTitle -AgentPid $agentPid
+            if (-not [string]::IsNullOrWhiteSpace($liveTitle)) {
+                $window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveTitle -Force
+                $window | Add-Member -NotePropertyName tab_name_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("o")) -Force
+            }
         }
     }
 

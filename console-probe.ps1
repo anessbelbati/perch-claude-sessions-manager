@@ -84,19 +84,23 @@ try {
         if ($h -ne [IntPtr]::Zero -and $h.ToInt64() -ne -1) {
             $info = New-Object PK+CSBI
             if ([PK]::GetConsoleScreenBufferInfo($h, [ref]$info)) {
+                # ONE RPC for the whole viewport: reads wrap cell-to-cell
+                # across rows. The old per-row loop made ~50 conhost round
+                # trips per probe, and conhost serializes them against the
+                # agent's own writes - probing was visibly slowing the TUIs.
                 $w = [int]$info.dwSize.X
-                $parts = New-Object System.Text.StringBuilder
-                for ($y = [int]$info.srWindow.Top; $y -le [int]$info.srWindow.Bottom; $y++) {
-                    $buf = New-Object char[] $w
+                $rows = [int]$info.srWindow.Bottom - [int]$info.srWindow.Top + 1
+                $len = [Math]::Min($w * $rows, 16000)
+                if ($len -gt 0) {
+                    $buf = New-Object char[] $len
                     $coord = New-Object PK+COORD
-                    $coord.X = 0; $coord.Y = [int16]$y
+                    $coord.X = 0; $coord.Y = [int16][int]$info.srWindow.Top
                     [uint32]$read = 0
-                    if ([PK]::ReadConsoleOutputCharacterW($h, $buf, [uint32]$w, $coord, [ref]$read)) {
-                        [void]$parts.Append((New-Object string($buf, 0, [int]$read)))
+                    if ([PK]::ReadConsoleOutputCharacterW($h, $buf, [uint32]$len, $coord, [ref]$read)) {
+                        $screen = ((New-Object string($buf, 0, [int]$read)) -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
+                        if ($screen.Length -gt 6000) { $screen = $screen.Substring(0, 6000) }
                     }
                 }
-                $screen = ($parts.ToString() -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
-                if ($screen.Length -gt 6000) { $screen = $screen.Substring(0, 6000) }
             }
             [void][PK]::CloseHandle($h)
         }

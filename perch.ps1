@@ -371,6 +371,15 @@ function Get-Sessions {
         if ($r.Length -gt 0) { $script:KnownRidClaims[$r] = [int]$s.AgentPid }
     }
 
+    # WORKING sessions are left alone by background probing: their consoles
+    # are busy rendering (probes contend with that via conhost RPC and were
+    # measurably slowing the CLIs), and their screens change too fast to
+    # fingerprint anyway. They get probed when they calm down.
+    $script:BusyPids = @{}
+    foreach ($s in $kept) {
+        if ($s.Status -eq 'working' -and $s.AgentPid -gt 0) { $script:BusyPids[[int]$s.AgentPid] = $true }
+    }
+
     # apply user prefs: custom names + pinned-to-top
     foreach ($s in $kept) {
         $display = $s.CwdName
@@ -561,6 +570,7 @@ $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conf
 $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found nothing (30s cooldown)
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
+$script:BusyPids = @{}          # pids of WORKING sessions - background probing leaves them alone
 
 function Invoke-PassiveTabLearn {
     # follow the PROCESS, not names: whatever tab the user has open exposes
@@ -584,12 +594,13 @@ function Invoke-PassiveTabLearn {
     # Probes are ASYNC (results arrive on a later tick) - zero UI blocking.
     foreach ($apid in @($script:LastScreenMap.Keys)) {
         if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
+        if ($script:BusyPids.ContainsKey($apid)) { continue }   # let working TUIs render in peace
         if ($null -eq (Get-Process -Id $apid -ErrorAction SilentlyContinue)) {
             [void]$script:LastScreenMap.Remove($apid)
             continue
         }
         $entry = $script:LastScreenMap[$apid]
-        if (((Get-Date) - $entry.Stamp).TotalSeconds -lt 30) { continue }
+        if (((Get-Date) - $entry.Stamp).TotalSeconds -lt 60) { continue }
         $fresh = Request-ConsoleInfo -TargetPid $apid
         if ($null -eq $fresh) { continue }   # pending or out of budget - later tick
         if ($null -ne $fresh.PSObject.Properties['Failed']) { $entry.Stamp = (Get-Date); continue }
@@ -1422,6 +1433,9 @@ $script:SessionList = $Window.FindName('SessionList')
 $script:ChipsPanel  = $Window.FindName('ChipsPanel')
 $script:LimitsPanel = $Window.FindName('LimitsPanel')
 $script:UsageFetchStamp = [datetime]::MinValue
+$script:UsageHist = @{}      # limit label -> samples of (T, Pct) for burn-rate math
+$script:LimitAlerted = @{}   # limit label -> chirped-at-90 flag (cleared on reset)
+$script:LastUsageKey = ''
 $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
@@ -2619,11 +2633,60 @@ function Update-LimitsPanel {
                     [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
         if (($now - $fetched).TotalMinutes -gt 15) { return }   # stale = say nothing
 
+        # burn-rate history: one sample per NEW fetch, per limit
+        $isNewSample = ([string]$u.fetched_at -ne $script:LastUsageKey)
+        if ($isNewSample) { $script:LastUsageKey = [string]$u.fetched_at }
+
         foreach ($lim in @($u.limits)) {
             $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$lim.percent))
             $hex = '#5ED584'
             if ($pct -ge 90 -or [string]$lim.severity -match 'exceeded|blocked') { $hex = '#FF6B6B' }
             elseif ($pct -ge 70 -or [string]$lim.severity -match 'warn') { $hex = '#FFB84D' }
+
+            $lkey = [string]$lim.label
+            if ($isNewSample) {
+                if (-not $script:UsageHist.ContainsKey($lkey)) { $script:UsageHist[$lkey] = New-Object System.Collections.ArrayList }
+                $hist = $script:UsageHist[$lkey]
+                # a big drop = the window RESET: clear history, chirp the good news
+                if ($hist.Count -gt 0 -and ($hist[$hist.Count - 1].Pct - $pct) -ge 20) {
+                    $hist.Clear()
+                    [void]$script:LimitAlerted.Remove($lkey)
+                    Invoke-Chirp   # your window is fresh - go
+                }
+                [void]$hist.Add(@{ T = $fetched; Pct = $pct })
+                while ($hist.Count -gt 0 -and ($now - $hist[0].T).TotalMinutes -gt 90) { $hist.RemoveAt(0) }
+                # crossing 90 percent: one chirp per window, never nags
+                if ($pct -ge 90 -and -not $script:LimitAlerted.ContainsKey($lkey)) {
+                    $script:LimitAlerted[$lkey] = $true
+                    Invoke-Chirp
+                }
+            }
+
+            # burn rate -> predicted cutoff: if the pace says you hit 100%
+            # BEFORE the reset, that beats the reset countdown as the thing
+            # you need to know (idea borrowed from every macOS usage app)
+            $capsAt = [datetime]::MinValue
+            if ($script:UsageHist.ContainsKey($lkey)) {
+                $hist = $script:UsageHist[$lkey]
+                if ($hist.Count -ge 2) {
+                    $first = $hist[0]; $last = $hist[$hist.Count - 1]
+                    $hrs = ($last.T - $first.T).TotalHours
+                    if ($hrs -gt 0.05 -and ($last.Pct - $first.Pct) -gt 0.5) {
+                        $rate = ($last.Pct - $first.Pct) / $hrs   # percent per hour
+                        if ($rate -gt 1) {
+                            $capsAt = $now.AddHours((100.0 - $pct) / $rate)
+                        }
+                    }
+                }
+            }
+            $resetAt = [datetime]::MaxValue
+            try {
+                $resetAt = ([datetime]::Parse([string]$lim.resets_at, $null,
+                            [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+            }
+            catch { }
+            $willCap = ($capsAt -gt [datetime]::MinValue -and $capsAt -lt $resetAt)
+            if ($willCap -and $hex -eq '#5ED584') { $hex = '#FFB84D' }
 
             $g = New-Object System.Windows.Controls.Grid
             $g.Margin = New-Object System.Windows.Thickness(0, 2, 0, 2)
@@ -2667,17 +2730,17 @@ function Update-LimitsPanel {
 
             $right = New-Object System.Windows.Controls.TextBlock
             $right.FontSize = 9.5
-            $right.Foreground = Get-Brush $hex
             $right.VerticalAlignment = 'Center'
             $right.HorizontalAlignment = 'Right'
-            $resetTxt = ''
-            try {
-                $at = ([datetime]::Parse([string]$lim.resets_at, $null,
-                       [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
-                $resetTxt = $script:Sep + (Format-ResetIn $at)
+            if ($willCap) {
+                # you will hit the wall BEFORE the reset - say when
+                $right.Text = ('{0:0}%' -f $pct) + $script:Sep + ('caps ~{0:HH:mm}' -f $capsAt)
             }
-            catch { }
-            $right.Text = ('{0:0}%' -f $pct) + $resetTxt
+            elseif ($resetAt -lt [datetime]::MaxValue) {
+                $right.Text = ('{0:0}%' -f $pct) + $script:Sep + (Format-ResetIn $resetAt)
+            }
+            else { $right.Text = ('{0:0}%' -f $pct) }
+            $right.Foreground = Get-Brush $hex
             [System.Windows.Controls.Grid]::SetColumn($right, 2)
             [void]$g.Children.Add($right)
 

@@ -473,6 +473,50 @@ function Start-ConsoleProbe {
     try { return [System.Diagnostics.Process]::Start($psi) } catch { return $null }
 }
 
+$script:ProbeJobs = @{}   # pid -> @{ Proc; Started }: probes IN FLIGHT (async)
+function Request-ConsoleInfo {
+    # NON-BLOCKING console probe: starts a child and returns $null (pending);
+    # a later call collects the finished result. The UI thread never waits on
+    # console RPC anymore - waiting synchronously froze the widget for ~1s
+    # per probe and native apps don't hitch every two seconds.
+    param([int]$TargetPid)
+
+    if ($script:ProbeJobs.ContainsKey($TargetPid)) {
+        $job = $script:ProbeJobs[$TargetPid]
+        if (-not $job.Proc.HasExited) {
+            if (((Get-Date) - $job.Started).TotalSeconds -gt 8) {
+                try { $job.Proc.Kill() } catch { }
+                try { $job.Proc.Dispose() } catch { }
+                [void]$script:ProbeJobs.Remove($TargetPid)
+                return [pscustomobject]@{ Failed = $true }
+            }
+            return $null   # still cooking - ask again next tick
+        }
+        [void]$script:ProbeJobs.Remove($TargetPid)
+        try {
+            if ($job.Proc.ExitCode -ne 0) { return [pscustomobject]@{ Failed = $true } }
+            $title = $job.Proc.StandardOutput.ReadLine()
+            [long]$hwnd = 0
+            $hwndLine = $job.Proc.StandardOutput.ReadLine()
+            if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
+            $screen = $job.Proc.StandardOutput.ReadLine()
+            if ($null -eq $screen) { $screen = '' }
+            [long]$conPid = 0
+            $conLine = $job.Proc.StandardOutput.ReadLine()
+            if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
+            return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid }
+        }
+        catch { return [pscustomobject]@{ Failed = $true } }
+        finally { try { $job.Proc.Dispose() } catch { } }
+    }
+
+    if ($script:ProbeBudget -le 0) { return $null }
+    $script:ProbeBudget--
+    $p = Start-ConsoleProbe -TargetPid $TargetPid
+    if ($null -ne $p) { $script:ProbeJobs[$TargetPid] = @{ Proc = $p; Started = Get-Date } }
+    return $null
+}
+
 function Read-ConsoleInfoBounded {
     # returns @{ Title; ConsoleHwnd } of a process's console, or $null.
     # Never blocks longer than ~2.5s (probe child gets killed).
@@ -509,8 +553,8 @@ function Read-ConsoleInfoBounded {
 $script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance runs once per process)
 $script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain conhost windows, no WT tab)
 $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
-$script:ProbeBudget = 2         # console probes allowed this tick (reset in Update-List) -
-                                # each is ~1s of blocked UI thread, so keep ticks snappy
+$script:ProbeBudget = 3         # probe STARTS allowed per tick (reset in Update-List) -
+                                # starting a child is ~30ms; results are collected async
 $script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel for the passive learner)
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
@@ -537,8 +581,7 @@ function Invoke-PassiveTabLearn {
     # keep candidate screens FRESH: agents redraw constantly, so a stale
     # fingerprint never matches the live pane and the learner goes blind -
     # forcing the (visible) click-time tab walk to do the job instead.
-    # AT MOST ONE probe per tick: probes are ~1s of blocked UI thread each,
-    # and refreshing several stale fingerprints in one tick froze the widget
+    # Probes are ASYNC (results arrive on a later tick) - zero UI blocking.
     foreach ($apid in @($script:LastScreenMap.Keys)) {
         if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
         if ($null -eq (Get-Process -Id $apid -ErrorAction SilentlyContinue)) {
@@ -547,18 +590,15 @@ function Invoke-PassiveTabLearn {
         }
         $entry = $script:LastScreenMap[$apid]
         if (((Get-Date) - $entry.Stamp).TotalSeconds -lt 30) { continue }
-        if ($script:ProbeBudget -le 0) { break }
-        $script:ProbeBudget--
-        $fresh = Read-ConsoleInfoBounded -TargetPid $apid
-        if ($null -ne $fresh) {
-            $script:LastTitleByPid[$apid] = [string]$fresh.Title
-            if ([long]$fresh.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$fresh.ConsoleId }
-        }
-        if ($null -ne $fresh -and ([string]$fresh.Screen).Length -ge 200) {
+        $fresh = Request-ConsoleInfo -TargetPid $apid
+        if ($null -eq $fresh) { continue }   # pending or out of budget - later tick
+        if ($null -ne $fresh.PSObject.Properties['Failed']) { $entry.Stamp = (Get-Date); continue }
+        $script:LastTitleByPid[$apid] = [string]$fresh.Title
+        if ([long]$fresh.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$fresh.ConsoleId }
+        if (([string]$fresh.Screen).Length -ge 200) {
             $script:LastScreenMap[$apid] = @{ Text = [string]$fresh.Screen; Stamp = (Get-Date) }
         }
         else { $entry.Stamp = (Get-Date) }   # don't hammer a mute console
-        break   # one is enough per tick - the rest rotate in on later ticks
     }
 
     $claimed = @{}
@@ -751,21 +791,21 @@ function Resolve-TabForPid {
     }
     if (Test-ProcSuspended $Proc) { return $null }   # not cached: may wake up
 
-    # probes cost a child process each (~0.7s); budget per tick so a fleet of
-    # unresolved processes can't stall the UI - leftovers resolve next ticks
-    if ($script:ProbeBudget -le 0) { return $null }
-    $script:ProbeBudget--
-
-    $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
-    $match = $null
-    if ($null -ne $info) {
-        if (([string]$info.Screen).Length -ge 200) {
-            $script:LastScreenMap[$TargetPid] = @{ Text = [string]$info.Screen; Stamp = (Get-Date) }   # fuels the passive learner
-        }
-        $script:LastTitleByPid[$TargetPid] = [string]$info.Title
-        if ([long]$info.ConsoleId -gt 0) { $script:ConsoleIdByPid[$TargetPid] = [long]$info.ConsoleId }
+    # ASYNC probe: $null while pending means "unresolved THIS tick, no
+    # verdict" - only a completed probe may write the negative cache
+    $info = Request-ConsoleInfo -TargetPid $TargetPid
+    if ($null -eq $info) { return $null }
+    if ($null -ne $info.PSObject.Properties['Failed']) {
+        $script:NoTabStamp[$TargetPid] = Get-Date
+        return $null
     }
-    if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.Title)) {
+    $match = $null
+    if (([string]$info.Screen).Length -ge 200) {
+        $script:LastScreenMap[$TargetPid] = @{ Text = [string]$info.Screen; Stamp = (Get-Date) }   # fuels the passive learner
+    }
+    $script:LastTitleByPid[$TargetPid] = [string]$info.Title
+    if ([long]$info.ConsoleId -gt 0) { $script:ConsoleIdByPid[$TargetPid] = [long]$info.ConsoleId }
+    if (-not [string]::IsNullOrWhiteSpace($info.Title)) {
         # TWIN-PROOF title matching. A title is a value, not ownership: two
         # freshly restarted sessions briefly share identical titles and plain
         # title matching once cross-mapped them (click on A focused B). The
@@ -1407,6 +1447,8 @@ $script:InTickStamp = [datetime]::MinValue
 $script:FocusBusy   = $false
 $script:LastFocusId = ''
 $script:LastFocusStamp = [datetime]::MinValue
+$script:RowCache    = @{}    # session id -> persistent row elements (diff rendering)
+$script:EmptyEl     = $null
 
 # last safety net: a handler exception must never tear the window down
 $Window.Dispatcher.Add_UnhandledException({
@@ -2435,20 +2477,21 @@ function Invoke-Chirp {
     catch { }
 }
 
-function New-RowMenu($Sess) {
+function New-RowMenu($Row) {
+    # menu items carry the ROW, not a session snapshot: rows now live for the
+    # whole session (diff rendering) while Row.Tag is refreshed every tick,
+    # so $s.Tag.Tag is always the LIVE session object
     $menu = New-Object System.Windows.Controls.ContextMenu
     $menu.Style = $script:Window.FindResource('HudMenu')
-    $menu.Add_Opened({ $script:UiHold++; $script:UiHoldStamp = Get-Date })
-    $menu.Add_Closed({ $script:UiHold = [Math]::Max(0, $script:UiHold - 1) })
     $miStyle = $script:Window.FindResource('HudMenuItem')
 
     $miPin = New-Object System.Windows.Controls.MenuItem
     $miPin.Style = $miStyle
-    $miPin.Header = $(if ($Sess.Pinned) { 'Unpin' } else { 'Pin to top' })
-    $miPin.Tag = $Sess
+    $miPin.Header = 'Pin to top'
+    $miPin.Tag = $Row
     $miPin.Add_Click({
         param($s, $e)
-        Set-Pref $s.Tag 'pinned' (-not [bool]$s.Tag.Pinned)
+        Set-Pref $s.Tag.Tag 'pinned' (-not [bool]$s.Tag.Tag.Pinned)
         Update-List -Force
     })
     [void]$menu.Items.Add($miPin)
@@ -2456,12 +2499,12 @@ function New-RowMenu($Sess) {
     $miRen = New-Object System.Windows.Controls.MenuItem
     $miRen.Style = $miStyle
     $miRen.Header = 'Rename...'
-    $miRen.Tag = $Sess
+    $miRen.Tag = $Row
     $miRen.Add_Click({
         param($s, $e)
-        $newName = Show-RenameDialog ([string]$s.Tag.DisplayName)
+        $newName = Show-RenameDialog ([string]$s.Tag.Tag.DisplayName)
         if ($null -ne $newName) {
-            Set-Pref $s.Tag 'name' $newName.Trim()
+            Set-Pref $s.Tag.Tag 'name' $newName.Trim()
             Update-List -Force
         }
     })
@@ -2470,13 +2513,25 @@ function New-RowMenu($Sess) {
     $miHide = New-Object System.Windows.Controls.MenuItem
     $miHide.Style = $miStyle
     $miHide.Header = 'Hide until next change'
-    $miHide.Tag = $Sess
+    $miHide.Tag = $Row
     $miHide.Add_Click({
         param($s, $e)
-        $script:Dismissed[$s.Tag.Id] = $s.Tag.Ts
+        $script:Dismissed[$s.Tag.Tag.Id] = $s.Tag.Tag.Ts
         Update-List -Force
     })
     [void]$menu.Items.Add($miHide)
+
+    $menu.Tag = $miPin
+    $menu.Add_Opened({
+        param($s, $e)
+        $script:UiHold++; $script:UiHoldStamp = Get-Date
+        # header reflects the CURRENT pin state at open time
+        try {
+            $s.Tag.Header = $(if ([bool]$s.PlacementTarget.Tag.Pinned) { 'Unpin' } else { 'Pin to top' })
+        }
+        catch { }
+    })
+    $menu.Add_Closed({ $script:UiHold = [Math]::Max(0, $script:UiHold - 1) })
 
     return $menu
 }
@@ -2648,13 +2703,14 @@ function New-Chip([string]$Text, [string]$Hex) {
 }
 
 function New-SessionRow($Sess) {
-    $meta = Get-StatusMeta $Sess.Status
-
+    # Build ONCE per session, then Update-SessionRow mutates in place every
+    # tick. Native apps don't rebuild their UI to change a label - neither do
+    # we anymore: rebuilding every row every 2s was why hover states blinked,
+    # menus needed babysitting, and the whole widget felt like a web page.
     $row = New-Object System.Windows.Controls.Border
     $row.CornerRadius = New-Object System.Windows.CornerRadius(10)
     $row.Padding = New-Object System.Windows.Thickness(10, 7, 10, 8)
     $row.Margin = New-Object System.Windows.Thickness(2, 1, 2, 1)
-    $row.Background = Get-RowBaseBrush $Sess
     $row.Cursor = [System.Windows.Input.Cursors]::Hand
     $row.Tag = $Sess
 
@@ -2668,29 +2724,19 @@ function New-SessionRow($Sess) {
 
     $dot = New-Object System.Windows.Shapes.Ellipse
     $dot.Width = 8; $dot.Height = 8
-    $dot.Fill = Get-Brush $meta.Color
     $dot.Margin = New-Object System.Windows.Thickness(1, 5, 10, 0)
     $dot.VerticalAlignment = 'Top'
     $glow = New-Object System.Windows.Media.Effects.DropShadowEffect
     $glow.BlurRadius = 8
     $glow.ShadowDepth = 0
     $glow.Opacity = 0.85
-    $glow.Color = [System.Windows.Media.ColorConverter]::ConvertFromString($meta.Color)
     $dot.Effect = $glow
     [System.Windows.Controls.Grid]::SetColumn($dot, 0)
     [void]$grid.Children.Add($dot)
-    if ($Sess.Status -eq 'working' -or $Sess.Status -eq 'attention') {
-        $anim = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.3,
-            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(850))))
-        $anim.AutoReverse = $true
-        $anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
-        $dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
-    }
 
     $mid = New-Object System.Windows.Controls.StackPanel
     [System.Windows.Controls.Grid]::SetColumn($mid, 1)
 
-    # line 1: project name + age
     $line1 = New-Object System.Windows.Controls.Grid
     foreach ($wdef in @('*', 'Auto')) {
         $cd = New-Object System.Windows.Controls.ColumnDefinition
@@ -2699,7 +2745,6 @@ function New-SessionRow($Sess) {
         [void]$line1.ColumnDefinitions.Add($cd)
     }
     $name = New-Object System.Windows.Controls.TextBlock
-    $name.Text = $(if ($Sess.Pinned) { [char]::ConvertFromUtf32(0x1F4CC) + ' ' + $Sess.DisplayName } else { $Sess.DisplayName })
     $name.FontSize = 12.5
     $name.FontWeight = [System.Windows.FontWeights]::SemiBold
     $name.Foreground = Get-Brush '#F4F4F8'
@@ -2707,7 +2752,6 @@ function New-SessionRow($Sess) {
     [System.Windows.Controls.Grid]::SetColumn($name, 0)
     [void]$line1.Children.Add($name)
     $age = New-Object System.Windows.Controls.TextBlock
-    $age.Text = Format-Age $Sess.Ts
     $age.FontSize = 10.5
     $age.Foreground = Get-Brush '#5F5F6A'
     $age.VerticalAlignment = 'Center'
@@ -2716,40 +2760,20 @@ function New-SessionRow($Sess) {
     [void]$line1.Children.Add($age)
     [void]$mid.Children.Add($line1)
 
-    # line 2: colored status + message snippet
-    $snippet = ($Sess.Message -replace '\s+', ' ').Trim()
-    if ($snippet.Length -gt 70) { $snippet = $snippet.Substring(0, 70) }
-    $label = $meta.Label
-    if ($Sess.Status -eq 'working' -and $script:ShowTimers -and $script:WorkSince.ContainsKey($Sess.Id)) {
-        $workSpan = (Get-Date) - $script:WorkSince[$Sess.Id]
-        if ($workSpan.TotalSeconds -ge 90) { $label = "working $(Format-Age $script:WorkSince[$Sess.Id])" }
-    }
-    if ($Sess.Provider -and $Sess.Provider -ne 'claude') { $label = "$($Sess.Provider)$($script:Sep)$label" }
     $sub = New-Object System.Windows.Controls.TextBlock
     $sub.FontSize = 10.5
     $sub.TextTrimming = 'CharacterEllipsis'
     $sub.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
-    $runStatus = New-Object System.Windows.Documents.Run($label)
-    $runStatus.Foreground = Get-Brush $meta.Color
+    $runStatus = New-Object System.Windows.Documents.Run('')
     $runStatus.FontWeight = [System.Windows.FontWeights]::SemiBold
     [void]$sub.Inlines.Add($runStatus)
-    if ($snippet.Length -gt 0) {
-        $runMsg = New-Object System.Windows.Documents.Run("$($script:Dash)$snippet")
-        $runMsg.Foreground = Get-Brush '#8B8B95'
-        [void]$sub.Inlines.Add($runMsg)
-    }
+    $runMsg = New-Object System.Windows.Documents.Run('')
+    $runMsg.Foreground = Get-Brush '#8B8B95'
+    [void]$sub.Inlines.Add($runMsg)
     [void]$mid.Children.Add($sub)
     [void]$grid.Children.Add($mid)
 
     $row.Child = $grid
-
-    $tipTab = ''
-    if ($null -ne $Sess.Window -and $Sess.Window.PSObject.Properties['tab_name']) {
-        $tipTab = [string]$Sess.Window.tab_name
-    }
-    $tipCwd = $Sess.Cwd
-    if ([string]::IsNullOrWhiteSpace($tipCwd)) { $tipCwd = '(untracked - folder unknown)' }
-    $row.ToolTip = "$tipCwd`ntab: $tipTab`n`n$($Sess.Message)`n`nclick = focus$($script:Sep)right-click = pin / rename / hide"
 
     $row.Add_MouseEnter({
         param($s, $e)
@@ -2757,6 +2781,12 @@ function New-SessionRow($Sess) {
         else { $s.Background = Get-Brush '#12FFFFFF' }
     })
     $row.Add_MouseLeave({ param($s, $e) $s.Background = Get-RowBaseBrush $s.Tag })
+    $row.Add_MouseLeftButtonDown({
+        # INSTANT pressed feedback - the work happens on mouse-up, but the
+        # eye needs an answer in the same frame as the finger
+        param($s, $e)
+        $s.Background = Get-Brush '#22FFFFFF'
+    })
     $row.Add_MouseLeftButtonUp({
         param($s, $e)
         # DEBOUNCE, hard. Focusing can involve console probes and the tab
@@ -2778,8 +2808,74 @@ function New-SessionRow($Sess) {
             $script:LastFocusStamp = Get-Date
         }
     })
-    $row.ContextMenu = New-RowMenu $Sess
-    return $row
+    $row.ContextMenu = New-RowMenu $row
+
+    $entry = @{
+        Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age
+        RunStatus = $runStatus; RunMsg = $runMsg
+        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''
+    }
+    Update-SessionRow $entry $Sess
+    return $entry
+}
+
+function Update-SessionRow($Entry, $Sess) {
+    # mutate only what CHANGED - property sets on unchanged values still cost
+    # layout, and this runs for every row on every tick
+    $Entry.Row.Tag = $Sess   # handlers + menus always see the live object
+    $meta = Get-StatusMeta $Sess.Status
+
+    if ($Entry.StatusKey -ne [string]$Sess.Status) {
+        $Entry.StatusKey = [string]$Sess.Status
+        $Entry.Dot.Fill = Get-Brush $meta.Color
+        $Entry.Glow.Color = [System.Windows.Media.ColorConverter]::ConvertFromString($meta.Color)
+        $Entry.RunStatus.Foreground = Get-Brush $meta.Color
+        if ($Sess.Status -eq 'working' -or $Sess.Status -eq 'attention') {
+            $anim = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.3,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(850))))
+            $anim.AutoReverse = $true
+            $anim.RepeatBehavior = [System.Windows.Media.Animation.RepeatBehavior]::Forever
+            $Entry.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $anim)
+        }
+        else {
+            $Entry.Dot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+            $Entry.Dot.Opacity = 1.0
+        }
+        if (-not $Entry.Row.IsMouseOver) { $Entry.Row.Background = Get-RowBaseBrush $Sess }
+    }
+
+    $nameTxt = $(if ($Sess.Pinned) { [char]::ConvertFromUtf32(0x1F4CC) + ' ' + $Sess.DisplayName } else { [string]$Sess.DisplayName })
+    if ($Entry.NameKey -ne $nameTxt) { $Entry.NameKey = $nameTxt; $Entry.Name.Text = $nameTxt }
+
+    $ageTxt = Format-Age $Sess.Ts
+    if ($Entry.Age.Text -ne $ageTxt) { $Entry.Age.Text = $ageTxt }
+
+    $snippet = ($Sess.Message -replace '\s+', ' ').Trim()
+    if ($snippet.Length -gt 70) { $snippet = $snippet.Substring(0, 70) }
+    $label = $meta.Label
+    if ($Sess.Status -eq 'working' -and $script:ShowTimers -and $script:WorkSince.ContainsKey($Sess.Id)) {
+        $workSpan = (Get-Date) - $script:WorkSince[$Sess.Id]
+        if ($workSpan.TotalSeconds -ge 90) { $label = "working $(Format-Age $script:WorkSince[$Sess.Id])" }
+    }
+    if ($Sess.Provider -and $Sess.Provider -ne 'claude') { $label = "$($Sess.Provider)$($script:Sep)$label" }
+    $subKey = "$label|$snippet"
+    if ($Entry.SubKey -ne $subKey) {
+        $Entry.SubKey = $subKey
+        $Entry.RunStatus.Text = $label
+        $Entry.RunMsg.Text = $(if ($snippet.Length -gt 0) { "$($script:Dash)$snippet" } else { '' })
+    }
+
+    $tipTab = ''
+    if ($null -ne $Sess.Window -and $Sess.Window.PSObject.Properties['tab_name']) {
+        $tipTab = [string]$Sess.Window.tab_name
+    }
+    $tipCwd = $Sess.Cwd
+    if ([string]::IsNullOrWhiteSpace($tipCwd)) { $tipCwd = '(untracked - folder unknown)' }
+    $tipKey = "$tipCwd|$tipTab|$($Sess.Message)"
+    if ($Entry.TipKey -ne $tipKey) {
+        $Entry.TipKey = $tipKey
+        $Entry.Row.ToolTip = "$tipCwd`ntab: $tipTab`n`n$($Sess.Message)`n`nclick = focus$($script:Sep)right-click = pin / rename / hide"
+    }
 }
 
 function Update-List {
@@ -2800,7 +2896,7 @@ function Update-List {
     }
     $script:InTick = $true
     $script:InTickStamp = Get-Date
-    $script:ProbeBudget = 2
+    $script:ProbeBudget = 3
     try {
 
     $sessions = @(Get-Sessions)
@@ -2830,31 +2926,67 @@ function Update-List {
         if (-not $liveIds.ContainsKey($k)) { [void]$script:WorkSince.Remove($k) }
     }
 
-    $script:SessionList.Children.Clear()
-    if ($visible.Count -eq 0) {
-        $emptyStack = New-Object System.Windows.Controls.StackPanel
-        $emptyStack.HorizontalAlignment = 'Center'
-        $emptyStack.Margin = New-Object System.Windows.Thickness(0, 14, 0, 14)
-        if ($null -ne $script:LogoSource) {
-            $birdImg = New-Object System.Windows.Controls.Image
-            $birdImg.Source = $script:LogoSource
-            $birdImg.Width = 42; $birdImg.Height = 42
-            $birdImg.Opacity = 0.9
-            $birdImg.HorizontalAlignment = 'Center'
-            $birdImg.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-            [void]$emptyStack.Children.Add($birdImg)
+    # DIFF rendering: rows persist across ticks and only changed properties
+    # get touched. No more clear-and-rebuild = no hover flicker, no layout
+    # storm every 2 seconds, menus stay attached. This is most of the
+    # difference between "web page" and "native".
+    $have = @{}
+    foreach ($s in $visible) { $have[[string]$s.Id] = $true }
+    foreach ($id in @($script:RowCache.Keys)) {
+        if (-not $have.ContainsKey($id)) {
+            [void]$script:SessionList.Children.Remove($script:RowCache[$id].Row)
+            [void]$script:RowCache.Remove($id)
         }
-        $empty = New-Object System.Windows.Controls.TextBlock
-        $empty.Text = 'all quiet' + $script:Dash.TrimEnd() + ' no live sessions'
-        $empty.FontSize = 11.5
-        $empty.Foreground = Get-Brush '#6E6E78'
-        $empty.HorizontalAlignment = 'Center'
-        [void]$emptyStack.Children.Add($empty)
-        [void]$script:SessionList.Children.Add($emptyStack)
+    }
+
+    if ($visible.Count -eq 0) {
+        if ($null -eq $script:EmptyEl) {
+            $emptyStack = New-Object System.Windows.Controls.StackPanel
+            $emptyStack.HorizontalAlignment = 'Center'
+            $emptyStack.Margin = New-Object System.Windows.Thickness(0, 14, 0, 14)
+            if ($null -ne $script:LogoSource) {
+                $birdImg = New-Object System.Windows.Controls.Image
+                $birdImg.Source = $script:LogoSource
+                $birdImg.Width = 42; $birdImg.Height = 42
+                $birdImg.Opacity = 0.9
+                $birdImg.HorizontalAlignment = 'Center'
+                $birdImg.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+                [void]$emptyStack.Children.Add($birdImg)
+            }
+            $empty = New-Object System.Windows.Controls.TextBlock
+            $empty.Text = 'all quiet' + $script:Dash.TrimEnd() + ' no live sessions'
+            $empty.FontSize = 11.5
+            $empty.Foreground = Get-Brush '#6E6E78'
+            $empty.HorizontalAlignment = 'Center'
+            [void]$emptyStack.Children.Add($empty)
+            $script:EmptyEl = $emptyStack
+        }
+        if (-not $script:SessionList.Children.Contains($script:EmptyEl)) {
+            [void]$script:SessionList.Children.Add($script:EmptyEl)
+        }
     }
     else {
+        if ($null -ne $script:EmptyEl -and $script:SessionList.Children.Contains($script:EmptyEl)) {
+            [void]$script:SessionList.Children.Remove($script:EmptyEl)
+        }
+        $idx = 0
         foreach ($s in $visible) {
-            [void]$script:SessionList.Children.Add((New-SessionRow $s))
+            $id = [string]$s.Id
+            if ($script:RowCache.ContainsKey($id)) {
+                $entry = $script:RowCache[$id]
+                Update-SessionRow $entry $s
+                $cur = $script:SessionList.Children.IndexOf($entry.Row)
+                if ($cur -ne $idx -and $cur -ge 0) {
+                    $script:SessionList.Children.RemoveAt($cur)
+                    $script:SessionList.Children.Insert($idx, $entry.Row)
+                }
+            }
+            else {
+                $entry = New-SessionRow $s
+                $script:RowCache[$id] = $entry
+                $script:SessionList.Children.Insert($idx, $entry.Row)
+            }
+            $idx++
         }
     }
 

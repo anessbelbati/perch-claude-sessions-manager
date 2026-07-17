@@ -44,7 +44,7 @@ $script:ChirpOn = $false
 $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
 $script:ShowTimers = $true
-$script:ThemeName = 'midnight'   # 'midnight' (classic dark) or 'glass' (liquid acrylic)
+$script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (midnight/oled/glass/phosphor/nord/catppuccin/synthwave)
 $script:AcctDisclaimerOk = $false
 $script:AcctPanel = $null
 try {
@@ -1740,6 +1740,100 @@ function Get-RowBaseBrush($Sess) {
     return [System.Windows.Media.Brushes]::Transparent
 }
 
+# ---------------------------------------------------------------- themes --
+# the theme catalog. every theme is a room the bird perches in: same light
+# text, same status colors (those are semantics, not decoration), different
+# walls. all brushes are frozen and shared. FxUnder renders behind the
+# content (glows), FxOver above everything (scanlines). Glow tints the
+# bird's halo to match the room.
+function New-GradBrush([double[]]$From, [double[]]$To, [object[]]$Stops) {
+    $g = New-Object System.Windows.Media.LinearGradientBrush
+    $g.StartPoint = New-Object System.Windows.Point($From[0], $From[1])
+    $g.EndPoint = New-Object System.Windows.Point($To[0], $To[1])
+    foreach ($s in $Stops) {
+        [void]$g.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($s[0]), [double]$s[1])))
+    }
+    $g.Freeze()
+    return $g
+}
+
+function New-ScanlineBrush {
+    # CRT scanlines: a 64x3 tile with one barely-there dark line. Frozen +
+    # tiled = realized once, effectively free to repaint (audit-approved).
+    $dg = New-Object System.Windows.Media.DrawingGroup
+    foreach ($r in @(
+            @('#00000000', 0, 3),     # transparent filler keeps the tile bounds
+            @('#0D000000', 2, 1))) {  # the line itself
+        $gd = New-Object System.Windows.Media.GeometryDrawing
+        $gd.Brush = Get-Brush ([string]$r[0])
+        $gd.Geometry = New-Object System.Windows.Media.RectangleGeometry(
+            (New-Object System.Windows.Rect(0, [double]$r[1], 64, [double]$r[2])))
+        [void]$dg.Children.Add($gd)
+    }
+    $b = New-Object System.Windows.Media.DrawingBrush($dg)
+    $b.TileMode = 'Tile'
+    $b.ViewportUnits = 'Absolute'
+    $b.Viewport = New-Object System.Windows.Rect(0, 0, 64, 3)
+    $b.Freeze()
+    return $b
+}
+
+function New-HorizonGlow {
+    # synthwave: a neon sun setting just below the card's bottom edge -
+    # magenta core cooling toward cyan as it fades out
+    $rg = New-Object System.Windows.Media.RadialGradientBrush
+    $rg.Center = New-Object System.Windows.Point(0.5, 1.22)
+    $rg.GradientOrigin = $rg.Center
+    $rg.RadiusX = 0.95
+    $rg.RadiusY = 0.78
+    foreach ($s in @(@('#3CFF41B0', 0.0), @('#1A7A5CFF', 0.55), @('#0033E0FF', 1.0))) {
+        [void]$rg.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($s[0]), [double]$s[1])))
+    }
+    $rg.Freeze()
+    return $rg
+}
+
+$script:ThemeSpecs = [ordered]@{
+    # the classics
+    midnight   = @{ Bg = $script:CardGradient
+                    BorderBrush = (Get-Brush '#24FFFFFF'); Glow = '#E07B54' }
+    oled       = @{ Bg = (Get-Brush '#FF060608')
+                    BorderBrush = (Get-Brush '#2BFFFFFF'); Glow = '#E07B54' }
+    glass      = @{ Glow = '#E07B54' }   # special-cased in Apply-Theme (acrylic + optics)
+    # the fun ones
+    phosphor   = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F70B150D', 0), @('#F7060F08', 1)))
+                    BorderBrush = (Get-Brush '#383EDC78'); Glow = '#3EDC78'
+                    FxOver = (New-ScanlineBrush) }
+    nord       = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F72E3440', 0), @('#F7262B36', 1)))
+                    BorderBrush = (Get-Brush '#3E88C0D0'); Glow = '#88C0D0' }
+    catppuccin = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F71E1E2E', 0), @('#F7181825', 1)))
+                    BorderBrush = (Get-Brush '#45CBA6F7'); Glow = '#CBA6F7' }
+    synthwave  = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(@('#F7261442', 0), @('#F7130B26', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
+                        @('#7DFF41B0', 0), @('#557A5CFF', 0.5), @('#7D33E0FF', 1)))
+                    Glow = '#FF41B0'
+                    FxUnder = (New-HorizonGlow) }
+}
+
+# two code-made overlay layers for theme effects: one under the content
+# (glows), one over everything (scanlines). Hit-test transparent, collapsed
+# unless the active theme uses them.
+$script:ThemeFxUnder = New-Object System.Windows.Controls.Border
+$script:ThemeFxOver  = New-Object System.Windows.Controls.Border
+foreach ($fx in @($script:ThemeFxUnder, $script:ThemeFxOver)) {
+    $fx.CornerRadius = New-Object System.Windows.CornerRadius(15)
+    $fx.IsHitTestVisible = $false
+    $fx.Visibility = 'Collapsed'
+}
+try {
+    $cardGrid = $script:RootCard.Child
+    $cardGrid.Children.Insert(2, $script:ThemeFxUnder)   # above glass optics, below content
+    [void]$cardGrid.Children.Add($script:ThemeFxOver)    # above everything
+}
+catch { }
+
 # window/taskbar icon + header logo
 try {
     $iconPath = Join-Path $PSScriptRoot 'icon.ico'
@@ -1751,6 +1845,7 @@ try {
     }
     $logoPath = Join-Path $PSScriptRoot 'logo.png'
     $logoImg = $Window.FindName('LogoImg')
+    $script:LogoImg = $logoImg
     if ($null -ne $logoImg -and (Test-Path -LiteralPath $logoPath)) {
         $bi = New-Object System.Windows.Media.Imaging.BitmapImage
         $bi.BeginInit()
@@ -1809,25 +1904,43 @@ function Apply-Theme {
         $script:RootCard.Background = $film
         foreach ($o in $overlays) { $o.Visibility = 'Visible' }
         $script:GlassRim.BorderBrush = $script:RimGradient
-    }
-    elseif ($script:ThemeName -eq 'oled') {
-        # pure black, hairline border - for people whose desktop is already
-        # a void and want the HUD to disappear into it
-        $script:RootCard.Margin = New-Object System.Windows.Thickness(12)
-        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(16)
-        $script:RootCard.Effect = $script:CardShadow
-        $script:RootCard.BorderBrush = Get-Brush '#2BFFFFFF'
-        $script:RootCard.Background = Get-Brush '#FF060608'
-        foreach ($o in $overlays) { $o.Visibility = 'Collapsed' }
+        $script:ThemeFxUnder.Visibility = 'Collapsed'
+        $script:ThemeFxOver.Visibility = 'Collapsed'
     }
     else {
+        # every non-glass theme is data, not code: walls + border + halo
+        # from the catalog. unknown names (old configs, typos) -> midnight.
+        $spec = $script:ThemeSpecs[$script:ThemeName]
+        if ($null -eq $spec -or $null -eq $spec.Bg) { $spec = $script:ThemeSpecs['midnight'] }
         $script:RootCard.Margin = New-Object System.Windows.Thickness(12)
         $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(16)
         $script:RootCard.Effect = $script:CardShadow
-        $script:RootCard.BorderBrush = Get-Brush '#24FFFFFF'
-        $script:RootCard.Background = $script:CardGradient
+        $script:RootCard.BorderBrush = $spec.BorderBrush
+        $script:RootCard.Background = $spec.Bg
         foreach ($o in $overlays) { $o.Visibility = 'Collapsed' }
+        foreach ($pair in @(
+                , @($script:ThemeFxUnder, $spec.FxUnder)
+                , @($script:ThemeFxOver, $spec.FxOver))) {
+            if ($null -ne $pair[1]) { $pair[0].Background = $pair[1]; $pair[0].Visibility = 'Visible' }
+            else { $pair[0].Visibility = 'Collapsed' }
+        }
     }
+    # the bird's halo matches the room
+    try {
+        if ($null -ne $script:LogoImg) {
+            $sp = $script:ThemeSpecs[$script:ThemeName]
+            $glowHex = '#E07B54'
+            if ($null -ne $sp -and $sp.Glow) { $glowHex = [string]$sp.Glow }
+            $ds = New-Object System.Windows.Media.Effects.DropShadowEffect
+            $ds.BlurRadius = 7
+            $ds.ShadowDepth = 0
+            $ds.Opacity = 0.55
+            $ds.Color = [System.Windows.Media.ColorConverter]::ConvertFromString($glowHex)
+            $ds.Freeze()
+            $script:LogoImg.Effect = $ds
+        }
+    }
+    catch { }
     Set-GlassBackdrop $glass
 }
 
@@ -2086,18 +2199,19 @@ function New-ThemeSwatch([string]$Name) {
             $prev.Background = $g
             $prev.BorderBrush = Get-Brush '#8CFFFFFF'
         }
-        'oled' {
-            $prev.Background = Get-Brush '#FF060608'
-            $prev.BorderBrush = Get-Brush '#2BFFFFFF'
-        }
         default {
-            $prev.Background = $script:CardGradient
-            $prev.BorderBrush = Get-Brush '#33FFFFFF'
+            $spec = $script:ThemeSpecs[$Name]
+            if ($null -eq $spec -or $null -eq $spec.Bg) { $spec = $script:ThemeSpecs['midnight'] }
+            $prev.Background = $spec.Bg
+            $prev.BorderBrush = $spec.BorderBrush
         }
     }
+    $dotHex = '#E07B54'
+    $sw = $script:ThemeSpecs[$Name]
+    if ($null -ne $sw -and $sw.Glow) { $dotHex = [string]$sw.Glow }
     $dot = New-Object System.Windows.Shapes.Ellipse
     $dot.Width = 7; $dot.Height = 7
-    $dot.Fill = Get-Brush '#E07B54'
+    $dot.Fill = Get-Brush $dotHex
     $dot.HorizontalAlignment = 'Left'; $dot.VerticalAlignment = 'Top'
     $dot.Margin = New-Object System.Windows.Thickness(7, 7, 0, 0)
     $prev.Child = $dot
@@ -2487,7 +2601,7 @@ function Update-AccountsPanel {
 }
 
 function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '') {
-    if ($Theme -in @('midnight', 'oled', 'glass') -and $Theme -ne $script:ThemeName) {
+    if ($script:ThemeSpecs.Keys -contains $Theme -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
         Apply-Theme
     }
@@ -2619,11 +2733,13 @@ function Show-SettingsDialog {
     $script:ThemeSaved = $false
     $script:ThemePickRings = @{}
     [void]$stack.Children.Add((New-DarkLabel 'theme'))
-    $themeRow = New-Object System.Windows.Controls.StackPanel
+    $themeRow = New-Object System.Windows.Controls.WrapPanel
     $themeRow.Orientation = 'Horizontal'
+    $themeRow.MaxWidth = 404
+    $themeRow.HorizontalAlignment = 'Left'
     $themeRow.Margin = New-Object System.Windows.Thickness(2, 0, 0, 6)
-    foreach ($tn in @('midnight', 'oled', 'glass')) {
-        [void]$themeRow.Children.Add((New-ThemeSwatch $tn))
+    foreach ($tn in @($script:ThemeSpecs.Keys)) {
+        [void]$themeRow.Children.Add((New-ThemeSwatch ([string]$tn)))
     }
     [void]$stack.Children.Add($themeRow)
 
@@ -2860,8 +2976,9 @@ function Invoke-AttentionRaise {
             $script:RootCard.BorderBrush = $pulse
             $ca.Add_Completed({
                 try {
-                    $script:RootCard.BorderBrush = Get-Brush $(
-                        if ($script:ThemeName -eq 'oled') { '#2BFFFFFF' } else { '#24FFFFFF' })
+                    $spec = $script:ThemeSpecs[$script:ThemeName]
+                    if ($null -eq $spec -or $null -eq $spec.BorderBrush) { $spec = $script:ThemeSpecs['midnight'] }
+                    $script:RootCard.BorderBrush = $spec.BorderBrush
                 }
                 catch { }
             })

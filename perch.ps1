@@ -2310,6 +2310,19 @@ function Set-PillPeek([bool]$On) {
     }
 }
 
+function Set-PillFoldInstant {
+    # a drag is starting: snap the peek back to the pill with NO animation,
+    # so the user always drags the tiny pill - never the open island. No
+    # right-edge anchoring here either: keeping Left fixed leaves the pill
+    # right where the card's top-left corner (the natural grab spot) was.
+    if (-not $script:Compact -or -not $script:PillPeeked) { return }
+    $script:PillPeeked = $false
+    Clear-PillAnimations
+    $script:AnchorRight = 0.0
+    $script:PillCard.Visibility = 'Visible'
+    $script:RootCard.Visibility = 'Collapsed'
+}
+
 function Clear-PillAnimations {
     # release every held animation so base values rule again - a mode
     # change mid-crossfade must not fight HoldEnd values
@@ -2338,6 +2351,9 @@ function Clear-PillAnimations {
 $script:PillDragging = $false   # DragMove() pumps a nested message loop, so
                                 # these timers TICK DURING A DRAG - without
                                 # this flag the peek opens in your hand mid-drag
+$script:PillDragEnd = [datetime]::MinValue   # capture release can fire a synthetic
+                                             # MouseEnter right after the drop; the
+                                             # cooldown keeps a parked pill a pill
 $script:PillPeekTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:PillPeekTimer.Interval = [TimeSpan]::FromMilliseconds(220)
 $script:PillPeekTimer.Add_Tick({
@@ -2364,6 +2380,7 @@ $script:PillCloseTimer.Add_Tick({
 })
 $script:PillHoverEnter = {
     if ($script:Compact) {
+        if (((Get-Date) - $script:PillDragEnd).TotalMilliseconds -lt 400) { return }
         $script:PillCloseTimer.Stop()
         $script:PillPeekTimer.Stop()
         $script:PillPeekTimer.Start()
@@ -4457,11 +4474,19 @@ $script:MiniBtn.Add_MouseLeftButtonUp({
     Save-HudState
 })
 # full mode: double-click header = fold to pill, single click = drag.
-# compact mode: the pill/peek card is one big 'open me' button - a CLEAN
-# single click (no movement) expands, dragging still moves. The stamp
-# guards the second press of an old-habit double-click from instantly
-# re-folding what the first press just opened.
+# compact mode: the pill/peek card is one big 'open me' button - click
+# expands, drag moves. The catch: hovering to GRAB the pill opens the peek
+# (that's its job), so a naive DragMove would drag the open island - the
+# thing the user hated most. We must know click-vs-drag BEFORE acting, and
+# DragMove() only tells us at mouse-up. So compact presses are detected by
+# hand: arm on press, watch movement, and the moment it crosses the drag
+# threshold FOLD the peek back to the pill and drag the pill. Release
+# without movement = click = expand. The stamp guards the second press of
+# an old-habit double-click from instantly re-folding what the first
+# press just opened.
 $script:PillExpandStamp = [datetime]::MinValue
+$script:PillPressActive = $false
+$script:PillPressPt = New-Object System.Windows.Point(0.0, 0.0)
 $script:HeaderClick = {
     param($s, $e)
     if ($e.ClickCount -eq 2) {
@@ -4474,23 +4499,19 @@ $script:HeaderClick = {
         $e.Handled = $true
         return
     }
-    $wasCompact = $script:Compact
-    $x0 = $script:Window.Left; $y0 = $script:Window.Top
-    $script:PillDragging = $true
-    try { $script:Window.DragMove() } catch { }
-    finally {
-        $script:PillDragging = $false
-        # a mid-drag MouseEnter re-arms the peek timer; don't let it fire
-        # right after the drop - parking the pill should leave a pill
-        try { $script:PillPeekTimer.Stop() } catch { }
+    if (-not $script:Compact) {
+        try { $script:Window.DragMove() } catch { }
+        return
     }
-    if ($wasCompact -and $script:Compact -and
-        [Math]::Abs($script:Window.Left - $x0) -lt 3 -and
-        [Math]::Abs($script:Window.Top - $y0) -lt 3) {
-        $script:PillExpandStamp = Get-Date
-        Set-CompactMode $false
-        Save-HudState
+    # compact: arm the click-vs-drag watcher. Capture so move/up still
+    # reach us when a fast flick leaves the tiny pill before we commit.
+    try {
+        $script:PillPressPt = $script:Window.PointToScreen($e.GetPosition($script:Window))
+        $script:PillPressActive = $true
+        [void]$script:Window.CaptureMouse()
     }
+    catch { $script:PillPressActive = $false }
+    $e.Handled = $true
 }
 $Header.Add_MouseLeftButtonDown($script:HeaderClick)
 $ChipsPanel.Add_MouseLeftButtonDown($script:HeaderClick)
@@ -4500,6 +4521,40 @@ $script:PillBar.Add_MouseLeftButtonDown($script:HeaderClick)   # pill: click out
 $script:RootCard.Add_MouseLeftButtonDown({
     param($s, $e)
     if ($script:Compact -and -not $e.Handled) { & $script:HeaderClick $s $e }
+})
+$Window.Add_MouseMove({
+    param($s, $e)
+    if (-not $script:PillPressActive) { return }
+    if ($e.LeftButton -ne [System.Windows.Input.MouseButtonState]::Pressed) {
+        $script:PillPressActive = $false
+        try { $script:Window.ReleaseMouseCapture() } catch { }
+        return
+    }
+    try { $cur = $script:Window.PointToScreen($e.GetPosition($script:Window)) } catch { return }
+    if ([Math]::Abs($cur.X - $script:PillPressPt.X) -lt 4 -and
+        [Math]::Abs($cur.Y - $script:PillPressPt.Y) -lt 4) { return }
+    # it's a DRAG: fold to the pill first, then move the pill
+    $script:PillPressActive = $false
+    try { $script:Window.ReleaseMouseCapture() } catch { }
+    Set-PillFoldInstant
+    $script:PillDragging = $true
+    try { $script:Window.DragMove() } catch { }
+    finally {
+        $script:PillDragging = $false
+        $script:PillDragEnd = Get-Date
+        try { $script:PillPeekTimer.Stop() } catch { }
+    }
+})
+$Window.Add_MouseLeftButtonUp({
+    param($s, $e)
+    if (-not $script:PillPressActive) { return }
+    $script:PillPressActive = $false
+    try { $script:Window.ReleaseMouseCapture() } catch { }
+    if ($script:Compact) {
+        $script:PillExpandStamp = Get-Date
+        Set-CompactMode $false
+        Save-HudState
+    }
 })
 function Save-HudState {
     try {

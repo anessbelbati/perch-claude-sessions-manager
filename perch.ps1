@@ -1551,6 +1551,7 @@ $xaml = @"
       </Setter>
     </Style>
   </Window.Resources>
+  <Grid x:Name="WinRoot">
   <Border x:Name="RootCard" CornerRadius="16" BorderBrush="#24FFFFFF" BorderThickness="1" Margin="12">
     <Border.Background>
       <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
@@ -1658,6 +1659,12 @@ $xaml = @"
     </Border>
     </Grid>
   </Border>
+  <!-- the resting pill is its OWN tiny card, not a squeezed RootCard: the
+       peek morph is a pure crossfade between the two (render-only, no
+       per-frame layout, no window-rect animation - THAT was the jank) -->
+  <Border x:Name="PillCard" CornerRadius="19" BorderThickness="1" Margin="8"
+          HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed"/>
+  </Grid>
 </Window>
 "@
 
@@ -1690,6 +1697,7 @@ $script:MiniBtn     = $Window.FindName('MiniBtn')
 $script:Divider     = $Window.FindName('Divider')
 $script:RowsScroll  = $Window.FindName('RowsScroll')
 $script:RootCard    = $Window.FindName('RootCard')
+$script:PillCard    = $Window.FindName('PillCard')
 $script:GlassDome   = $Window.FindName('GlassDome')
 $script:GlassStreak = $Window.FindName('GlassStreak')
 $script:GlassInner  = $Window.FindName('GlassInner')
@@ -1979,7 +1987,13 @@ $script:PillCluster['zzz'] = $pillZzz
 [void]$pillClusterPanel.Children.Add($pillZzz)
 [void]$pillRow.Children.Add($pillClusterPanel)
 [void]$script:PillBar.Children.Add($pillRow)
-try { [void]$script:Header.Parent.Children.Insert(0, $script:PillBar) } catch { }
+$script:PillBar.Visibility = 'Visible'   # PillCard's visibility is the gate now
+$script:PillCard.Child = $script:PillBar
+# the peek morph scales the big card in from the top - one persistent
+# transform, animated per open/close, cleared after
+$script:PeekScale = New-Object System.Windows.Media.ScaleTransform(1.0, 1.0)
+$script:RootCard.RenderTransform = $script:PeekScale
+$script:RootCard.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.0)
 
 function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
     $vals = @{ att = $Att; work = $Work; done = $Done }
@@ -2141,8 +2155,22 @@ function Apply-Theme {
         }
     }
     catch { }
-    # a theme applied while the pill is up must not un-round the pill
-    if ($script:Compact) { $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(19) }
+    # dress the pill card to match the room
+    try {
+        if ($glass) {
+            $script:PillCard.Background = $script:RootCard.Background   # the film
+            $script:PillCard.BorderBrush = Get-Brush '#59FFFFFF'
+            $script:PillCard.Margin = New-Object System.Windows.Thickness(0)
+        }
+        else {
+            $pspec = $script:ThemeSpecs[$script:ThemeName]
+            if ($null -eq $pspec -or $null -eq $pspec.Bg) { $pspec = $script:ThemeSpecs['midnight'] }
+            $script:PillCard.Background = $pspec.Bg
+            $script:PillCard.BorderBrush = $pspec.BorderBrush
+            $script:PillCard.Margin = New-Object System.Windows.Thickness(8)
+        }
+    }
+    catch { }
     Set-GlassBackdrop $glass
 }
 
@@ -2172,19 +2200,23 @@ function Set-CompactMode([bool]$On) {
     Set-PillEdgeAnchor
     if ($On) {
         $script:PillPeeked = $false
-        $script:Header.Visibility = 'Collapsed'
-        $script:ChipsPanel.Visibility = 'Collapsed'
-        $script:LimitsPanel.Visibility = 'Collapsed'
+        # the peek card = header + chips + limits at 264, no rows
+        $script:Header.Visibility = 'Visible'
+        $script:ChipsPanel.Visibility = 'Visible'
+        $script:LimitsPanel.Visibility = 'Visible'
         $script:RowsScroll.Visibility = 'Collapsed'
         $script:Divider.Visibility = 'Collapsed'
-        $script:PillBar.Visibility = 'Visible'
-        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(19)
+        $script:RootCard.Visibility = 'Collapsed'
+        $script:RootCard.Width = 264.0
+        $script:PillCard.Visibility = 'Visible'
         $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
         $script:MiniBtn.ToolTip = 'expand (or double-click the header)'
     }
     else {
-        $script:PillBar.Visibility = 'Collapsed'
+        $script:PillCard.Visibility = 'Collapsed'
+        $script:RootCard.Visibility = 'Visible'
+        $script:RootCard.Width = [double]::NaN
         $script:Header.Visibility = 'Visible'
         $script:ChipsPanel.Visibility = 'Visible'
         $script:LimitsPanel.Visibility = 'Visible'
@@ -2192,131 +2224,92 @@ function Set-CompactMode([bool]$On) {
         $script:Divider.Visibility = 'Visible'
         $script:Window.SizeToContent = 'Height'
         $script:Window.Width = 324
-        Apply-Theme   # restores the theme's own corner radius + backdrop
+        Apply-Theme   # restores the theme's backdrop state
         $script:MiniBtn.Text = [string][char]0x2013   # minimize glyph
         $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
     }
 }
 
 function Set-PillPeek([bool]$On) {
-    # hover = the island opens in place: chips + limit bars slide in,
-    # session rows stay put (that is what full expand is for).
-    # The open/close is a GLIDE, not a snap: measure the destination size
-    # invisibly, rewind, then run a ~190ms eased one-shot animation on the
-    # window rect. Event-driven and short - the perf audit's enemy was
-    # CONTINUOUS repaints, a 12-frame morph on a 264px window is nothing.
+    # hover = CROSSFADE pill -> mini card (header + chips + limit bars).
+    # v1 animated the window rect and stuttered: every frame was a
+    # SetWindowPos + full layout + layered-window readback, and the
+    # measure trick flashed an intermediate rect. Now the hwnd resizes
+    # ONCE per direction (a visibility flip under SizeToContent) and
+    # everything animated is render-only (opacity + scale) - software
+    # rendering glides through that.
     if (-not $script:Compact) { return }
     if ($On -eq $script:PillPeeked) { return }
     $script:PillPeeked = $On
+    Clear-PillAnimations
     Set-PillEdgeAnchor
-    $w = $script:Window
-    $wProp = [System.Windows.Window]::WidthProperty
-    $hProp = [System.Windows.Window]::HeightProperty
-    $lProp = [System.Windows.Window]::LeftProperty
-
-    # pin the base rect to whatever the eyes currently see (a reversal can
-    # land mid-flight), THEN clear in-flight animations - no snap possible
-    $fromW = $w.ActualWidth; $fromH = $w.ActualHeight; $fromL = $w.Left
-    $w.SizeToContent = 'Manual'
-    $w.Width = $fromW; $w.Height = $fromH
-    foreach ($p in @($wProp, $hProp, $lProp)) { $w.BeginAnimation($p, $null) }
-
-    # measure the destination WITHOUT presenting it: flip the layout state,
-    # force a layout pass, read the answer, rewind - all in this callback,
-    # so no full-size frame ever reaches the screen
+    $opProp = [System.Windows.UIElement]::OpacityProperty
     if ($On) {
-        $script:PillBar.ToolTip = $null   # the open island IS the tooltip
-        $script:ChipsPanel.Visibility = 'Visible'
-        $script:LimitsPanel.Visibility = 'Visible'
-        $script:ChipsPanel.Opacity = 0.0
-        $script:LimitsPanel.Opacity = 0.0
-        $w.SizeToContent = 'Height'
-        $w.Width = 264
-    }
-    else {
-        $script:ChipsPanel.Visibility = 'Collapsed'
-        $script:LimitsPanel.Visibility = 'Collapsed'
-        $w.SizeToContent = 'WidthAndHeight'
-    }
-    $w.UpdateLayout()
-    $toW = $w.ActualWidth; $toH = $w.ActualHeight
-    $w.SizeToContent = 'Manual'
-    $w.Width = $fromW; $w.Height = $fromH
-
-    $anchor = $script:AnchorRight
-    $script:AnchorRight = 0.0   # the glide moves Left itself; keep SizeChanged out of it
-    $toL = $(if ($anchor -gt 0) { $anchor - $toW } else { $fromL })
-    $script:PillAnimFinal = @{ Peek = $On; L = $toL }
-
-    $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(190))
-    $ease = New-Object System.Windows.Media.Animation.CubicEase
-    $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
-    $aw = New-Object System.Windows.Media.Animation.DoubleAnimation($fromW, $toW, $dur)
-    $ah = New-Object System.Windows.Media.Animation.DoubleAnimation($fromH, $toH, $dur)
-    $aw.EasingFunction = $ease; $ah.EasingFunction = $ease
-    $aw.Add_Completed({
-        # land exactly, hand the rect back to SizeToContent, drop the anims
-        try {
-            $fin = $script:PillAnimFinal
-            if ($null -eq $fin) { return }
-            $script:PillAnimFinal = $null
-            $script:Window.Left = [double]$fin.L
-            foreach ($p in @([System.Windows.Window]::WidthProperty,
-                             [System.Windows.Window]::HeightProperty,
-                             [System.Windows.Window]::LeftProperty)) {
-                $script:Window.BeginAnimation($p, $null)
-            }
-            if ([bool]$fin.Peek) {
-                $script:Window.SizeToContent = 'Height'
-                $script:Window.Width = 264
-            }
-            else {
-                $script:Window.SizeToContent = 'WidthAndHeight'
-            }
-        }
-        catch { }
-    })
-    $w.BeginAnimation($wProp, $aw)
-    $w.BeginAnimation($hProp, $ah)
-    if ($anchor -gt 0) {
-        $al = New-Object System.Windows.Media.Animation.DoubleAnimation($fromL, $toL, $dur)
-        $al.EasingFunction = $ease
-        $w.BeginAnimation($lProp, $al)
-    }
-    if ($On) {
-        # content breathes in just behind the growing card. The fade must
-        # RELEASE Opacity when done (HoldEnd would forever override the
-        # limits panel's staleness dimming) - completed = clear + base 1
-        $fade = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
-            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(150))))
-        $fade.BeginTime = [TimeSpan]::FromMilliseconds(70)
-        $fade.Add_Completed({
+        $script:PillBar.ToolTip = $null   # the open card IS the tooltip
+        $script:RootCard.Opacity = 0.0
+        $script:RootCard.Visibility = 'Visible'   # single hwnd grow via SizeToContent
+        $durIn = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(170))
+        $ease = New-Object System.Windows.Media.Animation.CubicEase
+        $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+        $fadeIn = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0, $durIn)
+        $fadeIn.EasingFunction = $ease
+        $fadeIn.Add_Completed({
             try {
-                foreach ($pnl in @($script:ChipsPanel, $script:LimitsPanel)) {
-                    $pnl.Opacity = 1.0
-                    $pnl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                if ($script:PillPeeked) {
+                    $script:RootCard.Opacity = 1.0
+                    $script:RootCard.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                    $script:PillCard.Visibility = 'Hidden'   # out of render + input, keeps layout
                 }
             }
             catch { }
         })
-        $script:ChipsPanel.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
-        $script:LimitsPanel.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $fade)
+        foreach ($sp in @([System.Windows.Media.ScaleTransform]::ScaleXProperty,
+                          [System.Windows.Media.ScaleTransform]::ScaleYProperty)) {
+            $grow = New-Object System.Windows.Media.Animation.DoubleAnimation(0.94, 1.0, $durIn)
+            $grow.EasingFunction = $ease
+            $script:PeekScale.BeginAnimation($sp, $grow)
+        }
+        $script:RootCard.BeginAnimation($opProp, $fadeIn)
+        $pillOut = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.0,
+            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(110))))
+        $script:PillCard.BeginAnimation($opProp, $pillOut)
+    }
+    else {
+        $script:PillCard.Visibility = 'Visible'
+        $script:PillCard.Opacity = 0.0
+        $durOut = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(130))
+        $fadeOut = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.0, $durOut)
+        $fadeOut.Add_Completed({
+            try {
+                if (-not $script:PillPeeked) {
+                    $script:RootCard.Visibility = 'Collapsed'   # single hwnd shrink
+                    $script:RootCard.Opacity = 1.0
+                    $script:RootCard.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                }
+            }
+            catch { }
+        })
+        $script:RootCard.BeginAnimation($opProp, $fadeOut)
+        $pillIn = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0, $durOut)
+        $script:PillCard.BeginAnimation($opProp, $pillIn)
     }
 }
 
 function Clear-PillAnimations {
-    # a mode change mid-glide must not fight held animations
-    $script:PillAnimFinal = $null
+    # release every held animation so base values rule again - a mode
+    # change mid-crossfade must not fight HoldEnd values
     try {
-        foreach ($p in @([System.Windows.Window]::WidthProperty,
-                         [System.Windows.Window]::HeightProperty,
-                         [System.Windows.Window]::LeftProperty)) {
-            $script:Window.BeginAnimation($p, $null)
+        $opProp = [System.Windows.UIElement]::OpacityProperty
+        foreach ($el in @($script:RootCard, $script:PillCard)) {
+            $el.BeginAnimation($opProp, $null)
+            $el.Opacity = 1.0
         }
-        foreach ($pnl in @($script:ChipsPanel, $script:LimitsPanel)) {
-            $pnl.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
-            $pnl.Opacity = 1.0
+        foreach ($sp in @([System.Windows.Media.ScaleTransform]::ScaleXProperty,
+                          [System.Windows.Media.ScaleTransform]::ScaleYProperty)) {
+            $script:PeekScale.BeginAnimation($sp, $null)
         }
+        $script:PeekScale.ScaleX = 1.0
+        $script:PeekScale.ScaleY = 1.0
     }
     catch { }
 }
@@ -2331,31 +2324,42 @@ $script:PillPeekTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:PillPeekTimer.Interval = [TimeSpan]::FromMilliseconds(220)
 $script:PillPeekTimer.Add_Tick({
     $script:PillPeekTimer.Stop()
-    try { if ($script:Compact -and $script:RootCard.IsMouseOver) { Set-PillPeek $true } } catch { }
+    try {
+        if ($script:Compact -and ($script:RootCard.IsMouseOver -or $script:PillCard.IsMouseOver)) {
+            Set-PillPeek $true
+        }
+    }
+    catch { }
 })
 $script:PillCloseTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:PillCloseTimer.Interval = [TimeSpan]::FromMilliseconds(260)
 $script:PillCloseTimer.Add_Tick({
     $script:PillCloseTimer.Stop()
     try {
-        if ($script:Compact -and -not $script:RootCard.IsMouseOver) { Set-PillPeek $false }
+        if ($script:Compact -and -not $script:RootCard.IsMouseOver -and -not $script:PillCard.IsMouseOver) {
+            Set-PillPeek $false
+        }
     }
     catch { }
 })
-$script:RootCard.Add_MouseEnter({
+$script:PillHoverEnter = {
     if ($script:Compact) {
         $script:PillCloseTimer.Stop()
         $script:PillPeekTimer.Stop()
         $script:PillPeekTimer.Start()
     }
-})
-$script:RootCard.Add_MouseLeave({
+}
+$script:PillHoverLeave = {
     $script:PillPeekTimer.Stop()
     if ($script:Compact -and $script:PillPeeked) {
         $script:PillCloseTimer.Stop()
         $script:PillCloseTimer.Start()
     }
-})
+}
+$script:RootCard.Add_MouseEnter($script:PillHoverEnter)
+$script:RootCard.Add_MouseLeave($script:PillHoverLeave)
+$script:PillCard.Add_MouseEnter($script:PillHoverEnter)
+$script:PillCard.Add_MouseLeave($script:PillHoverLeave)
 $Window.Add_SizeChanged({
     param($s, $e)
     if ($script:AnchorRight -gt 0) {
@@ -3365,7 +3369,24 @@ function Invoke-AttentionRaise {
             [System.Windows.Media.ColorConverter]::ConvertFromString('#30FFFFFF'), $dur)
         $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
         $ca.SetValue([System.Windows.Media.Animation.Timeline]::DesiredFrameRateProperty, 15)
-        if ($script:ThemeName -eq 'glass' -and $null -ne $script:GlassRim) {
+        if ($script:Compact -and -not $script:PillPeeked) {
+            # resting pill: its own border carries the red flash
+            $script:PillCard.BorderBrush = $pulse
+            $ca.Add_Completed({
+                try {
+                    if ($script:ThemeName -eq 'glass') {
+                        $script:PillCard.BorderBrush = Get-Brush '#59FFFFFF'
+                    }
+                    else {
+                        $spec = $script:ThemeSpecs[$script:ThemeName]
+                        if ($null -eq $spec -or $null -eq $spec.BorderBrush) { $spec = $script:ThemeSpecs['midnight'] }
+                        $script:PillCard.BorderBrush = $spec.BorderBrush
+                    }
+                }
+                catch { }
+            })
+        }
+        elseif ($script:ThemeName -eq 'glass' -and $null -ne $script:GlassRim) {
             $script:GlassRim.BorderBrush = $pulse
             $ca.Add_Completed({
                 try { $script:GlassRim.BorderBrush = $script:RimGradient } catch { }

@@ -2335,12 +2335,16 @@ function Clear-PillAnimations {
 # open/closed under a perfectly still cursor - the close timer re-checks
 # IsMouseOver after layout settles and only collapses if the mouse is
 # genuinely gone.
+$script:PillDragging = $false   # DragMove() pumps a nested message loop, so
+                                # these timers TICK DURING A DRAG - without
+                                # this flag the peek opens in your hand mid-drag
 $script:PillPeekTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:PillPeekTimer.Interval = [TimeSpan]::FromMilliseconds(220)
 $script:PillPeekTimer.Add_Tick({
     $script:PillPeekTimer.Stop()
     try {
-        if ($script:Compact -and ($script:RootCard.IsMouseOver -or $script:PillCard.IsMouseOver)) {
+        if ($script:Compact -and -not $script:PillDragging -and
+            ($script:RootCard.IsMouseOver -or $script:PillCard.IsMouseOver)) {
             Set-PillPeek $true
         }
     }
@@ -2351,7 +2355,8 @@ $script:PillCloseTimer.Interval = [TimeSpan]::FromMilliseconds(260)
 $script:PillCloseTimer.Add_Tick({
     $script:PillCloseTimer.Stop()
     try {
-        if ($script:Compact -and -not $script:RootCard.IsMouseOver -and -not $script:PillCard.IsMouseOver) {
+        if ($script:Compact -and -not $script:PillDragging -and
+            -not $script:RootCard.IsMouseOver -and -not $script:PillCard.IsMouseOver) {
             Set-PillPeek $false
         }
     }
@@ -4471,7 +4476,14 @@ $script:HeaderClick = {
     }
     $wasCompact = $script:Compact
     $x0 = $script:Window.Left; $y0 = $script:Window.Top
+    $script:PillDragging = $true
     try { $script:Window.DragMove() } catch { }
+    finally {
+        $script:PillDragging = $false
+        # a mid-drag MouseEnter re-arms the peek timer; don't let it fire
+        # right after the drop - parking the pill should leave a pill
+        try { $script:PillPeekTimer.Stop() } catch { }
+    }
     if ($wasCompact -and $script:Compact -and
         [Math]::Abs($script:Window.Left - $x0) -lt 3 -and
         [Math]::Abs($script:Window.Top - $y0) -lt 3) {

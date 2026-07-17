@@ -689,6 +689,13 @@ try {
         $cwdName = Split-Path -Path $cwd -Leaf
     }
 
+    # transcript path: carried forward when this event doesn't include one -
+    # viewers use it for the hover prompt-peek (read lazily, never streamed)
+    if ([string]::IsNullOrWhiteSpace($transcriptPath) -and $null -ne $existing -and
+        $null -ne $existing.PSObject.Properties['transcript_path']) {
+        $transcriptPath = [string]$existing.transcript_path
+    }
+
     # context size: cheap transcript-tail read, refreshed on the human-paced
     # events; carried forward from the previous record otherwise
     $contextTokens = 0
@@ -722,6 +729,7 @@ try {
         turn_id = $turnId
         cwd = $cwd
         cwd_name = $cwdName
+        transcript_path = $transcriptPath
         model = $model
         message = $message
         agent_pid = $agentPid

@@ -179,6 +179,7 @@ Add-Type -AssemblyName UIAutomationTypes  -ErrorAction SilentlyContinue
 $script:StatusMeta = @{
     'attention'  = @{ Rank = 0; Color = '#FF6B6B'; Label = 'needs you'  }
     'error'      = @{ Rank = 1; Color = '#FF6B6B'; Label = 'failed'     }
+    'retrying'   = @{ Rank = 1; Color = '#FF8F5E'; Label = 'api retry'  }
     'working'    = @{ Rank = 2; Color = '#FFB84D'; Label = 'working'    }
     'compacting' = @{ Rank = 2; Color = '#B48EF0'; Label = 'compacting' }
     'idle'       = @{ Rank = 3; Color = '#5ED584'; Label = 'done'       }
@@ -316,6 +317,7 @@ function Get-Sessions {
             AgentPid = $agentPid
             Window   = $s.window
             Context  = $(if ($null -ne $s.PSObject.Properties['context_tokens']) { [long]$s.context_tokens } else { 0 })
+            Transcript = $(if ($null -ne $s.PSObject.Properties['transcript_path']) { [string]$s.transcript_path } else { '' })
             Rank     = (Get-StatusMeta $status).Rank
         })
     }
@@ -418,6 +420,12 @@ function Get-Sessions {
             if ($ov.FileTs -eq $s.Ts) {
                 $s.Status = [string]$ov.Status
                 $s.Rank   = (Get-StatusMeta $s.Status).Rank
+                # KEEP WATCHING an overridden row: an api-retry that recovers
+                # (or an idle flip that was wrong) gets lifted by the next
+                # probe when busy markers reappear on screen
+                if (-not $script:UntrackedPids.ContainsKey($apid)) {
+                    [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts })
+                }
                 continue                                   # corrected: not busy anymore
             }
             [void]$script:BusyOverride.Remove($apid)       # newer hook event wins
@@ -861,6 +869,15 @@ $script:ScreenBusy = @(
     'ctrlctointerrupt'
     'ctrlbtoruninbackground'             # claude running-tool hint
 )
+$script:ScreenApiRetry = @(
+    'retryingin'                         # "Unable to connect ... Retrying in 4s (attempt 3/10)"
+)
+$script:ScreenApiError = @(
+    'unabletoconnecttoapi'               # connection refused / dns / proxy down
+    'connectionrefused'
+    'apierror'                           # "API Error: 500/529..."
+    'overloadederror'
+)
 
 function Test-ScreenLooksBusy([string]$Txt, [string]$Title) {
     # busy signals that do NOT rotate. The status-bar hint line alternates
@@ -903,17 +920,35 @@ function Invoke-BusyVerify {
         if ([long]$r.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$r.ConsoleId }
         $txt = [string]$r.Screen
         if ($txt.Length -lt 200) { continue }                           # mute console proves nothing
+        $ov = $script:BusyOverride[$apid]
         if (Test-ScreenLooksBusy $txt ([string]$r.Title)) {
+            # cooking (again): LIFT any override - an api-retry that got
+            # through goes straight back to plain 'working'
+            if ($null -ne $ov) { [void]$script:BusyOverride.Remove($apid) }
             $st.Misses = 0
             $st.Wait = [Math]::Min([int]$st.Wait + 30, 120)             # confirmed busy: ease off
             continue
         }
-        $needs = $false
-        foreach ($p in $script:ScreenNeedsYou) { if ($txt.Contains($p)) { $needs = $true; break } }
-        if ($needs) {
-            # a permission prompt is sitting there under a 'working' label -
-            # the one state perch exists to surface
-            $script:BusyOverride[$apid] = @{ Status = 'attention'; FileTs = $q.Ts }
+        # not cooking - what IS on screen? checked in blame order: a
+        # permission prompt outranks an api hiccup outranks plain idle
+        $verdict = $null
+        foreach ($p in $script:ScreenNeedsYou) { if ($txt.Contains($p)) { $verdict = 'attention'; break } }
+        if ($null -eq $verdict) {
+            foreach ($p in $script:ScreenApiRetry) { if ($txt.Contains($p)) { $verdict = 'retrying'; break } }
+        }
+        if ($null -eq $verdict) {
+            foreach ($p in $script:ScreenApiError) { if ($txt.Contains($p)) { $verdict = 'error'; break } }
+        }
+        if ($null -ne $verdict) {
+            $script:BusyOverride[$apid] = @{ Status = $verdict; FileTs = $q.Ts }
+            $st.Misses = 0
+            # api retries resolve themselves - look back quickly so recovery
+            # flips the row to working fast; the rest can relax
+            $st.Wait = $(if ($verdict -eq 'retrying') { 20 } else { [Math]::Min([int]$st.Wait + 30, 90) })
+            continue
+        }
+        if ($null -ne $ov -and [string]$ov.Status -eq 'idle') {
+            $st.Wait = [Math]::Min([int]$st.Wait + 30, 120)             # confirmed calm: ease off
             continue
         }
         $st.Misses++
@@ -1609,6 +1644,12 @@ $script:SessionList = $Window.FindName('SessionList')
 $script:ChipsPanel  = $Window.FindName('ChipsPanel')
 $script:LimitsPanel = $Window.FindName('LimitsPanel')
 $script:UsageFetchStamp = [datetime]::MinValue
+$script:BlocksSpawnStamp = [datetime]::MinValue
+$script:BlocksProc = $null           # blocks-probe child (never overlap scans)
+$script:BlocksFileLWT = [datetime]::MinValue
+$script:BlocksParsed = $null         # cached blocks.json parse
+$script:AnchorKey = ''               # last official 5h reset written as the probe's anchor
+$script:BlockCalib = New-Object System.Collections.ArrayList   # {Tok;Pct;At}: official% vs local tokens pairs
 $script:UsageHist = @{}      # limit label -> samples of (T, Pct) for burn-rate math
 $script:LimitAlerted = @{}   # limit label -> chirped-at-90 flag (cleared on reset)
 $script:LastUsageKey = ''
@@ -1674,7 +1715,7 @@ function Get-Brush([string]$Hex) {
 }
 
 function Get-RowBaseBrush($Sess) {
-    if ($Sess.Status -eq 'attention' -or $Sess.Status -eq 'error') { return Get-Brush '#14FF6B6B' }
+    if ($Sess.Status -in @('attention', 'error', 'retrying')) { return Get-Brush '#14FF6B6B' }
     return [System.Windows.Media.Brushes]::Transparent
 }
 
@@ -1801,6 +1842,15 @@ try {
         if ($null -ne $st.PSObject.Properties['Topmost']) {
             $script:UserTopmost = [bool]$st.Topmost
             $Window.Topmost = $script:UserTopmost
+        }
+        if ($null -ne $st.PSObject.Properties['Calib']) {
+            # learned 5h-window calibration pairs (official % vs local block
+            # tokens) survive restarts - the offline bars stay trustworthy
+            foreach ($cs in @($st.Calib)) {
+                if ($null -ne $cs -and $null -ne $cs.PSObject.Properties['Tok'] -and [double]$cs.Pct -gt 0) {
+                    [void]$script:BlockCalib.Add(@{ Tok = [long]$cs.Tok; Pct = [double]$cs.Pct; At = [string]$cs.At })
+                }
+            }
         }
         if ($null -ne $st.PSObject.Properties['Compact'] -and [bool]$st.Compact) {
             Set-CompactMode $true
@@ -2878,6 +2928,37 @@ function Update-LimitsPanel {
             }
         }
 
+        # source 3: LOCAL 5h-block estimate (the ccusage steal, zero api):
+        # a BelowNormal child incrementally buckets transcript token usage
+        # into 5h billing blocks. Used only when both official feeds are
+        # silent (offline / api down / rate-limited) - the cap is learned by
+        # CALIBRATING local block tokens against official percentages seen
+        # earlier, falling back to the P90 of past blocks.
+        if (($null -eq $script:BlocksProc -or $script:BlocksProc.HasExited) -and
+            ($now - $script:BlocksSpawnStamp).TotalSeconds -gt 120) {
+            $script:BlocksSpawnStamp = $now
+            $bpp = Join-Path $PSScriptRoot 'blocks-probe.ps1'
+            if (Test-Path -LiteralPath $bpp) {
+                $script:BlocksProc = Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$bpp`"")
+                try { $script:BlocksProc.PriorityClass = 'BelowNormal' } catch { }
+            }
+        }
+        $blocks = $null
+        $bPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\blocks.json'
+        if (Test-Path -LiteralPath $bPath) {
+            $bLwt = (Get-Item -LiteralPath $bPath).LastWriteTimeUtc
+            if ($bLwt -ne $script:BlocksFileLWT) {
+                try {
+                    $script:BlocksParsed = Get-Content -LiteralPath $bPath -Raw | ConvertFrom-Json
+                    $script:BlocksFileLWT = $bLwt
+                }
+                catch { }
+            }
+            if ($null -ne $script:BlocksParsed -and
+                ([datetime]::UtcNow - $bLwt).TotalMinutes -lt 6) { $blocks = $script:BlocksParsed }
+        }
+
         # endpoint snapshot rows (cached parse keyed on file write time)
         $endpointRows = @()
         $endpointFetched = [datetime]::MinValue
@@ -2909,8 +2990,50 @@ function Update-LimitsPanel {
         $rows = @()
         $staleMin = 0.0
         $srcStamp = $now
+        $localEst = $false
         if ($null -ne $official) {
             $rows = @($official)
+            # drop the official 5h reset as an ANCHOR: the blocks probe snaps
+            # its local window to it, so offline estimates share the server's
+            # exact boundaries instead of drifting up to an hour
+            foreach ($ol in @($official)) {
+                if ([string]$ol.label -eq '5h window' -and ([string]$ol.resets_at) -ne $script:AnchorKey) {
+                    $script:AnchorKey = [string]$ol.resets_at
+                    try { $script:AnchorKey | Set-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'AgentFocus\reset-anchor.txt') -Encoding ASCII } catch { }
+                }
+            }
+            # CALIBRATE while both eyes are open: official says X%, local
+            # math says Y tokens in the SAME window (block end must agree
+            # with the official reset) -> the full window holds ~Y*100/X.
+            # The median of these pairs beats any guessed plan size.
+            if ($null -ne $blocks -and $null -ne $blocks.block) {
+                foreach ($ol in @($official)) {
+                    if ([string]$ol.label -ne '5h window') { continue }
+                    $opct = [double]$ol.percent
+                    $otok = [long]$blocks.block.tokens
+                    if ($opct -lt 10 -or $otok -le 0) { break }   # tiny % = noisy ratio
+                    try {
+                        $orst = ([datetime]::Parse([string]$ol.resets_at, $null,
+                                 [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime()
+                        $bend = ([datetime]::Parse([string]$blocks.block.end, $null,
+                                 [System.Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime()
+                        if ([Math]::Abs(($orst - $bend).TotalMinutes) -gt 45) { break }   # different window: skip
+                    }
+                    catch { break }
+                    $lastC = $(if ($script:BlockCalib.Count -gt 0) { $script:BlockCalib[$script:BlockCalib.Count - 1] } else { $null })
+                    $lastAt = [datetime]::MinValue
+                    if ($null -ne $lastC) {
+                        try { $lastAt = ([datetime]::Parse([string]$lastC.At, $null,
+                                         [System.Globalization.DateTimeStyles]::RoundtripKind)) } catch { }
+                    }
+                    if (($now - $lastAt).TotalMinutes -gt 20) {
+                        [void]$script:BlockCalib.Add(@{ Tok = $otok; Pct = $opct; At = $now.ToString('o') })
+                        while ($script:BlockCalib.Count -gt 12) { $script:BlockCalib.RemoveAt(0) }
+                        Save-HudState
+                    }
+                    break
+                }
+            }
             # the statusline doesn't carry the per-model weekly rows - keep
             # them from the endpoint snapshot for up to 6h (weekly numbers
             # drift slowly; a 2h-old fable row beats a vanished fable row)
@@ -2927,10 +3050,42 @@ function Update-LimitsPanel {
             if ($endpointFetched -gt [datetime]::MinValue) { $staleMin = ($now - $endpointFetched).TotalMinutes }
             else { $staleMin = 999 }
             $srcStamp = $endpointFetched
+            # both official feeds silent: local block math carries the 5h row
+            # (fresh + honest about being an estimate via its '~local' label)
+            if ($null -ne $blocks -and $null -ne $blocks.block -and
+                ($staleMin -gt 20 -or $rows.Count -eq 0)) {
+                $cap = 0.0
+                if ($script:BlockCalib.Count -ge 3) {
+                    $capsArr = @(foreach ($cs in $script:BlockCalib) { [double]$cs.Tok * 100.0 / [double]$cs.Pct }) | Sort-Object
+                    $cap = [double]$capsArr[[int][Math]::Floor($capsArr.Count / 2)]
+                }
+                elseif ($null -ne $blocks.PSObject.Properties['p90'] -and [double]$blocks.p90 -gt 0) {
+                    $cap = [double]$blocks.p90
+                }
+                if ($cap -gt 0) {
+                    $estPct = [Math]::Min(100.0, [long]$blocks.block.tokens * 100.0 / $cap)
+                    $rows = @([pscustomobject]@{ label = '5h ~local'; percent = $estPct
+                                                 severity = 'normal'; resets_at = [string]$blocks.block.end }) +
+                            @($rows | Where-Object { ([string]$_.label) -ne '5h window' })
+                    $localEst = $true
+                }
+            }
         }
-        if ($rows.Count -eq 0) { $script:LimitsPanel.Children.Clear(); return }
+        if ($rows.Count -eq 0) {
+            $script:LimitsPanel.Children.Clear()
+            # keep the in-terminal statusline honest too: a seeded/stale text
+            # would keep claiming numbers we no longer have
+            try {
+                if ($script:SlTextKey -ne 'perch: limits offline') {
+                    $script:SlTextKey = 'perch: limits offline'
+                    $script:SlTextKey | Set-Content -LiteralPath (Join-Path $env:LOCALAPPDATA 'AgentFocus\statusline-text.txt') -Encoding ASCII
+                }
+            }
+            catch { }
+            return
+        }
 
-        $wantOpacity = $(if ($staleMin -gt 15) { 0.45 } else { 1.0 })
+        $wantOpacity = $(if ($staleMin -gt 15 -and -not $localEst) { 0.45 } else { 1.0 })
         if ($script:LimitsPanel.Opacity -ne $wantOpacity) { $script:LimitsPanel.Opacity = $wantOpacity }
 
         # rebuild only when the CONTENT changed (rounded pct / reset) or a
@@ -3065,8 +3220,9 @@ function Update-LimitsPanel {
             $old.Foreground = Get-Brush '#8A6E6E'
             $old.HorizontalAlignment = 'Right'
             $old.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
-            $old.Text = "data $([int]$staleMin)m old" +
-                        $(if ($coolActive) { ' (rate-limited, backing off)' } else { ', retrying' })
+            $old.Text = $(if ($localEst) { "5h = local estimate $([char]0x00B7) wk data $([int]$staleMin)m old" }
+                          else { "data $([int]$staleMin)m old" +
+                                 $(if ($coolActive) { ' (rate-limited, backing off)' } else { ', retrying' }) })
             [void]$script:LimitsPanel.Children.Add($old)
         }
 
@@ -3075,8 +3231,8 @@ function Update-LimitsPanel {
         # maintained by perch, costing the render one tiny file read
         try {
             $slParts = foreach ($lim in @($rows)) {
-                if (([string]$lim.label) -in @('5h window', 'week')) {
-                    ('{0} {1:0}%' -f ((([string]$lim.label) -replace '5h window', '5h') -replace 'week', 'wk'), [double]$lim.percent)
+                if (([string]$lim.label) -in @('5h window', 'week', '5h ~local')) {
+                    ('{0} {1:0}%' -f (((([string]$lim.label) -replace '5h ~local', '5h~') -replace '5h window', '5h') -replace 'week', 'wk'), [double]$lim.percent)
                 }
             }
             $slText = 'perch: ' + (($slParts | Where-Object { $_ }) -join ' | ')
@@ -3088,6 +3244,72 @@ function Update-LimitsPanel {
         catch { }
     }
     catch { }
+}
+
+$script:PeekCache = @{}   # transcript path -> {LWT; You; Bot} (re-read only on file change)
+function Get-TranscriptPeek([string]$Path) {
+    # hover peek: the last thing YOU said and the last thing CLAUDE said,
+    # pulled from the transcript tail. Lazy (hover only), cached per file
+    # version, tail-read only - transcripts grow to many MB.
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $lwt = (Get-Item -LiteralPath $Path).LastWriteTimeUtc
+        $c = $script:PeekCache[$Path]
+        if ($null -ne $c -and $c.LWT -eq $lwt) { return $c }
+        $fs = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+        try {
+            $take = [Math]::Min($fs.Length, 262144)
+            [void]$fs.Seek(-$take, [IO.SeekOrigin]::End)
+            $buf = New-Object byte[] $take
+            [void]$fs.Read($buf, 0, $take)
+            $text = [Text.Encoding]::UTF8.GetString($buf)
+        }
+        finally { $fs.Close() }
+        $lines = $text -split "`n"
+        $you = ''; $bot = ''
+        for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+            if ($you.Length -gt 0 -and $bot.Length -gt 0) { break }
+            $ln = $lines[$i]
+            if ($bot.Length -eq 0 -and $ln -like '*"type":"assistant"*') {
+                try {
+                    $o = $ln | ConvertFrom-Json
+                    $parts = @()
+                    foreach ($cb in @($o.message.content)) {
+                        if ([string]$cb.type -eq 'text' -and -not [string]::IsNullOrWhiteSpace([string]$cb.text)) { $parts += ([string]$cb.text).Trim() }
+                    }
+                    if ($parts.Count -gt 0) { $bot = $parts -join ' ' }
+                }
+                catch { }
+            }
+            elseif ($you.Length -eq 0 -and $ln -like '*"type":"user"*') {
+                try {
+                    $o = $ln | ConvertFrom-Json
+                    if ($null -ne $o.PSObject.Properties['isMeta'] -and [bool]$o.isMeta) { continue }
+                    $t = ''
+                    $mc = $o.message.content
+                    if ($mc -is [string]) { $t = $mc }
+                    else {
+                        $parts = @()
+                        foreach ($cb in @($mc)) { if ([string]$cb.type -eq 'text') { $parts += [string]$cb.text } }
+                        $t = $parts -join ' '
+                    }
+                    $t = $t.Trim()
+                    # skip machinery lines: tool results have no text blocks,
+                    # command wrappers/caveats/interrupt stubs aren't prompts
+                    if ($t.Length -eq 0 -or $t.StartsWith('<') -or
+                        $t.StartsWith('[Request interrupt') -or $t.StartsWith('Caveat:')) { continue }
+                    $you = $t
+                }
+                catch { }
+            }
+        }
+        if ($you.Length -gt 300) { $you = $you.Substring(0, 300) + '...' }
+        if ($bot.Length -gt 420) { $bot = $bot.Substring(0, 420) + '...' }
+        $res = @{ LWT = $lwt; You = $you; Bot = $bot }
+        $script:PeekCache[$Path] = $res
+        return $res
+    }
+    catch { return $null }
 }
 
 function New-Chip([string]$Text, [string]$Hex) {
@@ -3192,7 +3414,7 @@ function New-SessionRow($Sess) {
 
     $row.Add_MouseEnter({
         param($s, $e)
-        if ($s.Tag.Status -eq 'attention' -or $s.Tag.Status -eq 'error') { $s.Background = Get-Brush '#26FF6B6B' }
+        if ($s.Tag.Status -in @('attention', 'error', 'retrying')) { $s.Background = Get-Brush '#26FF6B6B' }
         else { $s.Background = Get-Brush '#12FFFFFF' }
     })
     $row.Add_MouseLeave({ param($s, $e) $s.Background = Get-RowBaseBrush $s.Tag })
@@ -3224,6 +3446,53 @@ function New-SessionRow($Sess) {
         }
     })
     $row.ContextMenu = New-RowMenu $row
+
+    # prompt peek (steal from the macOS menubar crowd): hover a row and see
+    # what you asked + what claude answered, without switching tabs. Content
+    # is built lazily on open - hovering costs nothing until you linger.
+    $tt = New-Object System.Windows.Controls.ToolTip
+    $tt.Background = Get-Brush '#F520202B'
+    $tt.BorderBrush = Get-Brush '#2EFFFFFF'
+    $tt.BorderThickness = New-Object System.Windows.Thickness(1)
+    $tt.Padding = New-Object System.Windows.Thickness(11, 8, 11, 9)
+    $row.ToolTip = $tt
+    [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($row, 700)
+    [System.Windows.Controls.ToolTipService]::SetShowDuration($row, 60000)
+    $row.Add_ToolTipOpening({
+        param($s, $e)
+        try {
+            $sess = $s.Tag
+            $peek = Get-TranscriptPeek ([string]$sess.Transcript)
+            $fallback = [string]$sess.Message
+            $hasPeek = ($null -ne $peek -and ($peek.You.Length -gt 0 -or $peek.Bot.Length -gt 0))
+            if (-not $hasPeek -and [string]::IsNullOrWhiteSpace($fallback)) { $e.Handled = $true; return }
+            $panel = New-Object System.Windows.Controls.StackPanel
+            $panel.MaxWidth = 330
+            $blocks = @()
+            if ($hasPeek) {
+                if ($peek.You.Length -gt 0) { $blocks += , @('you', '#8FA0C8', $peek.You) }
+                if ($peek.Bot.Length -gt 0) { $blocks += , @('claude', '#5ED584', $peek.Bot) }
+            }
+            else { $blocks += , @('last status', '#8FA0C8', $fallback) }
+            foreach ($b in $blocks) {
+                $h = New-Object System.Windows.Controls.TextBlock
+                $h.Text = [string]$b[0]
+                $h.FontSize = 9
+                $h.FontWeight = [System.Windows.FontWeights]::SemiBold
+                $h.Foreground = Get-Brush ([string]$b[1])
+                [void]$panel.Children.Add($h)
+                $bd = New-Object System.Windows.Controls.TextBlock
+                $bd.Text = [string]$b[2]
+                $bd.FontSize = 11
+                $bd.Foreground = Get-Brush '#E8E8EC'
+                $bd.TextWrapping = 'Wrap'
+                $bd.Margin = New-Object System.Windows.Thickness(0, 1, 0, 6)
+                [void]$panel.Children.Add($bd)
+            }
+            $s.ToolTip.Content = $panel
+        }
+        catch { $e.Handled = $true }
+    })
 
     $entry = @{
         Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age; Ctx = $ctx
@@ -3459,7 +3728,7 @@ function Update-List {
         }
     }
     $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
-    $work  = @($visible | Where-Object { $_.Status -in @('working', 'compacting') }).Count
+    $work  = @($visible | Where-Object { $_.Status -in @('working', 'compacting', 'retrying') }).Count
     $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
     $quiet = @($visible | Where-Object { $_.Status -eq 'quiet' }).Count
     $chipTexts = @{
@@ -3525,8 +3794,9 @@ $ChipsPanel.Add_MouseLeftButtonDown($script:HeaderClick)
 function Save-HudState {
     try {
         @{ Left = $script:Window.Left; Top = $script:Window.Top
-           Topmost = $script:UserTopmost; Compact = $script:Compact } |
-            ConvertTo-Json | Set-Content -LiteralPath $StatePath -Encoding UTF8
+           Topmost = $script:UserTopmost; Compact = $script:Compact
+           Calib = @($script:BlockCalib) } |
+            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
     }
     catch { }
 }

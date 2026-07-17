@@ -1,47 +1,67 @@
-# bird state art — generation spec
+# bird state art — generation spec (crazy edition)
 
-Drop the generated PNGs in THIS folder with these exact filenames.
-Perch will pick them up and switch the bird's face by state; any missing
-file silently falls back to `logo.png`, so generate in any order.
+Drop generated PNGs in THIS folder with these exact filenames.
+Perch picks them up per state; any missing file falls back to `logo.png`,
+so generate in any order — he levels up incrementally.
 
-## the golden rules (read before generating)
+## the golden rules (non-negotiable, even going crazy)
 
 1. **Use image-EDIT, not text-to-image.** Attach `logo.png` (repo root) and
-   ask the model to *edit* it. This is what keeps him the same bird.
-2. **Transparent background.** No backdrop, no card, no drop shadow.
-3. **Same scale, same position, same feet anchor** as the original —
-   the app swaps these mid-animation; if the body jumps, it flickers.
+   ask the model to *edit* it. This keeps him the SAME bird.
+2. **Transparent background.** No backdrop, no card, no ground shadow.
+3. **Same scale, same center of body mass** as the original — these swap
+   mid-animation; if the body jumps between frames, he flickers.
 4. **≥1024×1024 PNG.** We downscale, never upscale.
-5. Face-only states (blink, side-eye, focused) must keep the **silhouette
-   pixel-identical** — only the face pixels change. Pose states (sleep,
-   happy, wave, alert) may change posture, but keep the body mass centered
-   in the same spot.
+5. Face-only states (blink, sideeye, focused) keep the **silhouette
+   pixel-identical**. Pose/prop states can go wild with posture and props,
+   but props must stay CLOSE to the body (they render at 38px — a prop
+   drifting far from him gets cropped by the ring).
+6. Props small and bold — at 38px a subtle detail vanishes. Chunky > fine.
 
 Prompt template (paste with logo.png attached):
 
 > Edit the attached image. Keep the EXACT same character, art style,
-> colors, lighting, proportions, scale and position. Transparent
-> background, no shadow. Change ONLY the following: <state change>.
+> colors, lighting, proportions, scale and position of the body. Flat
+> cute vector-style like the original. Transparent background, no shadow.
+> Change ONLY the following: <state change>.
 
-## the states, in priority order
+## core cast (wire the moment they land)
 
 | # | file | perch state | the edit |
 |---|------|------------|----------|
-| 1 | `bird-blink.png` | blinking (everywhere) | close both eyes: replace the round dark eyes with two thin curved closed-eye lines. change NOTHING else — silhouette identical |
-| 2 | `bird-sleep.png` | all quiet (doze + breathing) | eyes closed with soft curved lids, head tilted down and tucked slightly toward the chest, body a touch rounder and fluffed, like a genuinely sleeping bird |
-| 3 | `bird-alert.png` | a session needs you | eyes wide open and a little bigger, crest feathers standing straight up, beak slightly open mid-chirp — alarmed but cute |
-| 4 | `bird-happy.png` | work finished (the hop) | eyes closed in happy upward arcs (^ ^), tiny rosy cheeks, one wing lifted a bit in celebration |
-| 5 | `bird-sideeye.png` | parked (ignored 30+ min) | eyes shifted to the side, flat unimpressed expression — the "you've been ignoring this" face. silhouette identical |
-| 6 | `bird-worried.png` | error / api retry | slightly furrowed eyes, small frown on the beak, one tiny sweat drop beside the head |
-| 7 | `bird-wave.png` | greeting (you hovered) | one wing raised in a friendly little wave, beak open in a happy chirp |
-| 8 | `bird-focused.png` | sessions working (optional) | eyes half-lowered in concentration, gaze angled slightly down like he's reading the work. silhouette identical |
-| 9 | `bird-hot.png` | 5h limit burning red (optional) | overheated: slightly deeper red flush, two small sweat drops, feathers a bit ruffled |
+| 1 | `bird-blink.png` | blinking, everywhere | both eyes closed as thin curved lines. NOTHING else — silhouette identical |
+| 2 | `bird-sleep.png` | all quiet (doze + breath) | fast asleep: droopy nightcap in soft purple, eyes closed with soft lids, head tucked toward chest, body fluffed rounder, one tiny drool bubble at the beak |
+| 3 | `bird-alert.png` | a session needs you | FULL ALARM: eyes huge, crest feathers exploded straight up, beak wide open mid-screech, two tiny motion lines beside the head |
+| 4 | `bird-happy.png` | work finished (the hop) | party mode: tiny golden party hat tilted on the head, eyes closed in happy ^ ^ arcs, rosy cheeks, 4-5 confetti pieces floating right around him |
+| 5 | `bird-sideeye.png` | parked (ignored 30+ min) | dead-flat unimpressed side-eye while holding a tiny paper coffee cup in one wing, mid-sip. the meme. silhouette otherwise identical |
+| 6 | `bird-worried.png` | error / api retry | dizzy: spiral swirl eyes, two sweat drops, three small loose feathers popping off the top of his head |
+| 7 | `bird-wave.png` | greeting (you hovered) | one wing raised high in a big friendly wave, beak open in a happy chirp, one tiny sparkle beside the wing |
+| 8 | `bird-focused.png` | sessions working | tiny round reading glasses perched on the beak, eyes half-lowered looking down like he's reviewing the work. silhouette identical |
+| 9 | `bird-hot.png` | 5h limit burning red | COOKING: deeper red flush, steam wisps rising off his head, a tiny thermometer held in the beak, slightly ruffled feathers |
+
+## extended cast (the crazy tier — nobody's widget has these)
+
+| # | file | perch state | the edit |
+|---|------|------------|----------|
+| 10 | `bird-grabbed.png` | while you DRAG the pill | held by the scruff like a kitten: body dangling limp and stretched slightly downward, wings hanging, blank resigned stare straight ahead |
+| 11 | `bird-hatch.png` | app boot (~1.5s hello) | bottom half still inside a cracked white egg shell, peeking out wide-eyed, one bit of shell resting on his head |
+| 12 | `bird-knocked.png` | usage limit BLOCKED / exceeded | knocked out flat: lying tilted, X or spiral eyes, tongue slightly out, three tiny stars circling above his head |
+| 13 | `bird-offline.png` | offline / local-estimate mode | little explorer: tiny antenna hat with a red no-signal X above it, squinting at a tiny folded paper map held in his wings |
+| 14 | `bird-crown.png` | EVERY session done, zero waiting | tiny golden crown, chest puffed out, the smuggest proud face physically possible |
+
+## sprite tier (optional, unlocks real flapping)
+
+| # | file | pairs with | the edit |
+|---|------|-----------|----------|
+| 15 | `bird-happy2.png` | `bird-happy.png` | identical to bird-happy but the lifted wing in the DOWN position — we alternate the two at ~90ms during the hop = actual flapping |
 
 ## what gets wired once files land
 
-- state machine picks the face from the dominant session status
-  (attention > error > working > done > quiet)
-- random blink every 4–9s using `bird-blink.png` (2 frames = alive)
-- moment animations keep playing on top — the perk wiggle runs on the
-  alert face, the hop on the happy face, the breath on the sleep face
-- 120ms opacity crossfade between faces so swaps feel organic, never snappy
+- face state machine from dominant status (blocked > attention > error >
+  working > done-all > quiet), with 120ms opacity crossfades
+- random blink every 4–9s on whatever face is showing (blink frame overlays)
+- `bird-grabbed` swaps in the instant a drag starts, back on drop —
+  the drag-fold already exists, the bird just needs to look the part
+- `bird-hatch` plays once on boot, then crossfades to the live state
+- moment animations layer on top: perk wiggle on alert, hop (with
+  flap frames if present) on happy, breath on sleep, squash on grabbed-drop

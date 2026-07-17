@@ -1341,6 +1341,7 @@ $xaml = @"
         </StackPanel>
       </Grid>
       <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,8" Background="Transparent"/>
+      <StackPanel x:Name="LimitsPanel" Margin="16,0,16,9" Background="Transparent"/>
       <Border x:Name="Divider" Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
       <ScrollViewer x:Name="RowsScroll" MaxHeight="560" VerticalScrollBarVisibility="Auto"
                     HorizontalScrollBarVisibility="Disabled">
@@ -1379,6 +1380,8 @@ $xaml = @"
 $script:Window      = [System.Windows.Markup.XamlReader]::Parse($xaml)
 $script:SessionList = $Window.FindName('SessionList')
 $script:ChipsPanel  = $Window.FindName('ChipsPanel')
+$script:LimitsPanel = $Window.FindName('LimitsPanel')
+$script:UsageFetchStamp = [datetime]::MinValue
 $script:Header      = $Window.FindName('Header')
 $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
@@ -2528,6 +2531,107 @@ function Invoke-AttentionRaise {
     catch { }
 }
 
+function Format-ResetIn([datetime]$At) {
+    $d = $At - (Get-Date)
+    if ($d.TotalMinutes -le 0) { return 'resetting' }
+    if ($d.TotalHours -ge 24) { return ('{0}d {1}h' -f [int][Math]::Floor($d.TotalDays), $d.Hours) }
+    if ($d.TotalHours -ge 1) { return ('{0}h {1}m' -f [int][Math]::Floor($d.TotalHours), $d.Minutes) }
+    return ('{0}m' -f [int][Math]::Ceiling($d.TotalMinutes))
+}
+
+function Update-LimitsPanel {
+    # account limit bars (same data as the CLI's /usage screen): how much of
+    # the 5h window / weekly caps is burned and when they reset. Fetched by a
+    # fire-and-forget child every 3 min - the UI thread never touches the
+    # network; it only reads the sanitized snapshot the child writes.
+    try {
+        $now = Get-Date
+        if (($now - $script:UsageFetchStamp).TotalSeconds -gt 180) {
+            $script:UsageFetchStamp = $now
+            $probe = Join-Path $PSScriptRoot 'usage-probe.ps1'
+            if (Test-Path -LiteralPath $probe) {
+                Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$probe`"") | Out-Null
+            }
+        }
+
+        $script:LimitsPanel.Children.Clear()
+        $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
+        if (-not (Test-Path -LiteralPath $uPath)) { return }
+        $u = Get-Content -LiteralPath $uPath -Raw | ConvertFrom-Json
+        if ($null -eq $u -or $null -eq $u.PSObject.Properties['limits']) { return }
+        $fetched = ([datetime]::Parse([string]$u.fetched_at, $null,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+        if (($now - $fetched).TotalMinutes -gt 15) { return }   # stale = say nothing
+
+        foreach ($lim in @($u.limits)) {
+            $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$lim.percent))
+            $hex = '#5ED584'
+            if ($pct -ge 90 -or [string]$lim.severity -match 'exceeded|blocked') { $hex = '#FF6B6B' }
+            elseif ($pct -ge 70 -or [string]$lim.severity -match 'warn') { $hex = '#FFB84D' }
+
+            $g = New-Object System.Windows.Controls.Grid
+            $g.Margin = New-Object System.Windows.Thickness(0, 2, 0, 2)
+            foreach ($wdef in @(86, 0, 92)) {
+                $cd = New-Object System.Windows.Controls.ColumnDefinition
+                if ($wdef -gt 0) { $cd.Width = New-Object System.Windows.GridLength($wdef) }
+                else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
+                [void]$g.ColumnDefinitions.Add($cd)
+            }
+
+            $lbl = New-Object System.Windows.Controls.TextBlock
+            $lbl.Text = [string]$lim.label
+            $lbl.FontSize = 9.5
+            $lbl.Foreground = Get-Brush '#8A8A93'
+            $lbl.VerticalAlignment = 'Center'
+            [System.Windows.Controls.Grid]::SetColumn($lbl, 0)
+            [void]$g.Children.Add($lbl)
+
+            # the bar: a track with a star-ratio grid inside (pct | rest) -
+            # no pixel math, WPF does the proportions
+            $track = New-Object System.Windows.Controls.Border
+            $track.Height = 5
+            $track.CornerRadius = New-Object System.Windows.CornerRadius(2.5)
+            $track.Background = Get-Brush '#16FFFFFF'
+            $track.VerticalAlignment = 'Center'
+            $track.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+            $ratio = New-Object System.Windows.Controls.Grid
+            foreach ($frac in @([Math]::Max($pct, 0.001), [Math]::Max(100.0 - $pct, 0.001))) {
+                $cd = New-Object System.Windows.Controls.ColumnDefinition
+                $cd.Width = New-Object System.Windows.GridLength($frac, 'Star')
+                [void]$ratio.ColumnDefinitions.Add($cd)
+            }
+            $fill = New-Object System.Windows.Controls.Border
+            $fill.CornerRadius = New-Object System.Windows.CornerRadius(2.5)
+            $fill.Background = Get-Brush $hex
+            [System.Windows.Controls.Grid]::SetColumn($fill, 0)
+            [void]$ratio.Children.Add($fill)
+            $track.Child = $ratio
+            [System.Windows.Controls.Grid]::SetColumn($track, 1)
+            [void]$g.Children.Add($track)
+
+            $right = New-Object System.Windows.Controls.TextBlock
+            $right.FontSize = 9.5
+            $right.Foreground = Get-Brush $hex
+            $right.VerticalAlignment = 'Center'
+            $right.HorizontalAlignment = 'Right'
+            $resetTxt = ''
+            try {
+                $at = ([datetime]::Parse([string]$lim.resets_at, $null,
+                       [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
+                $resetTxt = $script:Sep + (Format-ResetIn $at)
+            }
+            catch { }
+            $right.Text = ('{0:0}%' -f $pct) + $resetTxt
+            [System.Windows.Controls.Grid]::SetColumn($right, 2)
+            [void]$g.Children.Add($right)
+
+            [void]$script:LimitsPanel.Children.Add($g)
+        }
+    }
+    catch { }
+}
+
 function New-Chip([string]$Text, [string]$Hex) {
     $chip = New-Object System.Windows.Controls.Border
     $chip.CornerRadius = New-Object System.Windows.CornerRadius(9)
@@ -2753,6 +2857,8 @@ function Update-List {
             [void]$script:SessionList.Children.Add((New-SessionRow $s))
         }
     }
+
+    Update-LimitsPanel
 
     $script:ChipsPanel.Children.Clear()
     $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count

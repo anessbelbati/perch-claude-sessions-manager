@@ -506,7 +506,8 @@ function Read-ConsoleInfoBounded {
 $script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance runs once per process)
 $script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain conhost windows, no WT tab)
 $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
-$script:ProbeBudget = 4         # console probes allowed this tick (reset in Update-List)
+$script:ProbeBudget = 2         # console probes allowed this tick (reset in Update-List) -
+                                # each is ~1s of blocked UI thread, so keep ticks snappy
 $script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel for the passive learner)
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
@@ -532,7 +533,9 @@ function Invoke-PassiveTabLearn {
 
     # keep candidate screens FRESH: agents redraw constantly, so a stale
     # fingerprint never matches the live pane and the learner goes blind -
-    # forcing the (visible) click-time tab walk to do the job instead
+    # forcing the (visible) click-time tab walk to do the job instead.
+    # AT MOST ONE probe per tick: probes are ~1s of blocked UI thread each,
+    # and refreshing several stale fingerprints in one tick froze the widget
     foreach ($apid in @($script:LastScreenMap.Keys)) {
         if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
         if ($null -eq (Get-Process -Id $apid -ErrorAction SilentlyContinue)) {
@@ -552,6 +555,7 @@ function Invoke-PassiveTabLearn {
             $script:LastScreenMap[$apid] = @{ Text = [string]$fresh.Screen; Stamp = (Get-Date) }
         }
         else { $entry.Stamp = (Get-Date) }   # don't hammer a mute console
+        break   # one is enough per tick - the rest rotate in on later ticks
     }
 
     $claimed = @{}
@@ -1394,6 +1398,9 @@ $script:UiHold      = 0
 $script:UiHoldStamp = [datetime]::MinValue
 $script:InTick      = $false
 $script:InTickStamp = [datetime]::MinValue
+$script:FocusBusy   = $false
+$script:LastFocusId = ''
+$script:LastFocusStamp = [datetime]::MinValue
 
 # last safety net: a handler exception must never tear the window down
 $Window.Dispatcher.Add_UnhandledException({
@@ -2296,9 +2303,24 @@ function New-SessionRow($Sess) {
     $row.Add_MouseLeave({ param($s, $e) $s.Background = Get-RowBaseBrush $s.Tag })
     $row.Add_MouseLeftButtonUp({
         param($s, $e)
-        $ok = Invoke-FocusSession $s.Tag
-        if ($ok -and $script:HudHideAfterFocus) { $script:Window.WindowState = 'Minimized' }
-        if (-not $ok) { $s.Background = Get-Brush '#33FF6B6B' }
+        # DEBOUNCE, hard. Focusing can involve console probes and the tab
+        # walk - seconds of blocked UI thread. Impatient multi-clicks queue
+        # up behind the first one and each used to re-run the WHOLE dance,
+        # freezing the widget for the sum of all of them.
+        if ($script:FocusBusy) { return }
+        if ([string]$s.Tag.Id -eq $script:LastFocusId -and
+            ((Get-Date) - $script:LastFocusStamp).TotalMilliseconds -lt 1500) { return }
+        $script:FocusBusy = $true
+        try {
+            $ok = Invoke-FocusSession $s.Tag
+            if ($ok -and $script:HudHideAfterFocus) { $script:Window.WindowState = 'Minimized' }
+            if (-not $ok) { $s.Background = Get-Brush '#33FF6B6B' }
+        }
+        finally {
+            $script:FocusBusy = $false
+            $script:LastFocusId = [string]$s.Tag.Id
+            $script:LastFocusStamp = Get-Date
+        }
     })
     $row.ContextMenu = New-RowMenu $Sess
     return $row
@@ -2322,7 +2344,7 @@ function Update-List {
     }
     $script:InTick = $true
     $script:InTickStamp = Get-Date
-    $script:ProbeBudget = 4
+    $script:ProbeBudget = 2
     try {
 
     $sessions = @(Get-Sessions)

@@ -1915,6 +1915,7 @@ catch { }
 # need/work/done counts. Hovering peeks the chips + limit bars in place
 # (the PILLAR/NotchNook interaction people love), double-click expands.
 $script:PillCluster = @{}
+$script:PillAttTarget = $null   # longest-waiting attention session, set each tick
 $script:PillRingKey = ''
 $script:Pill5hPct = -1.0
 $script:Pill5hHex = '#5ED584'
@@ -1971,6 +1972,15 @@ foreach ($cdef in @(@('att', '#FF6B6B'), @('work', '#FFB84D'), @('done', '#5ED58
         $pds.Color = [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B')
         $pds.Freeze()
         $t.Effect = $pds
+        # and it's a BUTTON: click the red number -> land in the terminal
+        # that's been waiting longest. Transparent bg = whole box clickable,
+        # padding fattens the hit target on an 11px glyph.
+        $t.Background = [System.Windows.Media.Brushes]::Transparent
+        $t.Padding = New-Object System.Windows.Thickness(2, 2, 2, 2)
+        $t.Cursor = [System.Windows.Input.Cursors]::Hand
+        $t.ToolTip = 'jump to the session that needs you'
+        $t.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })   # don't arm click-vs-drag
+        $t.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Invoke-JumpToAtt })
     }
     $script:PillCluster[$cdef[0]] = $t
     [void]$pillClusterPanel.Children.Add($t)
@@ -2022,6 +2032,25 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         if ($tip.Count -eq 0) { $tip = @('all quiet') }
         $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
+    }
+}
+
+function Invoke-JumpToAtt {
+    # red = jump, everywhere: the pill's red count and the 'need you' chip
+    # both land you in the LONGEST-WAITING attention session's terminal.
+    # Same debounce discipline as row clicks - focusing can involve console
+    # probes and a UIA tab walk, seconds of blocked UI thread.
+    $sess = $script:PillAttTarget
+    if ($null -eq $sess -or $script:FocusBusy) { return }
+    if ([string]$sess.Id -eq $script:LastFocusId -and
+        ((Get-Date) - $script:LastFocusStamp).TotalMilliseconds -lt 1500) { return }
+    $script:FocusBusy = $true
+    try { [void](Invoke-FocusSession $sess) }
+    catch { }
+    finally {
+        $script:FocusBusy = $false
+        $script:LastFocusId = [string]$sess.Id
+        $script:LastFocusStamp = Get-Date
     }
 }
 
@@ -4417,11 +4446,24 @@ function Update-List {
                             @('quiet', '#8FA0C8'), @('all', '#71717A'))) {
             $chip = New-Chip '' $cdef[1]
             $chip.Visibility = 'Collapsed'
+            if ($cdef[0] -eq 'att') {
+                # red = jump, everywhere: the chip too (peek card + full view)
+                $chip.Cursor = [System.Windows.Input.Cursors]::Hand
+                $chip.ToolTip = 'jump to the session that needs you'
+                $chip.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+                $chip.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; Invoke-JumpToAtt })
+            }
             $script:ChipSet[$cdef[0]] = $chip
             [void]$script:ChipsPanel.Children.Add($chip)
         }
     }
-    $att   = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' }).Count
+    $attList = @($visible | Where-Object { $_.Status -eq 'attention' -or $_.Status -eq 'error' })
+    $script:PillAttTarget = $null
+    if ($attList.Count -gt 0) {
+        # neediest = the one that's been waiting longest
+        $script:PillAttTarget = @($attList | Sort-Object Ts)[0]
+    }
+    $att   = $attList.Count
     $work  = @($visible | Where-Object { $_.Status -in @('working', 'compacting', 'retrying') }).Count
     $done  = @($visible | Where-Object { $_.Status -eq 'idle' }).Count
     $quiet = @($visible | Where-Object { $_.Status -in @('quiet', 'parked') }).Count

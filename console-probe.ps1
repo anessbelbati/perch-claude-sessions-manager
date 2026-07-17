@@ -6,17 +6,44 @@
 # stdout line 2: the console window hwnd (0 for pseudo-consoles / hidden) -
 #                lets the parent handle agents in plain conhost windows that
 #                have no Windows Terminal tab at all.
-# With -Marker: also stamps the marker title for ~900ms (parent watches which
-# WT tab shows it) and restores.
+# stdout line 3: the console's VISIBLE screen text, normalized to lowercase
+#                letters+digits (single line, capped) - lets the parent match
+#                a session to a WT tab by CONTENT via UIA TextPattern, which
+#                works even for manually renamed tabs that ignore titles.
+# With -Marker: also stamps the marker title for MarkerMs (parent watches
+# which WT tab shows it) and restores.
 param(
     [Parameter(Mandatory = $true)][int]$TargetPid,
-    [string]$Marker = ''
+    [string]$Marker = '',
+    [int]$MarkerMs = 900
 )
 
 $dll = Join-Path $env:LOCALAPPDATA 'AgentFocus\AgentFocusNative.dll'
 if (-not (Test-Path -LiteralPath $dll)) { exit 2 }
 Add-Type -Path $dll
-Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class PK { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h); [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max); }'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PK {
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, System.Text.StringBuilder sb, int max);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+    [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
+
+    [StructLayout(LayoutKind.Sequential)] public struct COORD { public short X; public short Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct CSBI {
+        public COORD dwSize; public COORD dwCursorPosition; public ushort wAttributes;
+        public SMALL_RECT srWindow; public COORD dwMaximumWindowSize;
+    }
+    [DllImport("kernel32.dll")] public static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CSBI info);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    public static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] buf, uint len, COORD coord, out uint read);
+}
+'@
 $out = [Console]::Out   # bind BEFORE detaching our console
 
 [void][AgentFocus.ConsoleApi]::FreeConsole()
@@ -34,12 +61,43 @@ try {
         [void][PK]::GetClassName($cw, $csb, 256)
         if ($csb.ToString() -eq 'ConsoleWindowClass') { $cwOut = $cw.ToInt64() }
     }
+
+    # visible screen text: the session's true fingerprint (titles can be
+    # renamed away in WT; the CONTENT of the pane cannot)
+    $screen = ''
+    try {
+        # 3221225472 = GENERIC_READ|GENERIC_WRITE (0xC0000000 parses as a
+        # NEGATIVE Int32 literal in PowerShell 5.1 and breaks uint marshaling)
+        $h = [PK]::CreateFileW('CONOUT$', [uint32]3221225472, [uint32]3, [IntPtr]::Zero, [uint32]3, [uint32]0, [IntPtr]::Zero)
+        if ($h -ne [IntPtr]::Zero -and $h.ToInt64() -ne -1) {
+            $info = New-Object PK+CSBI
+            if ([PK]::GetConsoleScreenBufferInfo($h, [ref]$info)) {
+                $w = [int]$info.dwSize.X
+                $parts = New-Object System.Text.StringBuilder
+                for ($y = [int]$info.srWindow.Top; $y -le [int]$info.srWindow.Bottom; $y++) {
+                    $buf = New-Object char[] $w
+                    $coord = New-Object PK+COORD
+                    $coord.X = 0; $coord.Y = [int16]$y
+                    [uint32]$read = 0
+                    if ([PK]::ReadConsoleOutputCharacterW($h, $buf, [uint32]$w, $coord, [ref]$read)) {
+                        [void]$parts.Append((New-Object string($buf, 0, [int]$read)))
+                    }
+                }
+                $screen = ($parts.ToString() -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
+                if ($screen.Length -gt 6000) { $screen = $screen.Substring(0, 6000) }
+            }
+            [void][PK]::CloseHandle($h)
+        }
+    }
+    catch { $screen = '' }
+
     $out.WriteLine($prev)
     $out.WriteLine([string]$cwOut)
+    $out.WriteLine($screen)
     $out.Flush()
     if ($Marker.Length -gt 0) {
         [void][AgentFocus.ConsoleApi]::SetConsoleTitle($Marker)
-        Start-Sleep -Milliseconds 900
+        Start-Sleep -Milliseconds $MarkerMs
         [void][AgentFocus.ConsoleApi]::SetConsoleTitle($prev)
     }
 }

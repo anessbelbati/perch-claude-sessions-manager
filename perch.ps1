@@ -151,6 +151,9 @@ function Format-Age([datetime]$Ts) {
 
 function Get-Sessions {
     $now = Get-Date
+    # follow-the-process learning: map agents to tabs from whatever tab the
+    # user happens to have open right now (works on renamed tabs too)
+    try { Invoke-PassiveTabLearn } catch { }
     $sessions = New-Object System.Collections.ArrayList
     $files = Get-ChildItem -LiteralPath $StatusDir -Filter '*.json' -ErrorAction SilentlyContinue |
              Where-Object { $_.LastWriteTime -gt $now.AddDays(-7) }
@@ -174,12 +177,17 @@ function Get-Sessions {
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
 
-        # headless flag: usually a true subagent (hide), but sessions in tabs
-        # the hook couldn't correlate (second WT window, manually RENAMED tabs
-        # that ignore console titles) get mis-flagged too. Verify with our own
-        # resolver; when even that fails, only hide the session if its process
-        # ancestry says subagent - hiding a real session is the worst failure.
-        if ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless) {
+        # sessions without a usable tab id (headless-flagged: second WT window
+        # or manually RENAMED tabs blind the hook's marker trick; or hint-less:
+        # capture keeps failing) go through our own resolver - which also feeds
+        # the passive learner with their console titles. When even that fails,
+        # only hide the session if its process ancestry says subagent - hiding
+        # a real session is the worst failure mode.
+        $isHeadless = ($null -ne $s.PSObject.Properties['headless'] -and [bool]$s.headless)
+        $hasRid = ($null -ne $s.window -and
+                   $null -ne $s.window.PSObject.Properties['tab_runtime_id'] -and
+                   -not [string]::IsNullOrWhiteSpace([string]$s.window.tab_runtime_id))
+        if ($isHeadless -or -not $hasRid) {
             $rescueTab = $null
             if ($null -ne $proc) {
                 $rescueTab = Resolve-TabForPid -TargetPid $agentPid -Proc $proc -CwdName ([string]$s.cwd_name)
@@ -193,13 +201,15 @@ function Get-Sessions {
                     captured_event = 'hud-rescue+console'
                 }) -Force
             }
-            elseif ($null -eq $proc -or (Test-IsSubagentProc -TargetPid $agentPid)) { continue }
-            else {
-                # interactive session in a tab we can't identify (renamed to
-                # something arbitrary): show it window-less - clicking falls
-                # back to name matching in Invoke-FocusSession
+            elseif ($isHeadless) {
+                if ($null -eq $proc -or (Test-IsSubagentProc -TargetPid $agentPid)) { continue }
+                # interactive session in a tab we can't identify yet (renamed
+                # to something arbitrary): keep it visible window-less - the
+                # passive learner or a click-time cycle will pin it later
                 $s | Add-Member -NotePropertyName window -NotePropertyValue $null -Force
             }
+            # hint-less but not headless-flagged: keep whatever window the
+            # status file had (name matching may still work at click time)
         }
 
         $ts = $f.LastWriteTime
@@ -360,14 +370,14 @@ function Start-ConsoleProbe {
     # console RPC can hang FOREVER on a hosed conhost (observed live: one
     # agent process froze a probe for 2 minutes). Never attach from the HUD
     # process - spawn a disposable child that the caller can kill.
-    param([int]$TargetPid, [string]$Marker = '')
+    param([int]$TargetPid, [string]$Marker = '', [int]$MarkerMs = 900)
 
     $probe = Join-Path $PSScriptRoot 'console-probe.ps1'
     if (-not (Test-Path -LiteralPath $probe)) { return $null }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -TargetPid $TargetPid" +
-                     $(if ($Marker.Length -gt 0) { " -Marker `"$Marker`"" } else { '' })
+                     $(if ($Marker.Length -gt 0) { " -Marker `"$Marker`" -MarkerMs $MarkerMs" } else { '' })
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.CreateNoWindow = $true
@@ -382,7 +392,7 @@ function Read-ConsoleInfoBounded {
     $p = Start-ConsoleProbe -TargetPid $TargetPid
     if ($null -eq $p) { return $null }
     try {
-        if (-not $p.WaitForExit(2500)) {
+        if (-not $p.WaitForExit(3000)) {
             try { $p.Kill() } catch { }
             return $null
         }
@@ -391,7 +401,9 @@ function Read-ConsoleInfoBounded {
         [long]$hwnd = 0
         $hwndLine = $p.StandardOutput.ReadLine()
         if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
-        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd }
+        $screen = $p.StandardOutput.ReadLine()
+        if ($null -eq $screen) { $screen = '' }
+        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen }
     }
     catch { return $null }
     finally { try { $p.Dispose() } catch { } }
@@ -425,6 +437,105 @@ $script:UntrackedTabMap = @{}   # pid -> resolved tab rid (positive cache: dance
 $script:WinOnlyMap = @{}        # pid -> console window hwnd (agents in plain conhost windows, no WT tab)
 $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative cache, 5 min TTL)
 $script:ProbeBudget = 4         # console probes allowed this tick (reset in Update-List)
+$script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel for the passive learner)
+
+function Invoke-PassiveTabLearn {
+    # follow the PROCESS, not names: whatever tab the user has open exposes
+    # its rendered text via UIA. If it content-matches the probed console
+    # screen of exactly ONE unmapped agent, that selected tab IS the agent's
+    # tab - pin pid -> rid without stamping or guessing. Over normal
+    # tab-hopping this quietly maps even arbitrarily-renamed tabs.
+    $unmapped = $false
+    foreach ($apid in @($script:LastScreenMap.Keys)) {
+        if (-not $script:UntrackedTabMap.ContainsKey($apid)) { $unmapped = $true; break }
+    }
+    if (-not $unmapped) { return }
+    $tabs = @(Get-AllTerminalTabs)
+    if ($tabs.Count -eq 0) { return }
+
+    $claimed = @{}
+    foreach ($v in $script:UntrackedTabMap.Values) { $claimed[[string]$v] = $true }
+
+    $seenHwnd = @{}
+    foreach ($tb in $tabs) {
+        if (-not $tb.Selected -or $tb.Rid.Length -eq 0) { continue }
+        $hk = [string][long]$tb.Hwnd
+        if ($seenHwnd.ContainsKey($hk)) { continue }
+        $seenHwnd[$hk] = $true
+        if ($claimed.ContainsKey($tb.Rid)) { continue }
+
+        $paneText = Get-ActiveTermText -Hwnd $tb.Hwnd
+        if ($paneText.Length -lt 200) { continue }
+        $cands = @()
+        foreach ($apid in @($script:LastScreenMap.Keys)) {
+            if ($script:UntrackedTabMap.ContainsKey($apid)) { continue }
+            if (Test-ScreenMatch -S ([string]$script:LastScreenMap[$apid]) -T $paneText) { $cands += $apid }
+        }
+        if ($cands.Count -eq 1) {
+            $script:UntrackedTabMap[$cands[0]] = $tb.Rid
+            $claimed[$tb.Rid] = $true
+            [void]$script:NoTabStamp.Remove($cands[0])
+        }
+    }
+}
+
+function Resolve-TabByCycle {
+    # Deterministic CLICK-TIME resolution for tabs nothing else can correlate
+    # (renamed to something arbitrary): probe the agent's console SCREEN, then
+    # SELECT each tab in turn and compare its rendered UIA text - the content
+    # identifies the right tab no matter what the header says. Only ever
+    # called from a user click (the user asked to switch tabs; flipping
+    # through a few on the way is fine). The result is cached, so this runs
+    # at most once per process.
+    param([int]$TargetPid)
+
+    $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
+    if ($null -eq $info -or ([string]$info.Screen).Length -lt 200) { return $null }
+    $s = [string]$info.Screen
+    $script:LastScreenMap[$TargetPid] = $s
+
+    $tabs = @(Get-AllTerminalTabs -Fresh)
+    if ($tabs.Count -eq 0) { return $null }
+    $original = @{}   # hwnd -> tab selected before we started (restore on failure)
+    foreach ($tb in $tabs) {
+        $hk = [string][long]$tb.Hwnd
+        if ($tb.Selected -and -not $original.ContainsKey($hk)) { $original[$hk] = $tb }
+    }
+
+    $found = $null
+    try {
+        foreach ($tb in $tabs) {
+            if ($null -eq $tb.Element -or $tb.Rid.Length -eq 0) { continue }
+            try {
+                $pat = $tb.Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+                $pat.Select()
+            }
+            catch { continue }
+            for ($attempt = 0; $attempt -lt 2; $attempt++) {
+                Start-Sleep -Milliseconds 150
+                $paneText = Get-ActiveTermText -Hwnd $tb.Hwnd
+                if (Test-ScreenMatch -S $s -T $paneText) { $found = $tb; break }
+            }
+            if ($null -ne $found) { break }
+        }
+    }
+    catch { }
+
+    if ($null -ne $found) {
+        $script:UntrackedTabMap[$TargetPid] = $found.Rid
+        [void]$script:NoTabStamp.Remove($TargetPid)
+        return $found
+    }
+    foreach ($hk in @($original.Keys)) {
+        # not found: put the user back on the tab they were on
+        try {
+            $pat = $original[$hk].Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            $pat.Select()
+        }
+        catch { }
+    }
+    return $null
+}
 
 $script:SubagentCache = @{}   # pid -> bool (ancestry never changes for a live pid)
 function Test-IsSubagentProc {
@@ -501,6 +612,9 @@ function Resolve-TabForPid {
 
     $info = Read-ConsoleInfoBounded -TargetPid $TargetPid
     $match = $null
+    if ($null -ne $info -and ([string]$info.Screen).Length -ge 200) {
+        $script:LastScreenMap[$TargetPid] = [string]$info.Screen   # fuels the passive learner
+    }
     if ($null -ne $info -and -not [string]::IsNullOrWhiteSpace($info.Title)) {
         $norm = Get-NormalizedTabName $info.Title
         $byName = @($tabs | Where-Object { $_.Norm -eq $norm })
@@ -646,6 +760,49 @@ function Get-NormalizedTabName([string]$Name) {
     return (($Name -replace '^[^\p{L}\p{Nd}]+', '').Trim().ToLowerInvariant())
 }
 
+function Get-ActiveTermText {
+    # UIA TextPattern on the ACTIVE tab's TermControl: the rendered pane text
+    # (what Narrator reads). Tab renames touch only the header - the CONTENT
+    # is the one fingerprint of a session that cannot lie.
+    param([IntPtr]$Hwnd = [IntPtr]::Zero, $Root = $null)
+
+    try {
+        if ($null -eq $Root) {
+            if ($Hwnd -eq [IntPtr]::Zero) { return '' }
+            $Root = [System.Windows.Automation.AutomationElement]::FromHandle($Hwnd)
+        }
+        if ($null -eq $Root) { return '' }
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty, 'TermControl')
+        $tc = $Root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        if ($null -eq $tc) { return '' }
+        $tp = $tc.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+        $text = ''
+        foreach ($r in @($tp.GetVisibleRanges())) { $text += $r.GetText(2147483647) }
+        if ($text.Length -eq 0) { $text = $tp.DocumentRange.GetText(40000) }
+        return ($text -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
+    }
+    catch { return '' }
+}
+
+function Test-ScreenMatch {
+    # S = agent console screen (normalized by the probe), T = pane text from
+    # UIA. Same session => same text. Three slices of S are tested because
+    # both sides keep changing while an agent works - agreement of 2+ slices
+    # means it is the same screen; identical UI boilerplate alone cannot
+    # produce that across different sessions.
+    param([string]$S, [string]$T)
+
+    if ($S.Length -lt 200 -or $T.Length -lt 200) { return $false }
+    $hits = 0
+    foreach ($frac in @(0.15, 0.5, 0.85)) {
+        $start = [Math]::Max(0, [Math]::Min([int]($S.Length * $frac) - 60, $S.Length - 120))
+        $chunk = $S.Substring($start, 120)
+        if ($T.Contains($chunk)) { $hits++ }
+    }
+    return ($hits -ge 2)
+}
+
 $script:TabsCache = @()
 $script:TabsCacheStamp = [datetime]::MinValue
 function Get-AllTerminalTabs {
@@ -681,13 +838,20 @@ function Get-AllTerminalTabs {
                 try { $rid = ($tab.GetRuntimeId() -join '.') } catch { }
                 $tname = ''
                 try { $tname = [string]$tab.Current.Name } catch { }
+                $sel = $false
+                try {
+                    $sel = [bool]$tab.GetCurrentPropertyValue(
+                        [System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty)
+                }
+                catch { }
                 [void]$list.Add([pscustomobject]@{
-                    Hwnd    = $hwnd
-                    Rid     = $rid
-                    Name    = $tname
-                    Norm    = Get-NormalizedTabName $tname
-                    Index   = $i
-                    Element = $tab
+                    Hwnd     = $hwnd
+                    Rid      = $rid
+                    Name     = $tname
+                    Norm     = Get-NormalizedTabName $tname
+                    Index    = $i
+                    Selected = $sel
+                    Element  = $tab
                 })
             }
         }
@@ -744,6 +908,13 @@ function Invoke-FocusSession($Sess) {
                 $byLabel = @($tabs | Where-Object { $_.Norm -eq $wantN })
                 if ($byLabel.Count -eq 1) { $target = $byLabel[0]; break }
             }
+        }
+
+        if ($null -eq $target -and $null -ne $Sess.PSObject.Properties['AgentPid'] -and [int]$Sess.AgentPid -gt 0) {
+            # deterministic last resort: follow the PROCESS itself - stamp a
+            # marker on its console and cycle tabs until the TermControl shows
+            # it. Runs once per process (result cached), only on user clicks.
+            $target = Resolve-TabByCycle -TargetPid ([int]$Sess.AgentPid)
         }
     }
 

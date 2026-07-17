@@ -38,6 +38,7 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 - pin the widget = always on top. unpin = it stays out of your way and just flashes the taskbar when something needs you
 - also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
 - dead sessions disappear on their own, headless subagents / agent-team workers are hidden
+- **statuses that can't get stuck**: pressing esc mid-turn or finishing a `/compact` fires no hook event at all, which normally leaves a session painted "working" forever. perch notices a suspiciously stale busy row, quietly reads the console's actual screen, and corrects the label — a permission prompt hiding under "working" even gets promoted to **needs you**
 - **compact mode**: double-click the header (or hit the `–` button) and it folds into a tiny pill — just the bird and the status chips. everything still chirps and pulses, it just stops hogging your screen
 - **themes**: classic **midnight**, or **liquid glass** — real acrylic backdrop blur through DWM, specular rim light, reflection streaks. flip it in ⚙ settings and drag it over something colorful
 - **live limit bars**: how much of your 5-hour window and weekly caps you've burned and exactly when they reset, straight from the same endpoint the CLI's `/usage` screen uses. green → amber → red as you cook, with burn-rate prediction (`caps ~15:40`) when you're on pace to hit the wall before the reset. fetched by a background child every **5 minutes** (10 when the network's down) — deliberately gentle on the API, and the UI never waits on the network
@@ -100,7 +101,7 @@ notify = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
 
 the hard problem is mapping a session to its exact tab. tab titles change constantly (spinner glyphs, task summaries) and guessing from the foreground window is a disaster if you tab-hop fast.
 
-the trick: claude code hooks run as child processes of the claude process, so the hook can `AttachConsole()` into claude itself — and that console's title IS the session's tab title (ConPTY mirrors it up to windows terminal). match that against all tabs via UI Automation, and if the title isn't unique, briefly stamp a unique marker title on the console, find which tab shows it, restore the title. boom: session ↔ tab, no guessing.
+the trick: claude code hooks run as child processes of the claude process, so the hook can `AttachConsole()` into claude itself — and that console's title IS the session's tab title (ConPTY mirrors the app-set title up to windows terminal). match that against all tabs via UI Automation — but only when no *other* live session's console shows the same title right now (batch-restarted twins share identical startup titles, and matching a value without proving ownership once cross-wired two sessions). renamed tabs pin their name and ignore console titles entirely, so those fall back to cwd-name matching and, ultimately, to content fingerprinting: compare the console's visible screen text against what each tab actually renders. boom: session ↔ tab, no guessing.
 
 clicking a row re-matches against live tabs (fresh title first, UIA runtime id as tiebreaker), restores the window if minimized, selects the tab, brings it forward.
 
@@ -115,6 +116,8 @@ things that bit me so they don't have to bite you:
 - **`AttachConsole` resets std handles.** bind `[Console]::Out` before the first attach or your stdout just... stops.
 - **taskbar icons lie.** a powershell-hosted WPF window shows the powershell icon until you set your own `AppUserModelID`.
 - **process-hunting by command-line substring matches your own diagnostic process.** i killed my own kill-script mid-run more than once.
+- **no hook fires on esc.** claude code's `Stop` hook deliberately skips user interrupts, and `/compact` has a `PreCompact` but no post — two officially invisible transitions that left rows painted "working" forever. the console screen is the only witness.
+- **the TUI's hint line rotates.** "esc to interrupt" vanishes every few seconds in favor of random tips — a session 9 minutes into a bash call showed only a tip. deciding a session stopped because that hint is absent flips live sessions to done; trust the elapsed-timer/token row and the title's spinner glyph instead, and demand two clean sightings before believing anything.
 
 ## files
 

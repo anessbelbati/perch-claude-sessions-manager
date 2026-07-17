@@ -464,11 +464,12 @@ function Get-ConsoleTabHint {
         $marker = "cc-mark-$suffix-$PID"
         try {
             [void][AgentFocus.ConsoleApi]::SetConsoleTitle($marker)
-            for ($attempt = 0; $attempt -lt 4; $attempt++) {
-                Start-Sleep -Milliseconds 150
-                $match = Find-TerminalTabByName -Name $marker
-                if ($null -ne $match) { break }
-            }
+            # ONE attempt only. Each retry was a full UIA scan of every WT
+            # window (~1-3s with many tabs) and on ConPTY the marker NEVER
+            # shows, so 4 attempts were pure tax - enough to blow the 15s hook
+            # timeout on SessionStart and lose the status write entirely.
+            Start-Sleep -Milliseconds 150
+            $match = Find-TerminalTabByName -Name $marker
         }
         catch { $match = $null }
         finally {
@@ -676,58 +677,6 @@ try {
     $needCapture = ($eventName -eq "SessionStart") -or
                    ($eventName -eq "UserPromptSubmit") -or
                    ($eventName -notin @("SessionEnd", "PreCompact") -and -not $hasConsoleHint -and -not $headless)
-    if ($needCapture) {
-        # NOTE: no foreground-window fallback here on purpose. Guessing from
-        # the foreground window wrote wrong-tab (even wrong-app) hints when the
-        # user tab-hopped. Console capture is deterministic or nothing.
-        $cwdLeaf = ""
-        if ($null -ne $existing -and -not [string]::IsNullOrWhiteSpace([string]$existing.cwd_name)) {
-            $cwdLeaf = [string]$existing.cwd_name
-        }
-        elseif (-not [string]::IsNullOrWhiteSpace($cwd)) {
-            try { $cwdLeaf = Split-Path -Path $cwd -Leaf } catch { }
-        }
-        $captured = Get-ConsoleTabHint -SessionId $stableId -EventName $eventName -AgentPid $agentPid -CwdName $cwdLeaf
-        if ($null -ne $captured) {
-            if ($null -ne $captured.PSObject.Properties['tab_runtime_id']) {
-                $window = $captured
-                $headless = $false
-            }
-            else {
-                # no tab found: headless only if the ancestry says subagent -
-                # interactive sessions in unrecognizably-renamed tabs stay
-                # visible (window-less) rather than vanishing from viewers
-                $headless = [bool]$captured.headless
-                $window = $null
-            }
-        }
-        # $null = attach failed entirely -> keep whatever we had
-    }
-    elseif ($null -ne $window -and $eventName -ne "SessionEnd" -and
-            ([string]$window.captured_event) -like "*+console") {
-        # keep tab_name fresh: the agent console's title IS the live tab title.
-        # Viewers use it to re-match the tab even if the runtime id went stale.
-        # (only for title-following tabs: a cwdname-captured tab is RENAMED, its
-        # console title never matches the tab, refreshing would break matching)
-        # THROTTLED to 15s: AttachConsole is a conhost RPC that contends with
-        # the agent's own rendering, and this used to run on EVERY tool call.
-        $needFresh = $true
-        if ($null -ne $window.PSObject.Properties['tab_name_at']) {
-            try {
-                $lastAt = [datetime]::Parse([string]$window.tab_name_at, $null,
-                          [System.Globalization.DateTimeStyles]::RoundtripKind)
-                if (((Get-Date).ToUniversalTime() - $lastAt.ToUniversalTime()).TotalSeconds -lt 15) { $needFresh = $false }
-            }
-            catch { }
-        }
-        if ($needFresh) {
-            $liveTitle = Get-AgentConsoleTitle -AgentPid $agentPid
-            if (-not [string]::IsNullOrWhiteSpace($liveTitle)) {
-                $window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveTitle -Force
-                $window | Add-Member -NotePropertyName tab_name_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("o")) -Force
-            }
-        }
-    }
 
     # pin the session's identity to its ORIGINAL folder: agents cd around
     # (docs/webapp/pages...) and a changing name makes rows jump in viewers
@@ -782,9 +731,70 @@ try {
         window = $window
     }
 
+    # STATUS FIRST, capture second. Tab capture (below) is the expensive,
+    # killable part - a SessionStart capture with many tabs open could blow
+    # the 15s hook timeout and take the UNWRITTEN status down with it, which
+    # is exactly how compact-end repaints went missing: PreCompact painted
+    # 'compacting', the SessionStart that should have painted 'idle' died
+    # mid-capture, and the row stayed purple forever.
     $tempPath = "$statusPath.$PID.tmp"
     $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
     Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
+
+    $rewrite = $false
+    if ($needCapture) {
+        # NOTE: no foreground-window fallback here on purpose. Guessing from
+        # the foreground window wrote wrong-tab (even wrong-app) hints when the
+        # user tab-hopped. Console capture is deterministic or nothing.
+        $captured = Get-ConsoleTabHint -SessionId $stableId -EventName $eventName -AgentPid $agentPid -CwdName $cwdName
+        if ($null -ne $captured) {
+            if ($null -ne $captured.PSObject.Properties['tab_runtime_id']) {
+                $window = $captured
+                $headless = $false
+            }
+            else {
+                # no tab found: headless only if the ancestry says subagent -
+                # interactive sessions in unrecognizably-renamed tabs stay
+                # visible (window-less) rather than vanishing from viewers
+                $headless = [bool]$captured.headless
+                $window = $null
+            }
+            $rewrite = $true
+        }
+        # $null = attach failed entirely -> keep whatever we had
+    }
+    elseif ($null -ne $window -and $eventName -ne "SessionEnd" -and
+            ([string]$window.captured_event) -like "*+console") {
+        # keep tab_name fresh: the agent console's title IS the live tab title.
+        # Viewers use it to re-match the tab even if the runtime id went stale.
+        # (only for title-following tabs: a cwdname-captured tab is RENAMED, its
+        # console title never matches the tab, refreshing would break matching)
+        # THROTTLED to 15s: AttachConsole is a conhost RPC that contends with
+        # the agent's own rendering, and this used to run on EVERY tool call.
+        $needFresh = $true
+        if ($null -ne $window.PSObject.Properties['tab_name_at']) {
+            try {
+                $lastAt = [datetime]::Parse([string]$window.tab_name_at, $null,
+                          [System.Globalization.DateTimeStyles]::RoundtripKind)
+                if (((Get-Date).ToUniversalTime() - $lastAt.ToUniversalTime()).TotalSeconds -lt 15) { $needFresh = $false }
+            }
+            catch { }
+        }
+        if ($needFresh) {
+            $liveTitle = Get-AgentConsoleTitle -AgentPid $agentPid
+            if (-not [string]::IsNullOrWhiteSpace($liveTitle)) {
+                $window | Add-Member -NotePropertyName tab_name -NotePropertyValue $liveTitle -Force
+                $window | Add-Member -NotePropertyName tab_name_at -NotePropertyValue ((Get-Date).ToUniversalTime().ToString("o")) -Force
+                $rewrite = $true
+            }
+        }
+    }
+    if ($rewrite) {
+        $record.window = $window
+        $record.headless = $headless
+        $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+        Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
+    }
 
     }
     finally {

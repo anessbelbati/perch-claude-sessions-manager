@@ -400,14 +400,38 @@ function Get-Sessions {
         if ($r.Length -gt 0) { $script:KnownRidClaims[$r] = [int]$s.AgentPid }
     }
 
-    # WORKING sessions are left alone by background probing: their consoles
-    # are busy rendering (probes contend with that via conhost RPC and were
-    # measurably slowing the CLIs), and their screens change too fast to
-    # fingerprint anyway. They get probed when they calm down.
+    # WORKING sessions are left alone by the passive learner's probing: their
+    # consoles are busy rendering (probes contend with that via conhost RPC
+    # and were measurably slowing the CLIs), and their screens change too fast
+    # to fingerprint anyway. They get probed when they calm down.
+    # EXCEPT: stale busy rows get a slow ground-truth check (Invoke-BusyVerify)
+    # because hooks go silent on Esc-interrupts and can die before repainting
+    # after a compact - without it those rows show 'working' forever. A
+    # screen-proven override sticks until the next hook write to that file.
     $script:BusyPids = @{}
+    $queue = New-Object System.Collections.ArrayList
     foreach ($s in $kept) {
-        if ($s.Status -in @('working', 'compacting') -and $s.AgentPid -gt 0) { $script:BusyPids[[int]$s.AgentPid] = $true }
+        if ($s.Status -notin @('working', 'compacting') -or $s.AgentPid -le 0) { continue }
+        $apid = [int]$s.AgentPid
+        $ov = $script:BusyOverride[$apid]
+        if ($null -ne $ov) {
+            if ($ov.FileTs -eq $s.Ts) {
+                $s.Status = [string]$ov.Status
+                $s.Rank   = (Get-StatusMeta $s.Status).Rank
+                continue                                   # corrected: not busy anymore
+            }
+            [void]$script:BusyOverride.Remove($apid)       # newer hook event wins
+            [void]$script:BusyVerify.Remove($apid)
+        }
+        $script:BusyPids[$apid] = $true
+        # untracked rows (codex &co) already run their own screen inference -
+        # only hook-fed rows need the stale-busy lie detector
+        if (-not $script:UntrackedPids.ContainsKey($apid)) {
+            [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts })
+        }
     }
+    $script:BusyVerifyQueue = $queue
+    try { Invoke-BusyVerify } catch { }
 
     # apply user prefs: custom names + pinned-to-top
     foreach ($s in $kept) {
@@ -600,6 +624,9 @@ $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
 $script:BusyPids = @{}          # pids of WORKING sessions - background probing leaves them alone
+$script:BusyVerify = @{}        # pid -> {FileTs; Stamp; Wait; Misses}: stale-busy verification state
+$script:BusyOverride = @{}      # pid -> {Status; FileTs}: screen-proven correction of a stuck status
+$script:BusyVerifyQueue = @()   # busy rows eligible for verification, rebuilt every tick
 $script:UntrackedPids = @{}     # pids currently shown as untracked rows (screen-state detection)
 $script:FileCache = @{}         # status file path -> {LWT; Skip|Obj} (parse only what changed)
 $script:ProcSnapshot = @{}      # pid -> Process, refreshed at most every 4s
@@ -832,7 +859,70 @@ $script:ScreenNeedsYou = @(
 $script:ScreenBusy = @(
     'esctointerrupt'                     # claude/codex busy hint
     'ctrlctointerrupt'
+    'ctrlbtoruninbackground'             # claude running-tool hint
 )
+
+function Test-ScreenLooksBusy([string]$Txt, [string]$Title) {
+    # busy signals that do NOT rotate. The status-bar hint line alternates
+    # between "esc to interrupt" and random tips (verified live: a session 9
+    # minutes into a Bash call showed only a tip), so the hint's absence at
+    # one instant proves nothing. The elapsed-timer/token row and the braille
+    # spinner leading the console title are constant while a turn runs.
+    foreach ($p in $script:ScreenBusy) { if ($Txt.Contains($p)) { return $true } }
+    if ($Txt -match '\d+s\d+(\.\d+)?k?tokens') { return $true }   # "(9m 14s . 135k tokens"
+    if (-not [string]::IsNullOrEmpty($Title)) {
+        $c = [int][char]$Title[0]
+        if ($c -ge 0x2800 -and $c -le 0x28FF) { return $true }
+    }
+    return $false
+}
+
+function Invoke-BusyVerify {
+    # HOOK BLIND SPOTS: no hook event fires when the user Escs a running turn
+    # (Stop skips user interrupts BY DESIGN), and compact-end repaints can
+    # vanish with a timed-out hook. Either way a session sits painted
+    # 'working'/'compacting' forever. The console screen is ground truth:
+    # slow-probe stale busy rows and OVERRIDE the painted status once the
+    # screen provably stopped cooking - two clean sightings 15s apart, since
+    # a single frame without busy markers lies (the hint line rotates).
+    # Any newer hook write invalidates the override instantly.
+    foreach ($q in @($script:BusyVerifyQueue)) {
+        $apid = [int]$q.Pid
+        $st = $script:BusyVerify[$apid]
+        if ($null -eq $st -or $st.FileTs -ne $q.Ts) {
+            $st = @{ FileTs = $q.Ts; Stamp = [datetime]::MinValue; Wait = 40; Misses = 0 }
+            $script:BusyVerify[$apid] = $st
+        }
+        if (((Get-Date) - $q.Ts).TotalSeconds -lt 45) { continue }     # let the hooks speak first
+        if (((Get-Date) - $st.Stamp).TotalSeconds -lt $st.Wait) { continue }
+        $r = Request-ConsoleInfo -TargetPid $apid
+        if ($null -eq $r) { continue }                                  # pending or out of budget
+        $st.Stamp = Get-Date
+        if ($null -ne $r.PSObject.Properties['Failed']) { continue }
+        $script:LastTitleByPid[$apid] = [string]$r.Title
+        if ([long]$r.ConsoleId -gt 0) { $script:ConsoleIdByPid[$apid] = [long]$r.ConsoleId }
+        $txt = [string]$r.Screen
+        if ($txt.Length -lt 200) { continue }                           # mute console proves nothing
+        if (Test-ScreenLooksBusy $txt ([string]$r.Title)) {
+            $st.Misses = 0
+            $st.Wait = [Math]::Min([int]$st.Wait + 30, 120)             # confirmed busy: ease off
+            continue
+        }
+        $needs = $false
+        foreach ($p in $script:ScreenNeedsYou) { if ($txt.Contains($p)) { $needs = $true; break } }
+        if ($needs) {
+            # a permission prompt is sitting there under a 'working' label -
+            # the one state perch exists to surface
+            $script:BusyOverride[$apid] = @{ Status = 'attention'; FileTs = $q.Ts }
+            continue
+        }
+        $st.Misses++
+        $st.Wait = 15                                                   # suspicious: look again soon
+        if ($st.Misses -ge 2 -or $txt.Contains('interruptedbyuser')) {
+            $script:BusyOverride[$apid] = @{ Status = 'idle'; FileTs = $q.Ts }
+        }
+    }
+}
 
 function Get-ScreenInferredStatus([int]$AgentPid, [string]$Fallback) {
     # sharpen a title-inferred status using the last screen fingerprint (if

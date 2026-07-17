@@ -2020,7 +2020,7 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         if ($Done -gt 0) { $tip += "$Done done" }
         if ($Quiet -gt 0) { $tip += "$Quiet quiet" }
         if ($tip.Count -eq 0) { $tip = @('all quiet') }
-        $tipText = ($tip -join $script:Sep) + $script:Dash + 'double-click = full view'
+        $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
     }
 }
@@ -2211,7 +2211,7 @@ function Set-CompactMode([bool]$On) {
         $script:PillCard.Visibility = 'Visible'
         $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
-        $script:MiniBtn.ToolTip = 'expand (or double-click the header)'
+        $script:MiniBtn.ToolTip = 'expand (or just click the pill)'
     }
     else {
         $script:PillCard.Visibility = 'Collapsed'
@@ -2224,7 +2224,22 @@ function Set-CompactMode([bool]$On) {
         $script:Divider.Visibility = 'Visible'
         $script:Window.SizeToContent = 'Height'
         $script:Window.Width = 324
-        Apply-Theme   # restores the theme's backdrop state
+        # no Apply-Theme here: pill v2 never restyles RootCard, and the call
+        # cost DWM round-trips on every expand. The rows FADE in instead -
+        # render-only, so the single hwnd jump reads as designed, not lag.
+        try {
+            $rf = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
+                (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(140))))
+            $rf.Add_Completed({
+                try {
+                    $script:RowsScroll.Opacity = 1.0
+                    $script:RowsScroll.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                }
+                catch { }
+            })
+            $script:RowsScroll.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $rf)
+        }
+        catch { }
         $script:MiniBtn.Text = [string][char]0x2013   # minimize glyph
         $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
     }
@@ -4436,20 +4451,44 @@ $script:MiniBtn.Add_MouseLeftButtonUp({
     Set-CompactMode (-not $script:Compact)
     Save-HudState
 })
-# double-click the header or chips row = toggle compact; single click = drag
+# full mode: double-click header = fold to pill, single click = drag.
+# compact mode: the pill/peek card is one big 'open me' button - a CLEAN
+# single click (no movement) expands, dragging still moves. The stamp
+# guards the second press of an old-habit double-click from instantly
+# re-folding what the first press just opened.
+$script:PillExpandStamp = [datetime]::MinValue
 $script:HeaderClick = {
     param($s, $e)
     if ($e.ClickCount -eq 2) {
+        if (((Get-Date) - $script:PillExpandStamp).TotalMilliseconds -lt 450) {
+            $e.Handled = $true
+            return
+        }
         Set-CompactMode (-not $script:Compact)
         Save-HudState
         $e.Handled = $true
         return
     }
+    $wasCompact = $script:Compact
+    $x0 = $script:Window.Left; $y0 = $script:Window.Top
     try { $script:Window.DragMove() } catch { }
+    if ($wasCompact -and $script:Compact -and
+        [Math]::Abs($script:Window.Left - $x0) -lt 3 -and
+        [Math]::Abs($script:Window.Top - $y0) -lt 3) {
+        $script:PillExpandStamp = Get-Date
+        Set-CompactMode $false
+        Save-HudState
+    }
 }
 $Header.Add_MouseLeftButtonDown($script:HeaderClick)
 $ChipsPanel.Add_MouseLeftButtonDown($script:HeaderClick)
-$script:PillBar.Add_MouseLeftButtonDown($script:HeaderClick)   # pill: drag or double-click out
+$script:PillBar.Add_MouseLeftButtonDown($script:HeaderClick)   # pill: click out or drag
+# compact only: the whole peeked card body is clickable too. Double runs
+# are safe - the second bubbled invocation re-reads $script:Compact.
+$script:RootCard.Add_MouseLeftButtonDown({
+    param($s, $e)
+    if ($script:Compact -and -not $e.Handled) { & $script:HeaderClick $s $e }
+})
 function Save-HudState {
     try {
         @{ Left = $script:Window.Left; Top = $script:Window.Top

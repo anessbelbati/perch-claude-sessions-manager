@@ -3533,7 +3533,7 @@ function New-SessionRow($Sess) {
             $fallback = Get-PeekDisplayText ([string]$sess.Message) 300
             $hasPeek = ($null -ne $peek -and ($peek.You.Length -gt 0 -or $peek.Bot.Length -gt 0))
             if (-not $hasPeek -and [string]::IsNullOrWhiteSpace($fallback)) {
-                $s.ToolTip.Content = $null   # empty tooltip = never opens (the trap, used on purpose)
+                $s.ToolTip = $null   # a null tooltip never opens
                 return
             }
             $panel = New-Object System.Windows.Controls.StackPanel
@@ -3559,11 +3559,22 @@ function New-SessionRow($Sess) {
                 $bd.Margin = New-Object System.Windows.Thickness(0, 1, 0, 6)
                 [void]$panel.Children.Add($bd)
             }
-            $s.ToolTip.Content = $panel
+            # ASSIGN a fresh tooltip, never mutate through $s.ToolTip: the
+            # getter came back null-ish in the live window (hud-error.log
+            # caught 'property Content cannot be found') even though the
+            # identical pattern passes in isolation - assignment can't miss
+            $tip = New-Object System.Windows.Controls.ToolTip
+            $tip.Background = Get-Brush '#FF201D26'
+            $tip.BorderBrush = Get-Brush '#2EFFFFFF'
+            $tip.BorderThickness = New-Object System.Windows.Thickness(1)
+            $tip.Padding = New-Object System.Windows.Thickness(11, 8, 11, 9)
+            $tip.Content = $panel
+            $s.ToolTip = $tip
         }
         catch {
             try {
-                Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -Value "$(Get-Date -Format s) peek: $_" -ErrorAction SilentlyContinue
+                $diag = 'sender=' + $s.GetType().Name + ' tip=' + $(if ($null -eq $s.ToolTip) { 'null' } else { $s.ToolTip.GetType().Name })
+                Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -Value "$(Get-Date -Format s) peek: $_ [$diag]" -ErrorAction SilentlyContinue
             }
             catch { }
         }

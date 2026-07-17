@@ -39,6 +39,7 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 - also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
 - dead sessions disappear on their own, headless subagents / agent-team workers are hidden
 - **compact mode**: double-click the header (or hit the `–` button) and it folds into a tiny pill — just the bird and the status chips. everything still chirps and pulses, it just stops hogging your screen
+- **themes**: classic **midnight**, or **liquid glass** — real acrylic backdrop blur through DWM, specular rim light, reflection streaks. flip it in ⚙ settings and drag it over something colorful
 - **actual bird chirps**: drop some `.wav` files into a `sounds/` folder next to `perch.ps1` and it picks a random one whenever a session needs you (enable the chirp in ⚙ settings). no wavs = a humble synth beep. [mixkit](https://mixkit.co/free-sound-effects/bird/) has lovely free ones
 - one powershell script. no electron. no node_modules. your grandma's windows can run it
 

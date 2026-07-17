@@ -43,6 +43,7 @@ $AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
 $script:ChirpOn = $false
 $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ShowTimers = $true
+$script:ThemeName = 'midnight'   # 'midnight' (classic dark) or 'glass' (liquid acrylic)
 try {
     if (Test-Path -LiteralPath $CfgPath) {
         $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json
@@ -51,6 +52,7 @@ try {
         if ($null -ne $cfg.PSObject.Properties['ChirpOnAttention']) { $script:ChirpOn = [bool]$cfg.ChirpOnAttention }
         if ($null -ne $cfg.PSObject.Properties['ChirpVolume']) { $script:ChirpVolume = [int]$cfg.ChirpVolume }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
+        if ($null -ne $cfg.PSObject.Properties['ThemeName']) { $script:ThemeName = [string]$cfg.ThemeName }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
         }
@@ -59,6 +61,47 @@ try {
 catch { }
 # processes that count as "an agent CLI" for liveness + untracked discovery
 $script:AgentProcRegex = '^(' + ((@($AgentProcNames) + @('node', 'bun', 'deno', 'python')) -join '|') + ')'
+
+# real backdrop blur for the glass theme: undocumented-but-ubiquitous
+# SetWindowCompositionAttribute acrylic + Win11 DWM rounded corners
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace ClaudeHud {
+    public static class Glass {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct AccentPolicy { public int AccentState; public int AccentFlags; public uint GradientColor; public int AnimationId; }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CompData { public int Attribute; public IntPtr Data; public int SizeOfData; }
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowCompositionAttribute(IntPtr hwnd, ref CompData data);
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        public static void SetAcrylic(IntPtr hwnd, bool on, uint tintABGR) {
+            var accent = new AccentPolicy();
+            accent.AccentState = on ? 4 : 0;        // ACCENT_ENABLE_ACRYLICBLURBEHIND / DISABLED
+            accent.AccentFlags = 2;
+            accent.GradientColor = tintABGR;        // AABBGGRR
+            int sz = Marshal.SizeOf(accent);
+            IntPtr ptr = Marshal.AllocHGlobal(sz);
+            try {
+                Marshal.StructureToPtr(accent, ptr, false);
+                var data = new CompData { Attribute = 19, Data = ptr, SizeOfData = sz };   // WCA_ACCENT_POLICY
+                SetWindowCompositionAttribute(hwnd, ref data);
+            }
+            finally { Marshal.FreeHGlobal(ptr); }
+        }
+
+        public static void SetRoundCorners(IntPtr hwnd, bool round) {
+            int pref = round ? 2 : 0;               // DWMWCP_ROUND / DEFAULT (Win11; no-op on Win10)
+            DwmSetWindowAttribute(hwnd, 33, ref pref, 4);
+        }
+    }
+}
+"@
 
 # ---------- native + UIA ----------
 if (-not ("ClaudeHud.Native" -as [type])) {
@@ -1233,6 +1276,35 @@ $xaml = @"
     <Border.Effect>
       <DropShadowEffect BlurRadius="18" ShadowDepth="0" Opacity="0.55"/>
     </Border.Effect>
+    <Grid>
+    <!-- glass theme overlays: top-light sheen + diagonal reflection streaks
+         (under the content) and a light-catching rim (over everything).
+         Collapsed in the midnight theme. -->
+    <Border x:Name="GlassSheen" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0.1,0" EndPoint="0.5,1">
+          <GradientStop Color="#3DFFFFFF" Offset="0"/>
+          <GradientStop Color="#14FFFFFF" Offset="0.18"/>
+          <GradientStop Color="#05FFFFFF" Offset="0.42"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.65"/>
+          <GradientStop Color="#0AFFFFFF" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+    </Border>
+    <Border x:Name="GlassStreak" CornerRadius="9" IsHitTestVisible="False" Visibility="Collapsed">
+      <Border.Background>
+        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0.9">
+          <GradientStop Color="#00FFFFFF" Offset="0"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.30"/>
+          <GradientStop Color="#17FFFFFF" Offset="0.37"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.46"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.55"/>
+          <GradientStop Color="#0DFFFFFF" Offset="0.60"/>
+          <GradientStop Color="#00FFFFFF" Offset="0.68"/>
+          <GradientStop Color="#00FFFFFF" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.Background>
+    </Border>
     <StackPanel>
       <Grid x:Name="Header" Margin="16,11,12,7" Background="Transparent">
         <Grid.ColumnDefinitions>
@@ -1266,6 +1338,19 @@ $xaml = @"
         <StackPanel x:Name="SessionList" Margin="8,2,8,10"/>
       </ScrollViewer>
     </StackPanel>
+    <Border x:Name="GlassRim" CornerRadius="9" BorderThickness="1.4"
+            IsHitTestVisible="False" Visibility="Collapsed">
+      <Border.BorderBrush>
+        <LinearGradientBrush StartPoint="0.2,0" EndPoint="0.8,1">
+          <GradientStop Color="#A8FFFFFF" Offset="0"/>
+          <GradientStop Color="#30FFFFFF" Offset="0.22"/>
+          <GradientStop Color="#12FFFFFF" Offset="0.55"/>
+          <GradientStop Color="#26FFFFFF" Offset="0.85"/>
+          <GradientStop Color="#59FFFFFF" Offset="1"/>
+        </LinearGradientBrush>
+      </Border.BorderBrush>
+    </Border>
+    </Grid>
   </Border>
 </Window>
 "@
@@ -1281,6 +1366,12 @@ $script:MiniBtn     = $Window.FindName('MiniBtn')
 $script:Divider     = $Window.FindName('Divider')
 $script:RowsScroll  = $Window.FindName('RowsScroll')
 $script:RootCard    = $Window.FindName('RootCard')
+$script:GlassSheen  = $Window.FindName('GlassSheen')
+$script:GlassStreak = $Window.FindName('GlassStreak')
+$script:GlassRim    = $Window.FindName('GlassRim')
+$script:RimGradient = $script:GlassRim.BorderBrush          # restored after pulse animations
+$script:CardGradient = $script:RootCard.Background          # midnight look, restored on theme switch
+$script:CardShadow  = $script:RootCard.Effect
 $script:WorkSince   = @{}
 $script:Dismissed   = @{}
 $script:PrevAttention = @{}
@@ -1344,6 +1435,63 @@ try {
 }
 catch { }
 
+function Set-GlassBackdrop([bool]$On) {
+    # needs a real hwnd - called again from SourceInitialized for the boot path
+    try {
+        $h = (New-Object System.Windows.Interop.WindowInteropHelper($script:Window)).Handle
+        if ($h -eq [IntPtr]::Zero) { return }
+        if ($On) {
+            [ClaudeHud.Glass]::SetRoundCorners($h, $true)
+            # tint is ABGR: ~35% warm near-black. LOW alpha on purpose - the
+            # point is glass you can see through, not fogged plexiglass
+            [ClaudeHud.Glass]::SetAcrylic($h, $true, 0x59120E0C)
+        }
+        else {
+            [ClaudeHud.Glass]::SetAcrylic($h, $false, 0)
+            [ClaudeHud.Glass]::SetRoundCorners($h, $false)
+        }
+    }
+    catch { }
+}
+
+function Apply-Theme {
+    $glass = ($script:ThemeName -eq 'glass')
+    if ($glass) {
+        # liquid glass: REAL backdrop blur (acrylic) + a barely-there white
+        # film, lit by a sheen, two reflection streaks and a bright rim.
+        # margin 0 because the acrylic covers the whole hwnd rect - any
+        # transparent margin would show a square blur slab around the card.
+        $script:RootCard.Margin = New-Object System.Windows.Thickness(0)
+        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(9)
+        $script:RootCard.Effect = $null
+        $script:RootCard.BorderBrush = Get-Brush '#00FFFFFF'
+        $film = New-Object System.Windows.Media.LinearGradientBrush
+        $film.StartPoint = New-Object System.Windows.Point(0, 0)
+        $film.EndPoint = New-Object System.Windows.Point(0, 1)
+        [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+            [System.Windows.Media.ColorConverter]::ConvertFromString('#1CFFFFFF'), 0.0)))
+        [void]$film.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
+            [System.Windows.Media.ColorConverter]::ConvertFromString('#08FFFFFF'), 1.0)))
+        $film.Freeze()
+        $script:RootCard.Background = $film
+        $script:GlassSheen.Visibility = 'Visible'
+        $script:GlassStreak.Visibility = 'Visible'
+        $script:GlassRim.Visibility = 'Visible'
+        $script:GlassRim.BorderBrush = $script:RimGradient
+    }
+    else {
+        $script:RootCard.Margin = New-Object System.Windows.Thickness(12)
+        $script:RootCard.CornerRadius = New-Object System.Windows.CornerRadius(16)
+        $script:RootCard.Effect = $script:CardShadow
+        $script:RootCard.BorderBrush = Get-Brush '#24FFFFFF'
+        $script:RootCard.Background = $script:CardGradient
+        $script:GlassSheen.Visibility = 'Collapsed'
+        $script:GlassStreak.Visibility = 'Collapsed'
+        $script:GlassRim.Visibility = 'Collapsed'
+    }
+    Set-GlassBackdrop $glass
+}
+
 $script:Compact = $false
 function Set-CompactMode([bool]$On) {
     # compact = a little perch: logo + chips, no session rows. Everything
@@ -1394,6 +1542,9 @@ try {
     }
 }
 catch { }
+
+Apply-Theme   # brushes now; the acrylic backdrop needs an hwnd, so once more:
+$Window.Add_SourceInitialized({ try { Set-GlassBackdrop ($script:ThemeName -eq 'glass') } catch { } })
 
 function Show-RenameDialog([string]$Current) {
     $script:RenameResult = $null
@@ -1582,7 +1733,12 @@ function New-DialogButton([string]$Text, [bool]$Primary) {
     return $b
 }
 
-function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
+function Save-PerchSettings([bool]$Glass, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw) {
+    $newTheme = $(if ($Glass) { 'glass' } else { 'midnight' })
+    if ($newTheme -ne $script:ThemeName) {
+        $script:ThemeName = $newTheme
+        Apply-Theme
+    }
     $script:ChirpOn = $Chirp
     $script:ShowTimers = $Timers
     $script:HudHideAfterFocus = $HideAfter
@@ -1635,6 +1791,7 @@ function Save-PerchSettings([bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool
         $cfg | Add-Member -NotePropertyName HideAfterFocus    -NotePropertyValue $script:HudHideAfterFocus -Force
         $cfg | Add-Member -NotePropertyName ChirpOnAttention  -NotePropertyValue $script:ChirpOn -Force
         $cfg | Add-Member -NotePropertyName ChirpVolume       -NotePropertyValue $script:ChirpVolume -Force
+        $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
         $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
@@ -1698,11 +1855,12 @@ function Show-SettingsDialog {
     [void]$stack.Children.Add($head)
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
+    $rowGlass   = New-SettingRow 'liquid glass theme'                 ($script:ThemeName -eq 'glass')
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
     $rowTimers  = New-SettingRow 'show work timers on busy sessions'  $script:ShowTimers
     $rowHide    = New-SettingRow 'minimize after click-to-focus'      $script:HudHideAfterFocus
     $rowStartup = New-SettingRow 'start with windows'                 (Test-Path -LiteralPath $startupLnk)
-    foreach ($r in @($rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
+    foreach ($r in @($rowGlass, $rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
 
     $sep = New-Object System.Windows.Controls.Border
     $sep.Height = 1
@@ -1748,7 +1906,7 @@ function Show-SettingsDialog {
     $dlg.Content = $card
 
     $dlg.Tag = @{
-        Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
+        Glass = $rowGlass.Tag; Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
         Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child
     }
     $btnSave.Tag = $dlg
@@ -1756,7 +1914,7 @@ function Show-SettingsDialog {
     $btnSave.Add_MouseLeftButtonUp({
         param($s, $e)
         $c = $s.Tag.Tag
-        Save-PerchSettings ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
+        Save-PerchSettings ([bool]$c.Glass.Tag) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text)
         $s.Tag.Close()
     })
@@ -1873,6 +2031,22 @@ function Invoke-AttentionRaise {
             $oa = New-Object System.Windows.Media.Animation.DoubleAnimation(0.95, 0.55, $dur)
             $oa.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
             $eff.BeginAnimation([System.Windows.Media.Effects.DropShadowEffect]::OpacityProperty, $oa)
+        }
+        elseif ($script:ThemeName -eq 'glass' -and $null -ne $script:GlassRim) {
+            # glass has no drop shadow to pulse - flash the rim red instead,
+            # then hand the light back to the white gradient
+            $dur = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(650))
+            $pulse = New-Object System.Windows.Media.SolidColorBrush(
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'))
+            $script:GlassRim.BorderBrush = $pulse
+            $ca = New-Object System.Windows.Media.Animation.ColorAnimation(
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#FF6B6B'),
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#30FFFFFF'), $dur)
+            $ca.RepeatBehavior = New-Object System.Windows.Media.Animation.RepeatBehavior(4)
+            $ca.Add_Completed({
+                try { $script:GlassRim.BorderBrush = $script:RimGradient } catch { }
+            })
+            $pulse.BeginAnimation([System.Windows.Media.SolidColorBrush]::ColorProperty, $ca)
         }
     }
     catch { }

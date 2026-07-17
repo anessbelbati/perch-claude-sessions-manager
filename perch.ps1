@@ -2664,16 +2664,27 @@ function Update-LimitsPanel {
     # network; it only reads the sanitized snapshot the child writes.
     try {
         $now = Get-Date
-        # be a polite API citizen: one fetch per 5 minutes (limit windows move
-        # slowly), and when the endpoint looks unreachable (snapshot >30min
-        # stale) back off to 10 - hammering a dead line helps nobody
+        # be a polite API citizen: one fetch per 5 minutes, gated on the FILE
+        # age (not an in-memory stamp - restarts used to trigger an immediate
+        # fetch each time, and a day of debugging restarts got us 429'd), and
+        # never while a rate-limit cooldown is active
         $uProbePath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
-        $cadence = 300
-        if (-not (Test-Path -LiteralPath $uProbePath) -or
-            ([datetime]::UtcNow - (Get-Item -LiteralPath $uProbePath).LastWriteTimeUtc).TotalMinutes -gt 30) {
-            $cadence = 600
+        $coolPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage-cooldown.txt'
+        $fileAge = 1e9
+        if (Test-Path -LiteralPath $uProbePath) {
+            $fileAge = ([datetime]::UtcNow - (Get-Item -LiteralPath $uProbePath).LastWriteTimeUtc).TotalSeconds
         }
-        if (($now - $script:UsageFetchStamp).TotalSeconds -gt $cadence) {
+        $coolActive = $false
+        if (Test-Path -LiteralPath $coolPath) {
+            try {
+                $until = [datetime]::Parse((Get-Content -LiteralPath $coolPath -Raw).Trim(), $null,
+                         [System.Globalization.DateTimeStyles]::RoundtripKind)
+                $coolActive = ([datetime]::UtcNow -lt $until.ToUniversalTime())
+            }
+            catch { }
+        }
+        if (-not $coolActive -and $fileAge -gt 300 -and
+            ($now - $script:UsageFetchStamp).TotalSeconds -gt 60) {
             $script:UsageFetchStamp = $now
             $probe = Join-Path $PSScriptRoot 'usage-probe.ps1'
             if (Test-Path -LiteralPath $probe) {
@@ -2818,6 +2829,19 @@ function Update-LimitsPanel {
             [void]$g.Children.Add($right)
 
             [void]$script:LimitsPanel.Children.Add($g)
+        }
+
+        # staleness in words, not just opacity - a 45% dim was too subtle and
+        # old numbers were being read as current
+        if ($staleMin -gt 10) {
+            $old = New-Object System.Windows.Controls.TextBlock
+            $old.FontSize = 9
+            $old.Foreground = Get-Brush '#8A6E6E'
+            $old.HorizontalAlignment = 'Right'
+            $old.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
+            $old.Text = "data $([int]$staleMin)m old" +
+                        $(if ($coolActive) { ' (rate-limited, backing off)' } else { ', retrying' })
+            [void]$script:LimitsPanel.Children.Add($old)
         }
     }
     catch { }

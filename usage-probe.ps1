@@ -26,18 +26,42 @@ try {
     }
     if (-not $tok) { throw 'no token available' }
 
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    $r = $null
-    foreach ($timeout in @(20, 30)) {   # one retry - flaky wifi is a way of life
+    # respect an active rate-limit cooldown: hitting a throttled endpoint
+    # again is how you stay throttled
+    $cool = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage-cooldown.txt'
+    if (Test-Path -LiteralPath $cool) {
         try {
-            $r = Invoke-RestMethod 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec $timeout -Headers @{
-                Authorization    = "Bearer $tok"
-                'anthropic-beta' = 'oauth-2025-04-20'
-            }
-            break
+            $until = [datetime]::Parse((Get-Content -LiteralPath $cool -Raw).Trim(), $null,
+                     [System.Globalization.DateTimeStyles]::RoundtripKind)
+            if ([datetime]::UtcNow -lt $until.ToUniversalTime()) { exit 0 }
         }
-        catch { if ($timeout -eq 30) { throw } }
+        catch { }
     }
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    # ONE attempt, no retry: a failed request costs nothing to wait out, and
+    # retrying into a 429 digs the hole deeper
+    try {
+        $r = Invoke-RestMethod 'https://api.anthropic.com/api/oauth/usage' -TimeoutSec 20 -Headers @{
+            Authorization    = "Bearer $tok"
+            'anthropic-beta' = 'oauth-2025-04-20'
+        }
+    }
+    catch {
+        $resp = $_.Exception.Response
+        if ($null -ne $resp -and [int]$resp.StatusCode -eq 429) {
+            # back WAY off: Retry-After if the server names a number, else 30min
+            $mins = 30
+            try {
+                $ra = [int]$resp.Headers['Retry-After']
+                if ($ra -gt 0) { $mins = [Math]::Max([Math]::Ceiling($ra / 60.0), 5) }
+            }
+            catch { }
+            ([datetime]::UtcNow.AddMinutes($mins)).ToString('o') | Set-Content -LiteralPath $cool -Encoding UTF8
+        }
+        exit 0   # keep the old snapshot; the HUD shows its age honestly
+    }
+    Remove-Item -LiteralPath $cool -Force -Confirm:$false -ErrorAction SilentlyContinue
 
     $limits = @()
     foreach ($l in @($r.limits)) {

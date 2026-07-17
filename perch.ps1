@@ -3498,14 +3498,22 @@ function New-SessionRow($Sess) {
     $row.ToolTip = $tt
     [System.Windows.Controls.ToolTipService]::SetInitialShowDelay($row, 700)
     [System.Windows.Controls.ToolTipService]::SetShowDuration($row, 60000)
-    $row.Add_ToolTipOpening({
+    # content is built on MOUSE ENTER, not ToolTipOpening: the opening event
+    # never fired in this window (and an empty tooltip never opens, so lazy-
+    # build-on-open was a chicken-and-egg). MouseEnter provably fires - the
+    # hover highlight rides it - and the 700ms show delay means the panel is
+    # long built before the tooltip appears.
+    $row.Add_MouseEnter({
         param($s, $e)
         try {
             $sess = $s.Tag
             $peek = Get-TranscriptPeek ([string]$sess.Transcript)
             $fallback = [string]$sess.Message
             $hasPeek = ($null -ne $peek -and ($peek.You.Length -gt 0 -or $peek.Bot.Length -gt 0))
-            if (-not $hasPeek -and [string]::IsNullOrWhiteSpace($fallback)) { $e.Handled = $true; return }
+            if (-not $hasPeek -and [string]::IsNullOrWhiteSpace($fallback)) {
+                $s.ToolTip.Content = $null   # empty tooltip = never opens (the trap, used on purpose)
+                return
+            }
             $panel = New-Object System.Windows.Controls.StackPanel
             $panel.MaxWidth = 330
             $blocks = @()
@@ -3531,7 +3539,12 @@ function New-SessionRow($Sess) {
             }
             $s.ToolTip.Content = $panel
         }
-        catch { $e.Handled = $true }
+        catch {
+            try {
+                Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -Value "$(Get-Date -Format s) peek: $_" -ErrorAction SilentlyContinue
+            }
+            catch { }
+        }
     })
 
     $entry = @{

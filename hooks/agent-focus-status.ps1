@@ -415,29 +415,28 @@ function Get-ConsoleTabHint {
         $prevTitle = $sb.ToString()
         Write-HookDebug "ev=$EventName attached($AgentPid) title=[$prevTitle]"
 
+        # NOTE: deliberately NO by-title tab matching here. A title is a VALUE,
+        # not ownership: two just-started sessions briefly show identical
+        # titles, and a batch restart once cross-captured two sessions (both
+        # status files ended up with the SAME tab id - clicking session A
+        # focused session B's tab). The marker is ownership-proven: only OUR
+        # console can ever display it.
         $match = $null
         $capTag = "console"
-        if (-not [string]::IsNullOrWhiteSpace($prevTitle)) {
-            $candidate = Find-TerminalTabByName -Name $prevTitle
-            if ($null -ne $candidate -and $candidate.unique) { $match = $candidate }
+        $suffix = $SessionId
+        if ($suffix.Length -gt 8) { $suffix = $suffix.Substring(0, 8) }
+        $marker = "cc-mark-$suffix-$PID"
+        try {
+            [void][AgentFocus.ConsoleApi]::SetConsoleTitle($marker)
+            for ($attempt = 0; $attempt -lt 4; $attempt++) {
+                Start-Sleep -Milliseconds 150
+                $match = Find-TerminalTabByName -Name $marker
+                if ($null -ne $match) { break }
+            }
         }
-
-        if ($null -eq $match) {
-            $suffix = $SessionId
-            if ($suffix.Length -gt 8) { $suffix = $suffix.Substring(0, 8) }
-            $marker = "cc-mark-$suffix-$PID"
-            try {
-                [void][AgentFocus.ConsoleApi]::SetConsoleTitle($marker)
-                for ($attempt = 0; $attempt -lt 4; $attempt++) {
-                    Start-Sleep -Milliseconds 150
-                    $match = Find-TerminalTabByName -Name $marker
-                    if ($null -ne $match) { break }
-                }
-            }
-            catch { $match = $null }
-            finally {
-                try { [void][AgentFocus.ConsoleApi]::SetConsoleTitle($prevTitle) } catch { }
-            }
+        catch { $match = $null }
+        finally {
+            try { [void][AgentFocus.ConsoleApi]::SetConsoleTitle($prevTitle) } catch { }
         }
 
         if ($null -eq $match -and -not [string]::IsNullOrWhiteSpace($CwdName)) {

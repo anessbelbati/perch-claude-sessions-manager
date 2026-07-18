@@ -51,11 +51,20 @@ Prompt template (paste with logo.png attached):
 | 14 | `bird-crown.png` | EVERY session done, zero waiting | absolute monarch: golden crown, tiny royal-purple cape draped over his shoulders, chest puffed to the limit, eyes smugly half-lidded, the most self-satisfied face physically possible |
 | 15 | `bird-launch.png` | red-dot click (jump to terminal) | takeoff: tiny aviator goggles strapped on, a little red scarf trailing behind, body leaned forward into a superhero launch pose, two speed lines behind him |
 
-## sprite tier (frame pairs — real animation)
+## sprite tier (frame pairs + transitions — real animation, cheaply)
+
+Two rules make this tier work: **gradual emotions get an in-between frame,
+sudden ones get a hard cut** (getting grabbed/alarmed/KO'd is funnier as a
+snap), and **a loop pair = one extra frame of an existing state** that we
+alternate — infinite animation from a single image. Each pair frame must
+keep everything identical to its parent except the named moving part.
 
 | # | file | pairs with | the edit |
 |---|------|-----------|----------|
-| 16 | `bird-happy2.png` | `bird-happy.png` | identical to bird-happy but the flung wing in the DOWN position and the confetti fallen lower — we alternate the two at ~90ms during the hop = actual flapping with confetti physics |
+| 16 | `bird-happy2.png` | `bird-happy.png` | identical to bird-happy but the flung wing in the DOWN position and the confetti fallen lower — alternated at ~90ms during the hop = actual flapping with confetti physics |
+| 17 | `bird-drowsy.png` | transition into/out of `bird-sleep` | halfway asleep: eyes half-lidded, head starting to droop to one side, nightcap sitting crooked, one tiny Z. shown ~250ms in BOTH directions (dozing off and waking up) |
+| 18 | `bird-sideeye2.png` | `bird-sideeye.png` | identical but the coffee cup RAISED to the beak mid-sip, eyes still dead flat — swapped in for ~400ms every few seconds, so the parked bird periodically SIPS while judging you |
+| 19 | `bird-hot2.png` | `bird-hot.png` | identical but the paper fan at the opposite angle of its arc — alternated at ~180ms = frantic real-time fanning while he cooks |
 
 ## what gets wired once files land
 
@@ -68,3 +77,7 @@ Prompt template (paste with logo.png attached):
   Perch throws you into the terminal
 - moment animations layer on top: perk wiggle on alert, hop (with flap
   frames if present) on happy, breath on sleep, squash on grabbed-drop
+- transitions: `bird-drowsy` bridges into/out of sleep (~250ms each way);
+  sudden states (grabbed, alert, knocked, launch) stay HARD CUTS on purpose
+- loop pairs: sip every few seconds on parked, frantic fan alternation on
+  hot, flap alternation during the hop — one extra frame each, endless life

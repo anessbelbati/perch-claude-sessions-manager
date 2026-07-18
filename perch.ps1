@@ -2764,10 +2764,18 @@ $script:CarrySwingTimer.Add_Tick({
         $x = $script:Window.Left
         $vx = ($x - $script:CarryLastX) / 0.03
         $script:CarryLastX = $x
-        $target = [Math]::Max(-38.0, [Math]::Min(38.0, $vx * -0.045))
-        $script:CarryAngVel += (($target - $script:CarryAngle) * 140.0 - $script:CarryAngVel * 7.5) * 0.03
+        # CARTOON tuning: double tilt per speed, wide swing, low damping -
+        # a hard stop rings him like a bell for a few oscillations
+        $target = [Math]::Max(-58.0, [Math]::Min(58.0, $vx * -0.095))
+        $script:CarryAngVel += (($target - $script:CarryAngle) * 170.0 - $script:CarryAngVel * 4.2) * 0.03
         $script:CarryAngle += $script:CarryAngVel * 0.03
         if ($null -ne $script:BirdRot) { $script:BirdRot.Angle = $script:CarryAngle }
+        # jelly: stretch with swing violence, squash sideways to compensate
+        if ($null -ne $script:BirdScale) {
+            $j = [Math]::Min(0.18, [Math]::Abs($script:CarryAngVel) * 0.00055)
+            $script:BirdScale.ScaleY = 1.0 + $j
+            $script:BirdScale.ScaleX = 1.0 - ($j * 0.5)
+        }
     }
     catch { }
 })
@@ -4996,6 +5004,13 @@ $Window.Add_MouseMove({
         if ($null -ne $script:BirdRot) {
             $script:BirdRot.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $null)
         }
+        if ($null -ne $script:BirdScale) {
+            # the spring owns scale too (jelly) - release any held animations
+            foreach ($sp2 in @([System.Windows.Media.ScaleTransform]::ScaleXProperty,
+                               [System.Windows.Media.ScaleTransform]::ScaleYProperty)) {
+                $script:BirdScale.BeginAnimation($sp2, $null)
+            }
+        }
         if ($null -ne $script:BirdImgGrid) {
             $script:BirdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.08)
         }
@@ -5024,6 +5039,10 @@ $Window.Add_MouseMove({
             }
             if ($null -ne $script:BirdRot) {
                 $script:BirdRot.Angle = $(if ($script:BirdDozing) { -10.0 } else { 0.0 })
+            }
+            if ($null -ne $script:BirdScale) {
+                $script:BirdScale.ScaleX = 1.0
+                $script:BirdScale.ScaleY = 1.0
             }
         }
         catch { }

@@ -1,6 +1,8 @@
 # runtime state (per-user, not part of the project)
 hud-state.json
 hud-prefs.json
+hud-livesnap.json
+hud-livesnap.json.tmp
 hud-error.log
 hud-boot.log
 icon-preview.png

@@ -1651,6 +1651,27 @@ $xaml = @"
       <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,4" Background="Transparent"/>
       <StackPanel x:Name="LimitsPanel" Margin="16,0,16,9" Background="Transparent"/>
       <Border x:Name="Divider" Height="1" Background="#14FFFFFF" Margin="12,0,12,4"/>
+      <!-- CRASH INSURANCE: appears only when a snapshot from a previous life
+           lists sessions that are not running now. resume all = manual,
+           always - perch never relaunches anything on its own. -->
+      <Border x:Name="RestoreBar" CornerRadius="8" Background="#1A7BD8FF" BorderBrush="#2E7BD8FF"
+              BorderThickness="1" Margin="12,1,12,5" Padding="9,5,6,5" Visibility="Collapsed">
+        <Grid>
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="Auto"/>
+            <ColumnDefinition Width="Auto"/>
+          </Grid.ColumnDefinitions>
+          <TextBlock x:Name="RestoreText" FontSize="11.5" Foreground="#BFE4FF"
+                     VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+          <Border x:Name="RestoreGoBtn" Grid.Column="1" CornerRadius="6" Background="#2E7BD8FF" Margin="8,0,4,0" Cursor="Hand">
+            <TextBlock x:Name="RestoreGo" Text="resume all" FontSize="11" FontWeight="SemiBold"
+                       Foreground="#D8F0FF" Padding="8,2" VerticalAlignment="Center"/>
+          </Border>
+          <TextBlock x:Name="RestoreDismiss" Grid.Column="2" Text="&#x2715;" FontSize="10.5"
+                     Foreground="#807BD8FF" Padding="5,2,3,2" VerticalAlignment="Center" Cursor="Hand"/>
+        </Grid>
+      </Border>
       <ScrollViewer x:Name="RowsScroll" MaxHeight="560" VerticalScrollBarVisibility="Auto"
                     HorizontalScrollBarVisibility="Disabled">
         <StackPanel x:Name="SessionList" Margin="8,2,8,10"/>
@@ -1719,6 +1740,111 @@ $script:GearBtn     = $Window.FindName('GearBtn')
 $script:MiniBtn     = $Window.FindName('MiniBtn')
 $script:Divider     = $Window.FindName('Divider')
 $script:RowsScroll  = $Window.FindName('RowsScroll')
+# ---------------------------------------------------- crash insurance --
+# perch keeps a rolling snapshot of every live claude session (id + cwd).
+# A power cut, BSOD or accidental shutdown kills the terminals but not the
+# snapshot - on the next boot, sessions listed there that are NOT running
+# get offered in the RestoreBar. Offered. Clicking 'resume all' relaunches
+# each one in its own terminal tab via `claude --resume <id>`; nothing is
+# ever relaunched automatically.
+$SnapPath = Join-Path $PSScriptRoot 'hud-livesnap.json'
+$script:RestoreBar     = $Window.FindName('RestoreBar')
+$script:RestoreText    = $Window.FindName('RestoreText')
+$script:RestoreGoBtn   = $Window.FindName('RestoreGoBtn')
+$script:RestoreDismiss = $Window.FindName('RestoreDismiss')
+$script:LiveSnapSig = $null            # last written id-set (write only on change)
+$script:RestorePending = New-Object System.Collections.ArrayList
+$script:RestoreSavedAt = ''
+try {
+    if (Test-Path -LiteralPath $SnapPath) {
+        $snap = Get-Content -LiteralPath $SnapPath -Raw | ConvertFrom-Json
+        $script:RestoreSavedAt = [string]$snap.savedAt
+        foreach ($p in @($snap.sessions)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$p.id) -and
+                -not [string]::IsNullOrWhiteSpace([string]$p.cwd) -and
+                (Test-Path -LiteralPath ([string]$p.cwd))) {
+                [void]$script:RestorePending.Add(@{
+                    Id = [string]$p.id; Cwd = [string]$p.cwd; Name = [string]$p.name })
+            }
+        }
+    }
+}
+catch { }
+function Update-RestoreBar {
+    if ($null -eq $script:RestoreBar) { return }
+    $n = $script:RestorePending.Count
+    if ($n -le 0) {
+        if ($script:RestoreBar.Visibility -ne 'Collapsed') { $script:RestoreBar.Visibility = 'Collapsed' }
+        return
+    }
+    $script:RestoreText.Text = ('{0} {1} lost session{2}' -f
+        [char]0x21BB, $n, $(if ($n -eq 1) { '' } else { 's' }))
+    $tip = "these were alive when perch last saw them"
+    if ($script:RestoreSavedAt) {
+        try {
+            $age = (Get-Date) - [datetime]::Parse($script:RestoreSavedAt, $null,
+                [System.Globalization.DateTimeStyles]::RoundtripKind)
+            $tip += $(if ($age.TotalHours -ge 1) { ' ({0:0.#}h ago)' -f $age.TotalHours }
+                      else { ' ({0:0}min ago)' -f [Math]::Max(1, $age.TotalMinutes) })
+        }
+        catch { }
+    }
+    $tip += ":`n"
+    foreach ($p in $script:RestorePending) { $tip += ('  ' + $p.Name + '  -  ' + $p.Cwd + "`n") }
+    $tip += "resume all = one terminal tab per session, each running 'claude --resume'. nothing happens until you click."
+    if ([string]$script:RestoreBar.ToolTip -ne $tip) { $script:RestoreBar.ToolTip = $tip }
+    if ($script:RestoreBar.Visibility -ne 'Visible') { $script:RestoreBar.Visibility = 'Visible' }
+}
+function Invoke-ResumeSession($P) {
+    # one dead session -> one fresh terminal tab in its old cwd, claude
+    # picking the conversation back up. cmd /k keeps the tab (and any
+    # resume error) visible instead of vanishing on failure.
+    try {
+        $cmd = 'claude --resume ' + $P.Id
+        $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
+        if ($null -ne $wt) {
+            Start-Process wt.exe -ArgumentList ('-w 0 nt -d "' + $P.Cwd + '" cmd /k ' + $cmd)
+        }
+        else {
+            Start-Process cmd.exe -WorkingDirectory $P.Cwd -ArgumentList ('/k ' + $cmd)
+        }
+    }
+    catch { }
+}
+# staggered relaunch: N simultaneous claude boots would fight over CPU and
+# the terminal - one every 700ms feels like a calm roll call instead
+$script:RestoreQueue = New-Object System.Collections.Queue
+$script:RestoreTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:RestoreTimer.Interval = [TimeSpan]::FromMilliseconds(700)
+$script:RestoreTimer.Add_Tick({
+    try {
+        if ($script:RestoreQueue.Count -eq 0) { $script:RestoreTimer.Stop(); return }
+        Invoke-ResumeSession $script:RestoreQueue.Dequeue()
+    }
+    catch { $script:RestoreTimer.Stop() }
+})
+$script:RestoreGoBtn.Add_MouseLeftButtonUp({
+    param($s, $e)
+    $e.Handled = $true
+    try {
+        if ($script:RestorePending.Count -eq 0) { return }
+        foreach ($p in @($script:RestorePending)) { [void]$script:RestoreQueue.Enqueue($p) }
+        $script:RestorePending.Clear()
+        Update-RestoreBar
+        Invoke-ResumeSession $script:RestoreQueue.Dequeue()   # first one NOW
+        if ($script:RestoreQueue.Count -gt 0) { $script:RestoreTimer.Start() }
+    }
+    catch { }
+})
+$script:RestoreDismiss.Add_MouseLeftButtonUp({
+    param($s, $e)
+    $e.Handled = $true
+    $script:RestorePending.Clear()
+    Update-RestoreBar
+    # dismissed = you didn't want that morning; kill the stale snapshot so
+    # it can't re-offer after the NEXT reboot (the writer rebuilds it live)
+    try { Remove-Item -LiteralPath $SnapPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+})
 $script:RootCard    = $Window.FindName('RootCard')
 $script:PillCard    = $Window.FindName('PillCard')
 $script:GlassDome   = $Window.FindName('GlassDome')
@@ -2198,6 +2324,9 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         if ($tip.Count -eq 0) { $tip = @('all quiet') }
         if ([double]$script:Pill5hPct -ge 0) {
             $tip += ('5h {0:0}%' -f [double]$script:Pill5hPct)
+        }
+        if ($script:RestorePending.Count -gt 0) {
+            $tip += "$($script:RestorePending.Count) to restore"
         }
         $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
@@ -4910,6 +5039,36 @@ function Update-List {
     }
     foreach ($k in @($script:WorkSince.Keys)) {
         if (-not $liveIds.ContainsKey($k)) { [void]$script:WorkSince.Remove($k) }
+    }
+
+    # crash insurance, tick side: (1) anything the old snapshot offered
+    # that turns out to be alive (perch restart, not a reboot) leaves the
+    # offer; (2) the rolling snapshot rewrites whenever the live id-set
+    # changes - atomically, because the next power cut won't wait
+    if ($script:RestorePending.Count -gt 0) {
+        for ($ri = $script:RestorePending.Count - 1; $ri -ge 0; $ri--) {
+            if ($liveIds.ContainsKey($script:RestorePending[$ri].Id)) { $script:RestorePending.RemoveAt($ri) }
+        }
+    }
+    Update-RestoreBar
+    $snapList = @()
+    foreach ($s in $visible) {
+        if (($s.Provider -eq 'claude' -or $s.Id -match '^[0-9a-fA-F-]{32,}$') -and
+            -not [string]::IsNullOrWhiteSpace($s.Id) -and
+            -not [string]::IsNullOrWhiteSpace($s.Cwd)) {
+            $snapList += , @{ id = $s.Id; cwd = $s.Cwd; name = $s.CwdName }
+        }
+    }
+    $snapSig = (@($snapList | ForEach-Object { $_.id }) -join '|')
+    if ($snapSig -ne $script:LiveSnapSig) {
+        $script:LiveSnapSig = $snapSig
+        try {
+            $tmp = $SnapPath + '.tmp'
+            @{ savedAt = (Get-Date).ToString('o'); sessions = $snapList } |
+                ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $tmp -Encoding UTF8
+            Move-Item -LiteralPath $tmp -Destination $SnapPath -Force
+        }
+        catch { }
     }
 
     # DIFF rendering: rows persist across ticks and only changed properties

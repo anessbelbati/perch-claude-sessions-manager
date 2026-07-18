@@ -1951,6 +1951,8 @@ $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
 $script:PillBirdA = $null       # visible face Image
 $script:PillBirdB = $null       # crossfade partner Image
+$script:BirdRingGrid = $null    # the 48px ring grid (grows to 68 mid-carry)
+$script:BirdImgGrid = $null     # the bird image wrapper (rides along)
 $script:BirdFaceKey = 'neutral'
 $script:BirdFaceHoldUntil = [datetime]::MinValue   # moment faces override state faces
 $script:PillAttCount = 0
@@ -1992,7 +1994,7 @@ if ($null -ne $script:LogoSource) {
                 $bfi = New-Object System.Windows.Media.Imaging.BitmapImage
                 $bfi.BeginInit()
                 $bfi.UriSource = New-Object System.Uri($bfF.FullName)
-                $bfi.DecodePixelWidth = 96
+                $bfi.DecodePixelWidth = 160   # crisp at the 68px carry size on scaled displays
                 $bfi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
                 $bfi.EndInit()
                 $bfi.Freeze()
@@ -2031,8 +2033,10 @@ if ($null -ne $script:LogoSource) {
     $birdImgGrid.RenderTransform = $birdTg
     $birdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
     [void]$birdGrid.Children.Add($birdImgGrid)
+    $script:BirdImgGrid = $birdImgGrid
 }
 [void]$pillRow.Children.Add($birdGrid)
+$script:BirdRingGrid = $birdGrid   # resized during a drag: the carried bird grows
 
 $pillClusterPanel = New-Object System.Windows.Controls.StackPanel
 $pillClusterPanel.Orientation = 'Horizontal'
@@ -4932,30 +4936,36 @@ $Window.Add_MouseMove({
         $script:BirdFaceHoldUntil = [datetime]::MaxValue
         Set-BirdFace 'grabbed' -Instant
     }
-    # you carry ONLY the bird: capsule, ring and counts vanish for the ride,
-    # leaving the scruff-grabbed kitten floating under your cursor
+    # you carry ONLY the bird - and he's the STAR: capsule, ring, counts and
+    # every margin vanish, and he grows to 68px. The window shrink-wraps to
+    # just the big scruff-grabbed cutie under your cursor.
     $script:PillDragDress = $null
     try {
         $script:PillDragDress = @{
             Bg = $script:PillCard.Background
             Border = $script:PillCard.BorderBrush
             Arc = $script:PillRingArc.Visibility
+            CardMargin = $script:PillCard.Margin
+            BarMargin = $script:PillBar.Margin
         }
         $script:PillCard.Background = [System.Windows.Media.Brushes]::Transparent
         $script:PillCard.BorderBrush = [System.Windows.Media.Brushes]::Transparent
         $script:PillRingTrack.Visibility = 'Collapsed'
         $script:PillRingArc.Visibility = 'Collapsed'
         if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Collapsed' }
+        $script:PillCard.Margin = New-Object System.Windows.Thickness(0)
+        $script:PillBar.Margin = New-Object System.Windows.Thickness(0)
+        if ($null -ne $script:BirdRingGrid) { $script:BirdRingGrid.Width = 68.0; $script:BirdRingGrid.Height = 68.0 }
+        if ($null -ne $script:BirdImgGrid) { $script:BirdImgGrid.Width = 68.0; $script:BirdImgGrid.Height = 68.0 }
     }
     catch { }
     # pinch him AT the cursor: DragMove keeps whatever offset you grabbed
-    # with, so snap the window first - the bird's scruff (x=38: card margin
-    # 8 + border 1 + bar margin 5 + bird center 24; y=20: just above his
-    # head) lands exactly under the pointer, wherever the press started
+    # with, so snap the window first - the scruff of the 68px carry bird
+    # (border 1 + center 34 = x 35; y ~11) lands exactly under the pointer
     try {
         $grabPos = $e.GetPosition($script:Window)
-        $script:Window.Left += $grabPos.X - 38.0
-        $script:Window.Top += $grabPos.Y - 20.0
+        $script:Window.Left += $grabPos.X - 35.0
+        $script:Window.Top += $grabPos.Y - 11.0
     }
     catch { }
     # flush layout + a render pass BEFORE the modal drag: without this the
@@ -4978,6 +4988,10 @@ $Window.Add_MouseMove({
                 $script:PillRingTrack.Visibility = 'Visible'
                 $script:PillRingArc.Visibility = $script:PillDragDress.Arc
                 if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Visible' }
+                $script:PillCard.Margin = $script:PillDragDress.CardMargin
+                $script:PillBar.Margin = $script:PillDragDress.BarMargin
+                if ($null -ne $script:BirdRingGrid) { $script:BirdRingGrid.Width = 48.0; $script:BirdRingGrid.Height = 48.0 }
+                if ($null -ne $script:BirdImgGrid) { $script:BirdImgGrid.Width = 40.0; $script:BirdImgGrid.Height = 40.0 }
             }
             catch { }
             $script:PillDragDress = $null

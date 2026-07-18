@@ -1948,6 +1948,14 @@ $script:BirdScale = $null       # transforms exist only if the logo loaded
 $script:BirdDozing = $false     # bird leans over asleep when everything's quiet
 $script:PrevDoneCount = 0       # done-count rises -> happy hop
 $script:PillWorkCount = 0       # gates the supervising head-tilt
+$script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
+$script:PillBirdA = $null       # visible face Image
+$script:PillBirdB = $null       # crossfade partner Image
+$script:BirdFaceKey = 'neutral'
+$script:BirdFaceHoldUntil = [datetime]::MinValue   # moment faces override state faces
+$script:PillAttCount = 0
+$script:PillErrCount = 0
+$script:PillDoneAll = $false
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 # bird-first geometry: left margin 5 puts the ring's center at x=30 - the
@@ -1974,12 +1982,41 @@ $script:PillRingArc.StrokeEndLineCap = 'Round'
 $script:PillRingArc.Visibility = 'Collapsed'
 [void]$birdGrid.Children.Add($script:PillRingArc)
 if ($null -ne $script:LogoSource) {
+    # FACE LIBRARY: assets/bird/bird-<state>.png keyed by <state>. Missing
+    # files silently fall back to the logo - the pack can be incomplete.
+    $script:BirdFaces = @{ neutral = $script:LogoSource }
+    try {
+        $bdir = Join-Path $PSScriptRoot 'assets\bird'
+        if (Test-Path -LiteralPath $bdir) {
+            foreach ($bfF in Get-ChildItem -LiteralPath $bdir -Filter 'bird-*.png' -ErrorAction SilentlyContinue) {
+                $bfi = New-Object System.Windows.Media.Imaging.BitmapImage
+                $bfi.BeginInit()
+                $bfi.UriSource = New-Object System.Uri($bfF.FullName)
+                $bfi.DecodePixelWidth = 96
+                $bfi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+                $bfi.EndInit()
+                $bfi.Freeze()
+                $script:BirdFaces[$bfF.BaseName.Substring(5)] = $bfi
+            }
+        }
+    }
+    catch { }
+    # two stacked Images = 120ms face crossfades; transforms ride on the
+    # wrapper grid so every motion moves whichever face is showing
+    $birdImgGrid = New-Object System.Windows.Controls.Grid
+    $birdImgGrid.Width = 40; $birdImgGrid.Height = 40
+    $birdImgGrid.HorizontalAlignment = 'Center'
+    $birdImgGrid.VerticalAlignment = 'Center'
     $pillBird = New-Object System.Windows.Controls.Image
     $pillBird.Source = $script:LogoSource
-    $pillBird.Width = 38; $pillBird.Height = 38
-    $pillBird.HorizontalAlignment = 'Center'
-    $pillBird.VerticalAlignment = 'Center'
     [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($pillBird, 'HighQuality')
+    $script:PillBirdA = $pillBird
+    $script:PillBirdB = New-Object System.Windows.Controls.Image
+    $script:PillBirdB.Opacity = 0.0
+    $script:PillBirdB.IsHitTestVisible = $false
+    [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($script:PillBirdB, 'HighQuality')
+    [void]$birdImgGrid.Children.Add($pillBird)
+    [void]$birdImgGrid.Children.Add($script:PillBirdB)
     # the bird LIVES: scale (perk, squash) + rotate (doze lean, head tilt) +
     # translate (hop). All render-only, all event-driven moments - no loops,
     # no idle cost. Origin near the feet so tilts read as LEANING and hops
@@ -1991,9 +2028,9 @@ if ($null -ne $script:LogoSource) {
     [void]$birdTg.Children.Add($script:BirdScale)
     [void]$birdTg.Children.Add($script:BirdRot)
     [void]$birdTg.Children.Add($script:BirdShift)
-    $pillBird.RenderTransform = $birdTg
-    $pillBird.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
-    [void]$birdGrid.Children.Add($pillBird)
+    $birdImgGrid.RenderTransform = $birdTg
+    $birdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
+    [void]$birdGrid.Children.Add($birdImgGrid)
 }
 [void]$pillRow.Children.Add($birdGrid)
 
@@ -2079,6 +2116,7 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         $script:BirdDozing = $false
         Invoke-BirdMotion 'wake'
     }
+    Update-BirdFace
     if ($script:Compact -and -not $script:PillPeeked) {
         $tip = @()
         if ($Att -gt 0) { $tip += "$Att need you" }
@@ -2212,6 +2250,57 @@ function Invoke-BirdMotion([string]$Kind) {
     catch { }
 }
 
+function Set-BirdFace([string]$Key) {
+    # swap the bird's ART to a state face - 120ms crossfade when the pill
+    # is on screen, instant when it isn't. Unknown keys fall back to logo.
+    if ($null -eq $script:PillBirdA) { return }
+    $src = $script:BirdFaces[$Key]
+    if ($null -eq $src) { $src = $script:BirdFaces['neutral']; $Key = 'neutral' }
+    if ($null -eq $src -or $script:BirdFaceKey -eq $Key) { return }
+    $script:BirdFaceKey = $Key
+    try {
+        $opProp = [System.Windows.UIElement]::OpacityProperty
+        if (-not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')) {
+            $script:PillBirdB.BeginAnimation($opProp, $null)
+            $script:PillBirdB.Opacity = 0.0
+            $script:PillBirdA.Source = $src
+            return
+        }
+        $script:PillBirdB.Source = $src
+        $fadeK = $Key
+        $fade = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
+            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(120))))
+        $done = {
+            try {
+                if ($script:BirdFaceKey -eq $fadeK) {
+                    $script:PillBirdA.Source = $script:PillBirdB.Source
+                }
+                $script:PillBirdB.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                $script:PillBirdB.Opacity = 0.0
+            }
+            catch { }
+        }.GetNewClosure()
+        $fade.Add_Completed($done)
+        $script:PillBirdB.BeginAnimation($opProp, $fade)
+    }
+    catch { }
+}
+
+function Update-BirdFace {
+    # dominant-status face, lowest to highest priority - later wins. Moment
+    # faces (wave/happy/launch/grabbed/hatch) override via BirdFaceHoldUntil.
+    if ((Get-Date) -lt $script:BirdFaceHoldUntil) { return }
+    $key = 'neutral'
+    if ($script:BirdDozing) { $key = 'sleep' }
+    if ($script:PillWorkCount -gt 0) { $key = 'focused' }
+    if ($script:PillDoneAll) { $key = 'crown' }
+    if ([double]$script:Pill5hPct -ge 90.0) { $key = 'hot' }
+    if ($script:PillErrCount -gt 0) { $key = 'worried' }
+    if ($script:PillAttCount -gt 0) { $key = 'alert' }
+    if ([double]$script:Pill5hPct -ge 99.5) { $key = 'knocked' }
+    Set-BirdFace $key
+}
+
 function Invoke-JumpToAtt {
     # red = jump, everywhere: the pill's red count and the 'need you' chip
     # both land you in the LONGEST-WAITING attention session's terminal.
@@ -2219,6 +2308,14 @@ function Invoke-JumpToAtt {
     # probes and a UIA tab walk, seconds of blocked UI thread.
     $sess = $script:PillAttTarget
     if ($null -eq $sess -or $script:FocusBusy) { return }
+    # aviator moment: show the takeoff face and FLUSH a render pass before
+    # the focus dance blocks the UI thread - otherwise it appears after
+    if ($null -ne $script:BirdFaces['launch'] -and $null -ne $script:PillBirdA) {
+        $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(1500)
+        $script:BirdFaceKey = 'launch'
+        $script:PillBirdA.Source = $script:BirdFaces['launch']
+        try { $script:Window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render) } catch { }
+    }
     if ([string]$sess.Id -eq $script:LastFocusId -and
         ((Get-Date) - $script:LastFocusStamp).TotalMilliseconds -lt 1500) { return }
     $script:FocusBusy = $true
@@ -2559,6 +2656,10 @@ function Clear-PillAnimations {
             $script:BirdRot.Angle = $(if ($script:BirdDozing) { -10.0 } else { 0.0 })
             $script:BirdShift.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null)
             $script:BirdShift.Y = 0.0
+            if ($null -ne $script:PillBirdB) {
+                $script:PillBirdB.BeginAnimation($opProp, $null)
+                $script:PillBirdB.Opacity = 0.0
+            }
         }
     }
     catch { }
@@ -2616,6 +2717,43 @@ $script:BirdTiltTimer.Add_Tick({
     catch { }
 })
 $script:BirdTiltTimer.Start()
+# the blink: every 4-9s, the neutral face closes its eyes for 140ms. Direct
+# Source swaps (no crossfade) - a blink IS a hard cut. Only on the neutral
+# face: blinking away the glasses/hat/props of other faces reads as a glitch.
+$script:BirdUnblinkTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:BirdUnblinkTimer.Interval = [TimeSpan]::FromMilliseconds(140)
+$script:BirdUnblinkTimer.Add_Tick({
+    $script:BirdUnblinkTimer.Stop()
+    try {
+        if ($script:BirdFaceKey -eq 'neutral' -and $null -ne $script:PillBirdA) {
+            $script:PillBirdA.Source = $script:BirdFaces['neutral']
+        }
+    }
+    catch { }
+})
+$script:BirdBlinkTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:BirdBlinkTimer.Interval = [TimeSpan]::FromSeconds(6)
+$script:BirdBlinkTimer.Add_Tick({
+    try {
+        $script:BirdBlinkTimer.Interval = [TimeSpan]::FromMilliseconds((Get-Random -Minimum 4000 -Maximum 9000))
+        if ($script:Compact -and $script:PillCard.Visibility -eq 'Visible' -and
+            $script:BirdFaceKey -eq 'neutral' -and $null -ne $script:BirdFaces['blink'] -and
+            $null -ne $script:PillBirdA -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
+            $script:PillBirdA.Source = $script:BirdFaces['blink']
+            $script:BirdUnblinkTimer.Stop()
+            $script:BirdUnblinkTimer.Start()
+        }
+    }
+    catch { }
+})
+$script:BirdBlinkTimer.Start()
+# boot = hatch: he arrives in his egg, then the first tick hatches him into
+# whatever the day actually looks like
+if ($null -ne $script:BirdFaces['hatch'] -and $null -ne $script:PillBirdA) {
+    $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2200)
+    $script:BirdFaceKey = 'hatch'
+    $script:PillBirdA.Source = $script:BirdFaces['hatch']
+}
 $script:BirdGreetStamp = [datetime]::MinValue
 $script:PillHoverEnter = {
     if ($script:Compact) {
@@ -2625,6 +2763,10 @@ $script:PillHoverEnter = {
             ((Get-Date) - $script:BirdGreetStamp).TotalMilliseconds -gt 2200) {
             $script:BirdGreetStamp = Get-Date
             Invoke-BirdMotion 'greet'
+            if ($null -ne $script:BirdFaces['wave'] -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
+                $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(1100)
+                Set-BirdFace 'wave'
+            }
         }
         $script:PillCloseTimer.Stop()
         $script:PillPeekTimer.Stop()
@@ -4701,8 +4843,17 @@ function Update-List {
             if ($chip.Visibility -ne 'Visible') { $chip.Visibility = 'Visible' }
         }
     }
+    $script:PillAttCount = $att
+    $script:PillErrCount = @($visible | Where-Object { $_.Status -in @('error', 'retrying') }).Count
+    $script:PillDoneAll = ($done -gt 0 -and $att -eq 0 -and $work -eq 0)
     Update-PillCluster $att $work $done $quiet
-    if ($done -gt $script:PrevDoneCount) { Invoke-BirdMotion 'hop' }   # work finished!
+    if ($done -gt $script:PrevDoneCount) {
+        Invoke-BirdMotion 'hop'   # work finished!
+        if ($null -ne $script:BirdFaces['happy']) {
+            $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)
+            Set-BirdFace 'happy'
+        }
+    }
     $script:PrevDoneCount = $done
 
     # resurface the HUD when a session NEWLY needs attention
@@ -4796,10 +4947,15 @@ $Window.Add_MouseMove({
     try { $cur = $script:Window.PointToScreen($e.GetPosition($script:Window)) } catch { return }
     if ([Math]::Abs($cur.X - $script:PillPressPt.X) -lt 4 -and
         [Math]::Abs($cur.Y - $script:PillPressPt.Y) -lt 4) { return }
-    # it's a DRAG: fold to the pill first, then move the pill
+    # it's a DRAG: fold to the pill first, then move the pill - and the
+    # bird gets scruff-grabbed like a kitten for the ride
     $script:PillPressActive = $false
     try { $script:Window.ReleaseMouseCapture() } catch { }
     Set-PillFoldInstant
+    if ($null -ne $script:BirdFaces['grabbed']) {
+        $script:BirdFaceHoldUntil = [datetime]::MaxValue
+        Set-BirdFace 'grabbed'
+    }
     $script:PillDragging = $true
     try { $script:Window.DragMove() } catch { }
     finally {
@@ -4807,6 +4963,8 @@ $Window.Add_MouseMove({
         $script:PillDragEnd = Get-Date
         try { $script:PillPeekTimer.Stop() } catch { }
         Save-HudState   # parked = remembered, even if perch dies uncleanly
+        $script:BirdFaceHoldUntil = [datetime]::MinValue
+        Update-BirdFace
         Invoke-BirdMotion 'settle'
     }
 })

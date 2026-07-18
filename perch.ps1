@@ -2250,9 +2250,12 @@ function Invoke-BirdMotion([string]$Kind) {
     catch { }
 }
 
-function Set-BirdFace([string]$Key) {
-    # swap the bird's ART to a state face - 120ms crossfade when the pill
-    # is on screen, instant when it isn't. Unknown keys fall back to logo.
+function Set-BirdFace([string]$Key, [switch]$Instant) {
+    # swap the bird's ART to a state face. The NEW face lands on the visible
+    # Image IMMEDIATELY; the old face fades out on the overlay Image. A
+    # killed animation can only cut the goodbye short - it can never strand
+    # a stale face (v1 adopted the new face in Completed, and any
+    # Clear-PillAnimations mid-fade left the bird stuck forever).
     if ($null -eq $script:PillBirdA) { return }
     $src = $script:BirdFaces[$Key]
     if ($null -eq $src) { $src = $script:BirdFaces['neutral']; $Key = 'neutral' }
@@ -2260,27 +2263,25 @@ function Set-BirdFace([string]$Key) {
     $script:BirdFaceKey = $Key
     try {
         $opProp = [System.Windows.UIElement]::OpacityProperty
-        if (-not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')) {
-            $script:PillBirdB.BeginAnimation($opProp, $null)
+        $old = $script:PillBirdA.Source
+        $script:PillBirdB.BeginAnimation($opProp, $null)
+        $script:PillBirdA.Source = $src
+        if ($Instant -or $null -eq $old -or
+            -not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')) {
             $script:PillBirdB.Opacity = 0.0
-            $script:PillBirdA.Source = $src
             return
         }
-        $script:PillBirdB.Source = $src
-        $fadeK = $Key
-        $fade = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
+        $script:PillBirdB.Source = $old
+        $script:PillBirdB.Opacity = 1.0
+        $fade = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.0,
             (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(120))))
-        $done = {
+        $fade.Add_Completed({
             try {
-                if ($script:BirdFaceKey -eq $fadeK) {
-                    $script:PillBirdA.Source = $script:PillBirdB.Source
-                }
                 $script:PillBirdB.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
                 $script:PillBirdB.Opacity = 0.0
             }
             catch { }
-        }.GetNewClosure()
-        $fade.Add_Completed($done)
+        })
         $script:PillBirdB.BeginAnimation($opProp, $fade)
     }
     catch { }
@@ -2296,7 +2297,10 @@ function Update-BirdFace {
     if ($script:PillDoneAll) { $key = 'crown' }
     if ([double]$script:Pill5hPct -ge 90.0) { $key = 'hot' }
     if ($script:PillErrCount -gt 0) { $key = 'worried' }
-    if ($script:PillAttCount -gt 0) { $key = 'alert' }
+    # NOTE: no permanent 'alert' - attention almost always exists, and a
+    # permanently shocked bird reads as a bug. Fresh attention holds the
+    # alert face for 45s from the hasNew pulse instead; the red count and
+    # the chips carry the standing state.
     if ([double]$script:Pill5hPct -ge 99.5) { $key = 'knocked' }
     Set-BirdFace $key
 }
@@ -4868,6 +4872,10 @@ function Update-List {
     if ($hasNew) {
         Invoke-AttentionRaise
         Invoke-BirdMotion 'perk'
+        if ($null -ne $script:BirdFaces['alert']) {
+            $script:BirdFaceHoldUntil = (Get-Date).AddSeconds(45)
+            Set-BirdFace 'alert'
+        }
     }
     $script:PrevAttention = $curAtt
 
@@ -4954,8 +4962,16 @@ $Window.Add_MouseMove({
     Set-PillFoldInstant
     if ($null -ne $script:BirdFaces['grabbed']) {
         $script:BirdFaceHoldUntil = [datetime]::MaxValue
-        Set-BirdFace 'grabbed'
+        Set-BirdFace 'grabbed' -Instant
     }
+    # flush layout + a render pass BEFORE the modal drag: without this the
+    # layered window drags STALE pixels - the old open island ghosting
+    # behind the pill for the whole ride
+    try {
+        $script:Window.UpdateLayout()
+        $script:Window.Dispatcher.Invoke([Action]{}, [System.Windows.Threading.DispatcherPriority]::Render)
+    }
+    catch { }
     $script:PillDragging = $true
     try { $script:Window.DragMove() } catch { }
     finally {

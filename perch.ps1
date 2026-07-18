@@ -4948,6 +4948,16 @@ $Window.Add_MouseMove({
         if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Collapsed' }
     }
     catch { }
+    # pinch him AT the cursor: DragMove keeps whatever offset you grabbed
+    # with, so snap the window first - the bird's scruff (x=38: card margin
+    # 8 + border 1 + bar margin 5 + bird center 24; y=20: just above his
+    # head) lands exactly under the pointer, wherever the press started
+    try {
+        $grabPos = $e.GetPosition($script:Window)
+        $script:Window.Left += $grabPos.X - 38.0
+        $script:Window.Top += $grabPos.Y - 20.0
+    }
+    catch { }
     # flush layout + a render pass BEFORE the modal drag: without this the
     # layered window drags STALE pixels - the old open island ghosting
     # behind the pill for the whole ride

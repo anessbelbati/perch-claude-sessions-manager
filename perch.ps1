@@ -2133,7 +2133,10 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         if ($Done -gt 0) { $tip += "$Done done" }
         if ($Quiet -gt 0) { $tip += "$Quiet quiet" }
         if ($tip.Count -eq 0) { $tip = @('all quiet') }
-        $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = peek, again = full'
+        if ([double]$script:Pill5hPct -ge 0) {
+            $tip += ('5h {0:0}%' -f [double]$script:Pill5hPct)
+        }
+        $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
     }
 }
@@ -2527,7 +2530,7 @@ function Set-CompactMode([bool]$On) {
         $script:PillCard.Visibility = 'Visible'
         $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
-        $script:MiniBtn.ToolTip = 'expand (click the pill: peek, click again: full)'
+        $script:MiniBtn.ToolTip = 'expand (or just click the pill)'
         # folding a quiet HUD: the bird should already be asleep AND breathing
         if ($script:BirdDozing) { Invoke-BirdMotion 'doze' }
     }
@@ -5075,15 +5078,12 @@ $Window.Add_MouseLeftButtonUp({
     $script:PillPressActive = $false
     try { $script:Window.ReleaseMouseCapture() } catch { }
     if ($script:Compact) {
-        # the ladder: pill -> peek -> full. One rung per click.
-        if ($script:PillPressWasPeeked) {
-            $script:PillExpandStamp = Get-Date
-            Set-CompactMode $false
-            Save-HudState
-        }
-        else {
-            Set-PillPeek $true
-        }
+        # ONE rung: click = full view. The peek middle-state was redundant -
+        # everything it showed, the full card shows better, and the pill's
+        # tooltip carries the limits glance for free.
+        $script:PillExpandStamp = Get-Date
+        Set-CompactMode $false
+        Save-HudState
     }
 })
 function Save-HudState {

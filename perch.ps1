@@ -1685,7 +1685,7 @@ $xaml = @"
   <!-- the resting pill is its OWN tiny card, not a squeezed RootCard: the
        peek morph is a pure crossfade between the two (render-only, no
        per-frame layout, no window-rect animation - THAT was the jank) -->
-  <Border x:Name="PillCard" CornerRadius="29" BorderThickness="1" Margin="8"
+  <Border x:Name="PillCard" CornerRadius="28" BorderThickness="1" Margin="8"
           HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed"/>
   </Grid>
 </Window>
@@ -1958,12 +1958,15 @@ $script:BirdFaceHoldUntil = [datetime]::MinValue   # moment faces override state
 $script:PillAttCount = 0
 $script:PillErrCount = 0
 $script:PillDoneAll = $false
+$script:CarryAngle = 0.0        # pendulum state while you carry him
+$script:CarryAngVel = 0.0
+$script:CarryLastX = 0.0
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
-# bird-first geometry: left margin 5 puts the ring's center at x=30 - the
-# same center as the capsule's left cap (CR 29), so the bird's ring IS the
-# pill's left end. Everything else orbits him.
-$script:PillBar.Margin = New-Object System.Windows.Thickness(5, 4, 14, 4)
+# bird-first geometry, packed TIGHT: left margin 3 puts the ring's center
+# at x=28 - the same center as the capsule's left cap (CR 28), so the
+# bird's ring IS the pill's left end. Everything else orbits him, close.
+$script:PillBar.Margin = New-Object System.Windows.Thickness(3, 3, 10, 3)
 $script:PillBar.Background = [System.Windows.Media.Brushes]::Transparent
 $script:PillBar.Visibility = 'Collapsed'
 $pillRow = New-Object System.Windows.Controls.StackPanel
@@ -2749,6 +2752,25 @@ $script:BirdBlinkTimer.Add_Tick({
     catch { }
 })
 $script:BirdBlinkTimer.Start()
+# CARRY PHYSICS: while you drag him, a 30ms sampler reads the window's
+# horizontal velocity and drives a spring-damped pendulum - he tilts
+# against the motion, overshoots, and wobbles back when you stop. The
+# dispatcher pumps timers during DragMove, so this runs mid-carry.
+$script:CarrySwingTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:CarrySwingTimer.Interval = [TimeSpan]::FromMilliseconds(30)
+$script:CarrySwingTimer.Add_Tick({
+    try {
+        if (-not $script:PillDragging) { $script:CarrySwingTimer.Stop(); return }
+        $x = $script:Window.Left
+        $vx = ($x - $script:CarryLastX) / 0.03
+        $script:CarryLastX = $x
+        $target = [Math]::Max(-38.0, [Math]::Min(38.0, $vx * -0.045))
+        $script:CarryAngVel += (($target - $script:CarryAngle) * 140.0 - $script:CarryAngVel * 7.5) * 0.03
+        $script:CarryAngle += $script:CarryAngVel * 0.03
+        if ($null -ne $script:BirdRot) { $script:BirdRot.Angle = $script:CarryAngle }
+    }
+    catch { }
+})
 # boot = hatch: he arrives in his egg, then the first tick hatches him into
 # whatever the day actually looks like
 if ($null -ne $script:BirdFaces['hatch'] -and $null -ne $script:PillBirdA) {
@@ -4968,6 +4990,21 @@ $Window.Add_MouseMove({
         $script:Window.Top += $grabPos.Y - 11.0
     }
     catch { }
+    # dangle physics: pivot at the scruff, kill any held rotation animation,
+    # zero the spring, start the sampler
+    try {
+        if ($null -ne $script:BirdRot) {
+            $script:BirdRot.BeginAnimation([System.Windows.Media.RotateTransform]::AngleProperty, $null)
+        }
+        if ($null -ne $script:BirdImgGrid) {
+            $script:BirdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.08)
+        }
+        $script:CarryLastX = $script:Window.Left
+        $script:CarryAngle = 0.0
+        $script:CarryAngVel = 0.0
+        $script:CarrySwingTimer.Start()
+    }
+    catch { }
     # flush layout + a render pass BEFORE the modal drag: without this the
     # layered window drags STALE pixels - the old open island ghosting
     # behind the pill for the whole ride
@@ -4980,6 +5017,16 @@ $Window.Add_MouseMove({
     try { $script:Window.DragMove() } catch { }
     finally {
         $script:PillDragging = $false
+        try { $script:CarrySwingTimer.Stop() } catch { }
+        try {
+            if ($null -ne $script:BirdImgGrid) {
+                $script:BirdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
+            }
+            if ($null -ne $script:BirdRot) {
+                $script:BirdRot.Angle = $(if ($script:BirdDozing) { -10.0 } else { 0.0 })
+            }
+        }
+        catch { }
         $script:PillDragEnd = Get-Date
         if ($null -ne $script:PillDragDress) {
             try {

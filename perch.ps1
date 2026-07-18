@@ -1965,6 +1965,10 @@ $script:PillDoneAll = $false
 $script:CarryAngle = 0.0        # pendulum state while you carry him
 $script:CarryAngVel = 0.0
 $script:CarryLastX = 0.0
+$script:CarryFlips = 0          # shake detector: fast direction flips -> he swears
+$script:CarryLastSign = 0
+$script:CarryFlipStamp = [datetime]::MinValue
+$script:BirdBoopCount = 0       # boop-spam detector: pester the cooldown -> he swears
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 # bird-first geometry, packed TIGHT: left margin 3 puts the ring's center
@@ -2055,8 +2059,24 @@ $script:BirdGreetStamp = [datetime]::MinValue
 $script:BirdRingGrid.Add_MouseEnter({
     try {
         if (-not $script:Compact -or $script:PillDragging -or $script:PillPressActive) { return }
+        if (((Get-Date) - $script:BirdGreetStamp).TotalSeconds -lt 8) {
+            # pestering him during the cooldown - he's counting. Four boops
+            # and he LOSES IT: grawlix rant + furious feather shake. Works
+            # from sleep too (waking him repeatedly EARNS the cussing) -
+            # but keep the body asleep then: face swears, lean stays.
+            $script:BirdBoopCount++
+            if ($script:BirdBoopCount -ge 4 -and $null -ne $script:BirdFaces['cursing'] -and
+                (Get-Date) -ge $script:BirdFaceHoldUntil) {
+                $script:BirdBoopCount = 0
+                $script:BirdGreetStamp = Get-Date
+                Set-BirdFace 'cursing'
+                $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)
+                if (-not $script:BirdDozing) { Invoke-BirdMotion 'ruffle' }
+            }
+            return
+        }
         if ((Get-Date) -lt $script:BirdFaceHoldUntil) { return }
-        if (((Get-Date) - $script:BirdGreetStamp).TotalSeconds -lt 8) { return }
+        $script:BirdBoopCount = 0
         $script:BirdGreetStamp = Get-Date
         if ($script:BirdDozing) {
             if ($null -ne $script:BirdFaces['drowsy']) {
@@ -2917,6 +2937,24 @@ $script:CarrySwingTimer.Add_Tick({
             $j = [Math]::Min(0.18, [Math]::Abs($script:CarryAngVel) * 0.00055)
             $script:BirdScale.ScaleY = 1.0 + $j
             $script:BirdScale.ScaleX = 1.0 - ($j * 0.5)
+        }
+        # SHAKE detection: violent direction flips in quick succession =
+        # you're rattling the poor birb. Four fast flips and he starts
+        # SWEARING at you mid-dangle (grawlix face, if the art exists) -
+        # direct Source set, same as the grab face: holds rule mid-carry
+        if ([Math]::Abs($vx) -gt 900) {
+            $sign = [Math]::Sign($vx)
+            if ($sign -ne $script:CarryLastSign) {
+                if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 900) { $script:CarryFlips = 0 }
+                $script:CarryFlips++
+                $script:CarryFlipStamp = Get-Date
+                $script:CarryLastSign = $sign
+                if ($script:CarryFlips -ge 4 -and $script:BirdFaceKey -ne 'cursing' -and
+                    $null -ne $script:BirdFaces['cursing'] -and $null -ne $script:PillBirdA) {
+                    $script:BirdFaceKey = 'cursing'
+                    $script:PillBirdA.Source = $script:BirdFaces['cursing']
+                }
+            }
         }
     }
     catch { }
@@ -5178,6 +5216,8 @@ $Window.Add_MouseMove({
         $script:CarryLastX = $script:Window.Left
         $script:CarryAngle = 0.0
         $script:CarryAngVel = 0.0
+        $script:CarryFlips = 0
+        $script:CarryLastSign = 0
         $script:CarrySwingTimer.Start()
     }
     catch { }

@@ -50,6 +50,7 @@ Prompt template (paste with logo.png attached):
 | 13 | `bird-offline.png` | offline / local-estimate mode | lost explorer: tiny antenna hat with a bold red no-signal X above it, squinting hard at a small folded paper map held in both wings, one brow-feather furrowed |
 | 14 | `bird-crown.png` | EVERY session done, zero waiting | absolute monarch: golden crown, tiny royal-purple cape draped over his shoulders, chest puffed to the limit, eyes smugly half-lidded, the most self-satisfied face physically possible |
 | 15 | `bird-launch.png` | red-dot click (jump to terminal) | takeoff: tiny aviator goggles strapped on, a little red scarf trailing behind, body leaned forward into a superhero launch pose, two speed lines behind him |
+| 20 | `bird-cursing.png` | you PESTERED him (boop-spam the hover, or SHAKE him mid-carry) | absolutely losing it: brow-feathers slanted down hard in fury, eyes squeezed into enraged >< shapes, beak wide open mid-rant, deep red flush, a steam puff popping off his head, one wing raised shaking a tiny clenched fist, and a chunky comic speech bubble CLOSE to his head with bold grawlix: @#$%&! — TRIGGERS ALREADY WIRED, lights up the moment this file lands |
 
 ## sprite tier (frame pairs + transitions — real animation, cheaply)
 

@@ -1685,7 +1685,7 @@ $xaml = @"
   <!-- the resting pill is its OWN tiny card, not a squeezed RootCard: the
        peek morph is a pure crossfade between the two (render-only, no
        per-frame layout, no window-rect animation - THAT was the jank) -->
-  <Border x:Name="PillCard" CornerRadius="28" BorderThickness="1" Margin="8"
+  <Border x:Name="PillCard" CornerRadius="30" BorderThickness="1" Margin="8"
           HorizontalAlignment="Left" VerticalAlignment="Top" Visibility="Collapsed"/>
   </Grid>
 </Window>
@@ -1964,8 +1964,9 @@ $script:CarryLastX = 0.0
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 # bird-first geometry, packed TIGHT: left margin 3 puts the ring's center
-# at x=28 - the same center as the capsule's left cap (CR 28), so the
-# bird's ring IS the pill's left end. Everything else orbits him, close.
+# at x=30 - the same center as the capsule's left cap (CR 30), so the
+# bird's ring IS the pill's left end. The bird's image box fills the ring
+# (art padding is the only gap) - no dead space around the cutie.
 $script:PillBar.Margin = New-Object System.Windows.Thickness(3, 3, 10, 3)
 $script:PillBar.Background = [System.Windows.Media.Brushes]::Transparent
 $script:PillBar.Visibility = 'Collapsed'
@@ -1974,7 +1975,7 @@ $pillRow.Orientation = 'Horizontal'
 $pillRow.VerticalAlignment = 'Center'
 
 $birdGrid = New-Object System.Windows.Controls.Grid
-$birdGrid.Width = 48; $birdGrid.Height = 48
+$birdGrid.Width = 52; $birdGrid.Height = 52
 $script:PillRingTrack = New-Object System.Windows.Shapes.Ellipse
 $script:PillRingTrack.Stroke = Get-Brush '#1EFFFFFF'
 $script:PillRingTrack.StrokeThickness = 2.8
@@ -2009,7 +2010,7 @@ if ($null -ne $script:LogoSource) {
     # two stacked Images = 120ms face crossfades; transforms ride on the
     # wrapper grid so every motion moves whichever face is showing
     $birdImgGrid = New-Object System.Windows.Controls.Grid
-    $birdImgGrid.Width = 40; $birdImgGrid.Height = 40
+    $birdImgGrid.Width = 52; $birdImgGrid.Height = 52   # fills the ring - art padding is the gap
     $birdImgGrid.HorizontalAlignment = 'Center'
     $birdImgGrid.VerticalAlignment = 'Center'
     $pillBird = New-Object System.Windows.Controls.Image
@@ -2353,20 +2354,20 @@ function Update-PillRing {
         return
     }
     $script:PillRingArc.Stroke = Get-Brush $script:Pill5hHex
-    $r = 22.6
+    $r = 24.6
     if ($pct -ge 99.5) {
         # a closed arc is degenerate geometry - full circle gets an ellipse
         $eg = New-Object System.Windows.Media.EllipseGeometry(
-            (New-Object System.Windows.Point(24, 24)), $r, $r)
+            (New-Object System.Windows.Point(26, 26)), $r, $r)
         $eg.Freeze()
         $script:PillRingArc.Data = $eg
     }
     else {
         $ang = [Math]::Max(0.02, $pct / 100.0) * 2.0 * [Math]::PI
         $fig = New-Object System.Windows.Media.PathFigure
-        $fig.StartPoint = New-Object System.Windows.Point(24.0, (24.0 - $r))
+        $fig.StartPoint = New-Object System.Windows.Point(26.0, (26.0 - $r))
         $arc = New-Object System.Windows.Media.ArcSegment(
-            (New-Object System.Windows.Point((24.0 + $r * [Math]::Sin($ang)), (24.0 - $r * [Math]::Cos($ang)))),
+            (New-Object System.Windows.Point((26.0 + $r * [Math]::Sin($ang)), (26.0 - $r * [Math]::Cos($ang)))),
             (New-Object System.Windows.Size($r, $r)),
             0, ($pct -gt 50), 'Clockwise', $true)
         [void]$fig.Segments.Add($arc)
@@ -5056,8 +5057,8 @@ $Window.Add_MouseMove({
                 if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Visible' }
                 $script:PillCard.Margin = $script:PillDragDress.CardMargin
                 $script:PillBar.Margin = $script:PillDragDress.BarMargin
-                if ($null -ne $script:BirdRingGrid) { $script:BirdRingGrid.Width = 48.0; $script:BirdRingGrid.Height = 48.0 }
-                if ($null -ne $script:BirdImgGrid) { $script:BirdImgGrid.Width = 40.0; $script:BirdImgGrid.Height = 40.0 }
+                if ($null -ne $script:BirdRingGrid) { $script:BirdRingGrid.Width = 52.0; $script:BirdRingGrid.Height = 52.0 }
+                if ($null -ne $script:BirdImgGrid) { $script:BirdImgGrid.Width = 52.0; $script:BirdImgGrid.Height = 52.0 }
             }
             catch { }
             $script:PillDragDress = $null

@@ -2045,6 +2045,35 @@ if ($null -ne $script:LogoSource) {
 }
 [void]$pillRow.Children.Add($birdGrid)
 $script:BirdRingGrid = $birdGrid   # resized during a drag: the carried bird grows
+# HOVER = he NOTICES you. The law stands - hover opens NOTHING - but the
+# bird is a creature, not a button: pass the cursor over HIM and he waves
+# hello (wink, chirp, tiny bounce). Do it while he's asleep and he cracks
+# one eye open (drowsy frame), clocks you, and drifts back off - the doze
+# lean and the breathing never stop. Cooldown so a restless cursor doesn't
+# turn him into a metronome; moment faces (grabbed/launch/alert...) win.
+$script:BirdGreetStamp = [datetime]::MinValue
+$script:BirdRingGrid.Add_MouseEnter({
+    try {
+        if (-not $script:Compact -or $script:PillDragging -or $script:PillPressActive) { return }
+        if ((Get-Date) -lt $script:BirdFaceHoldUntil) { return }
+        if (((Get-Date) - $script:BirdGreetStamp).TotalSeconds -lt 8) { return }
+        $script:BirdGreetStamp = Get-Date
+        if ($script:BirdDozing) {
+            if ($null -ne $script:BirdFaces['drowsy']) {
+                Set-BirdFace 'drowsy'
+                $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(1200)
+            }
+        }
+        else {
+            if ($null -ne $script:BirdFaces['wave']) {
+                Set-BirdFace 'wave'
+                $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(1800)
+            }
+            Invoke-BirdMotion 'greet'
+        }
+    }
+    catch { }
+})
 
 $pillClusterPanel = New-Object System.Windows.Controls.StackPanel
 $pillClusterPanel.Orientation = 'Horizontal'

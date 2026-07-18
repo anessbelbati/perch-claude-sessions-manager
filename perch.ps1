@@ -2080,6 +2080,7 @@ $pillZzz.Visibility = 'Collapsed'
 $script:PillCluster['zzz'] = $pillZzz
 [void]$pillClusterPanel.Children.Add($pillZzz)
 [void]$pillRow.Children.Add($pillClusterPanel)
+$script:PillClusterPanel = $pillClusterPanel   # hidden during a drag: you carry ONLY the bird
 [void]$script:PillBar.Children.Add($pillRow)
 $script:PillBar.Visibility = 'Visible'   # PillCard's visibility is the gate now
 $script:PillCard.Child = $script:PillBar
@@ -2124,7 +2125,7 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
         if ($Done -gt 0) { $tip += "$Done done" }
         if ($Quiet -gt 0) { $tip += "$Quiet quiet" }
         if ($tip.Count -eq 0) { $tip = @('all quiet') }
-        $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = full view'
+        $tipText = ($tip -join $script:Sep) + $script:Dash + 'click = peek, again = full'
         if ([string]$script:PillBar.ToolTip -ne $tipText) { $script:PillBar.ToolTip = $tipText }
     }
 }
@@ -2518,7 +2519,7 @@ function Set-CompactMode([bool]$On) {
         $script:PillCard.Visibility = 'Visible'
         $script:Window.SizeToContent = 'WidthAndHeight'
         $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
-        $script:MiniBtn.ToolTip = 'expand (or just click the pill)'
+        $script:MiniBtn.ToolTip = 'expand (click the pill: peek, click again: full)'
         # folding a quiet HUD: the bird should already be asleep AND breathing
         if ($script:BirdDozing) { Invoke-BirdMotion 'doze' }
     }
@@ -2570,6 +2571,9 @@ function Set-PillPeek([bool]$On) {
     $opProp = [System.Windows.UIElement]::OpacityProperty
     if ($On) {
         $script:PillBar.ToolTip = $null   # the open card IS the tooltip
+        $script:PillCloseTimer.Interval = [TimeSpan]::FromSeconds(5)
+        $script:PillCloseTimer.Stop()
+        $script:PillCloseTimer.Start()    # the peek closes itself; clicks are the only opener
         $script:RootCard.Opacity = 0.0
         $script:RootCard.Visibility = 'Visible'   # single hwnd grow via SizeToContent
         $durIn = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(170))
@@ -2599,6 +2603,7 @@ function Set-PillPeek([bool]$On) {
         $script:PillCard.BeginAnimation($opProp, $pillOut)
     }
     else {
+        $script:PillCloseTimer.Stop()
         $script:PillCard.Visibility = 'Visible'
         $script:PillCard.Opacity = 0.0
         $durOut = New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(130))
@@ -2669,39 +2674,28 @@ function Clear-PillAnimations {
     catch { }
 }
 
-# peek opens after a beat (220ms) so drive-by mouse passes don't twitch the
-# pill. Closing is DEBOUNCED too: the open-resize itself fires a spurious
-# MouseLeave mid-layout, and closing on it made the island oscillate
-# open/closed under a perfectly still cursor - the close timer re-checks
-# IsMouseOver after layout settles and only collapses if the mouse is
-# genuinely gone.
+# CLICK-DRIVEN peek (hover triggers NOTHING - the user hated the pill
+# changing state under a passing cursor): click the pill = peek opens,
+# click the peek = full view. The peek closes ITSELF a few seconds after
+# you leave it - the timer only ever closes, never opens, and it extends
+# politely while the cursor is still reading the card.
 $script:PillDragging = $false   # DragMove() pumps a nested message loop, so
-                                # these timers TICK DURING A DRAG - without
-                                # this flag the peek opens in your hand mid-drag
-$script:PillDragEnd = [datetime]::MinValue   # capture release can fire a synthetic
-                                             # MouseEnter right after the drop; the
-                                             # cooldown keeps a parked pill a pill
-$script:PillPeekTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:PillPeekTimer.Interval = [TimeSpan]::FromMilliseconds(220)
-$script:PillPeekTimer.Add_Tick({
-    $script:PillPeekTimer.Stop()
-    try {
-        if ($script:Compact -and -not $script:PillDragging -and
-            ($script:RootCard.IsMouseOver -or $script:PillCard.IsMouseOver)) {
-            Set-PillPeek $true
-        }
-    }
-    catch { }
-})
+                                # the close timer TICKS DURING A DRAG - the
+                                # flag keeps it from acting mid-carry
+$script:PillDragEnd = [datetime]::MinValue
 $script:PillCloseTimer = New-Object System.Windows.Threading.DispatcherTimer
-$script:PillCloseTimer.Interval = [TimeSpan]::FromMilliseconds(260)
+$script:PillCloseTimer.Interval = [TimeSpan]::FromSeconds(5)
 $script:PillCloseTimer.Add_Tick({
     $script:PillCloseTimer.Stop()
     try {
-        if ($script:Compact -and -not $script:PillDragging -and
-            -not $script:RootCard.IsMouseOver -and -not $script:PillCard.IsMouseOver) {
-            Set-PillPeek $false
+        if (-not $script:Compact -or -not $script:PillPeeked -or $script:PillDragging) { return }
+        if ($script:RootCard.IsMouseOver) {
+            # still reading it - check again soon
+            $script:PillCloseTimer.Interval = [TimeSpan]::FromSeconds(3)
+            $script:PillCloseTimer.Start()
+            return
         }
+        Set-PillPeek $false
     }
     catch { }
 })
@@ -2758,36 +2752,7 @@ if ($null -ne $script:BirdFaces['hatch'] -and $null -ne $script:PillBirdA) {
     $script:BirdFaceKey = 'hatch'
     $script:PillBirdA.Source = $script:BirdFaces['hatch']
 }
-$script:BirdGreetStamp = [datetime]::MinValue
-$script:PillHoverEnter = {
-    if ($script:Compact) {
-        if (((Get-Date) - $script:PillDragEnd).TotalMilliseconds -lt 400) { return }
-        # the bird says hi when you come over (unless he's asleep - rude)
-        if (-not $script:PillPeeked -and -not $script:BirdDozing -and
-            ((Get-Date) - $script:BirdGreetStamp).TotalMilliseconds -gt 2200) {
-            $script:BirdGreetStamp = Get-Date
-            Invoke-BirdMotion 'greet'
-            if ($null -ne $script:BirdFaces['wave'] -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
-                $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(1100)
-                Set-BirdFace 'wave'
-            }
-        }
-        $script:PillCloseTimer.Stop()
-        $script:PillPeekTimer.Stop()
-        $script:PillPeekTimer.Start()
-    }
-}
-$script:PillHoverLeave = {
-    $script:PillPeekTimer.Stop()
-    if ($script:Compact -and $script:PillPeeked) {
-        $script:PillCloseTimer.Stop()
-        $script:PillCloseTimer.Start()
-    }
-}
-$script:RootCard.Add_MouseEnter($script:PillHoverEnter)
-$script:RootCard.Add_MouseLeave($script:PillHoverLeave)
-$script:PillCard.Add_MouseEnter($script:PillHoverEnter)
-$script:PillCard.Add_MouseLeave($script:PillHoverLeave)
+# hover triggers NOTHING - peek opens on click only (see HeaderClick)
 $Window.Add_SizeChanged({
     param($s, $e)
     if ($script:AnchorRight -gt 0) {
@@ -4908,6 +4873,8 @@ $script:MiniBtn.Add_MouseLeftButtonUp({
 # press just opened.
 $script:PillExpandStamp = [datetime]::MinValue
 $script:PillPressActive = $false
+$script:PillPressWasPeeked = $false
+$script:PillDragDress = $null
 $script:PillPressPt = New-Object System.Windows.Point(0.0, 0.0)
 $script:HeaderClick = {
     param($s, $e)
@@ -4929,6 +4896,7 @@ $script:HeaderClick = {
     # reach us when a fast flick leaves the tiny pill before we commit.
     try {
         $script:PillPressPt = $script:Window.PointToScreen($e.GetPosition($script:Window))
+        $script:PillPressWasPeeked = $script:PillPeeked   # decides the click LADDER at release
         $script:PillPressActive = $true
         [void]$script:Window.CaptureMouse()
     }
@@ -4964,6 +4932,22 @@ $Window.Add_MouseMove({
         $script:BirdFaceHoldUntil = [datetime]::MaxValue
         Set-BirdFace 'grabbed' -Instant
     }
+    # you carry ONLY the bird: capsule, ring and counts vanish for the ride,
+    # leaving the scruff-grabbed kitten floating under your cursor
+    $script:PillDragDress = $null
+    try {
+        $script:PillDragDress = @{
+            Bg = $script:PillCard.Background
+            Border = $script:PillCard.BorderBrush
+            Arc = $script:PillRingArc.Visibility
+        }
+        $script:PillCard.Background = [System.Windows.Media.Brushes]::Transparent
+        $script:PillCard.BorderBrush = [System.Windows.Media.Brushes]::Transparent
+        $script:PillRingTrack.Visibility = 'Collapsed'
+        $script:PillRingArc.Visibility = 'Collapsed'
+        if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Collapsed' }
+    }
+    catch { }
     # flush layout + a render pass BEFORE the modal drag: without this the
     # layered window drags STALE pixels - the old open island ghosting
     # behind the pill for the whole ride
@@ -4977,7 +4961,17 @@ $Window.Add_MouseMove({
     finally {
         $script:PillDragging = $false
         $script:PillDragEnd = Get-Date
-        try { $script:PillPeekTimer.Stop() } catch { }
+        if ($null -ne $script:PillDragDress) {
+            try {
+                $script:PillCard.Background = $script:PillDragDress.Bg
+                $script:PillCard.BorderBrush = $script:PillDragDress.Border
+                $script:PillRingTrack.Visibility = 'Visible'
+                $script:PillRingArc.Visibility = $script:PillDragDress.Arc
+                if ($null -ne $script:PillClusterPanel) { $script:PillClusterPanel.Visibility = 'Visible' }
+            }
+            catch { }
+            $script:PillDragDress = $null
+        }
         Save-HudState   # parked = remembered, even if perch dies uncleanly
         $script:BirdFaceHoldUntil = [datetime]::MinValue
         Update-BirdFace
@@ -4990,9 +4984,15 @@ $Window.Add_MouseLeftButtonUp({
     $script:PillPressActive = $false
     try { $script:Window.ReleaseMouseCapture() } catch { }
     if ($script:Compact) {
-        $script:PillExpandStamp = Get-Date
-        Set-CompactMode $false
-        Save-HudState
+        # the ladder: pill -> peek -> full. One rung per click.
+        if ($script:PillPressWasPeeked) {
+            $script:PillExpandStamp = Get-Date
+            Set-CompactMode $false
+            Save-HudState
+        }
+        else {
+            Set-PillPeek $true
+        }
     }
 })
 function Save-HudState {

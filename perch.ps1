@@ -1946,6 +1946,10 @@ $script:PillPeeked = $false
 $script:AnchorRight = 0.0
 $script:BirdScale = $null       # transforms exist only if the logo loaded
 $script:BirdDozing = $false     # bird leans over asleep when everything's quiet
+$script:PillParkedCount = 0     # parked (ignored 30+ min) -> the judging sideeye
+$script:BirdFlapN = 0           # flap-burst frame counter (happy/happy2)
+$script:BirdFanFlip = $false    # hot/hot2 alternation phase
+$script:BirdFanTimer = $null    # created with the other timers below
 $script:PrevDoneCount = 0       # done-count rises -> happy hop
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
@@ -2119,10 +2123,20 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
     $script:PillWorkCount = $Work
     if ($wantZ -eq 'Visible' -and -not $script:BirdDozing) {
         $script:BirdDozing = $true
+        # drowsy bridges INTO sleep: half-lidded for a beat, then out cold
+        if ($null -ne $script:BirdFaces['drowsy'] -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
+            Set-BirdFace 'drowsy'
+            $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(700)
+        }
         Invoke-BirdMotion 'doze'
     }
     elseif ($wantZ -ne 'Visible' -and $script:BirdDozing) {
         $script:BirdDozing = $false
+        # and OUT of sleep: he surfaces through drowsy, not a hard snap
+        if ($null -ne $script:BirdFaces['drowsy'] -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
+            Set-BirdFace 'drowsy'
+            $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(450)
+        }
         Invoke-BirdMotion 'wake'
     }
     Update-BirdFace
@@ -2175,6 +2189,7 @@ function Invoke-BirdMotion([string]$Kind) {
     $sy = [System.Windows.Media.ScaleTransform]::ScaleYProperty
     $ra = [System.Windows.Media.RotateTransform]::AngleProperty
     $ty = [System.Windows.Media.TranslateTransform]::YProperty
+    $tx = [System.Windows.Media.TranslateTransform]::XProperty
     switch ($Kind) {
         'perk' {
             # something newly needs you: puff up + indignant wiggle
@@ -2229,6 +2244,35 @@ function Invoke-BirdMotion([string]$Kind) {
                 (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(110))))
             $a.AutoReverse = $true
             Start-BirdAnim $script:BirdScale $sy $a 1.0
+        }
+        'look' {
+            # idle antic: glance left, hold, glance right, hold, back - the
+            # head turn is sold by rotation + a tiny sideways lean together
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
+                @(0, 0), @(-8, 170), @(-8, 560), @(8, 800), @(8, 1180), @(0, 1380))) 0.0
+            Start-BirdAnim $script:BirdShift $tx (New-BirdKeyAnim @(
+                @(0, 0), @(-2.4, 170), @(-2.4, 560), @(2.4, 800), @(2.4, 1180), @(0, 1380))) 0.0
+        }
+        'ruffle' {
+            # idle antic: a dog-shaking-off-water feather ruffle - fast
+            # rotation shimmy with a jelly puff (X and Y in opposition)
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdRot $ra (New-BirdKeyAnim @(
+                @(0, 0), @(-5, 60), @(5, 125), @(-4, 190), @(4, 255), @(-2, 315), @(0, 375))) 0.0
+            Start-BirdAnim $script:BirdScale $sx (New-BirdKeyAnim @(
+                @(1.0, 0), @(1.14, 85), @(0.92, 170), @(1.10, 250), @(0.97, 320), @(1.0, 390))) 1.0
+            Start-BirdAnim $script:BirdScale $sy (New-BirdKeyAnim @(
+                @(1.0, 0), @(0.90, 85), @(1.08, 170), @(0.94, 250), @(1.03, 320), @(1.0, 390))) 1.0
+        }
+        'hopturn' {
+            # idle antic: hops, turns his BACK on you (ScaleX through 0 to
+            # -1 = a real pivot), sulks a beat, hops back around. Peak bird.
+            if (-not $vis) { return }
+            Start-BirdAnim $script:BirdShift $ty (New-BirdKeyAnim @(
+                @(0, 0), @(-4.5, 110), @(0, 220), @(0, 1020), @(-4.5, 1130), @(0, 1240))) 0.0
+            Start-BirdAnim $script:BirdScale $sx (New-BirdKeyAnim @(
+                @(1.0, 0), @(-1.0, 250), @(-1.0, 1040), @(1.0, 1290))) 1.0
         }
         'doze' {
             # everything's quiet: lean over asleep (pose HOLDS via the base
@@ -2307,6 +2351,9 @@ function Update-BirdFace {
     if ($script:BirdDozing) { $key = 'sleep' }
     if ($script:PillWorkCount -gt 0) { $key = 'focused' }
     if ($script:PillDoneAll) { $key = 'crown' }
+    # a session you've IGNORED past ParkMinutes: the meme side-eye. Beats
+    # crown (a parked session is still waiting, no matter how smug he feels)
+    if ($script:PillParkedCount -gt 0) { $key = 'sideeye' }
     if ([double]$script:Pill5hPct -ge 90.0) { $key = 'hot' }
     if ($script:PillErrCount -gt 0) { $key = 'worried' }
     # NOTE: no permanent 'alert' - attention almost always exists, and a
@@ -2315,6 +2362,12 @@ function Update-BirdFace {
     # the chips carry the standing state.
     if ([double]$script:Pill5hPct -ge 99.5) { $key = 'knocked' }
     Set-BirdFace $key
+    # hot runs the frantic-fan loop (hot/hot2 alternation) - (re)arm it
+    # whenever the resting face is hot and the pill is on screen; the
+    # timer stops itself the moment either condition breaks
+    if ($key -eq 'hot' -and $null -ne $script:BirdFanTimer -and -not $script:BirdFanTimer.IsEnabled -and
+        $null -ne $script:BirdFaces['hot2'] -and $script:Compact -and
+        $script:PillCard.Visibility -eq 'Visible') { $script:BirdFanTimer.Start() }
 }
 
 function Invoke-JumpToAtt {
@@ -2676,6 +2729,8 @@ function Clear-PillAnimations {
             $script:BirdRot.Angle = $(if ($script:BirdDozing) { -10.0 } else { 0.0 })
             $script:BirdShift.BeginAnimation([System.Windows.Media.TranslateTransform]::YProperty, $null)
             $script:BirdShift.Y = 0.0
+            $script:BirdShift.BeginAnimation([System.Windows.Media.TranslateTransform]::XProperty, $null)
+            $script:BirdShift.X = 0.0
             if ($null -ne $script:PillBirdB) {
                 $script:PillBirdB.BeginAnimation($opProp, $null)
                 $script:PillBirdB.Opacity = 0.0
@@ -2710,32 +2765,44 @@ $script:PillCloseTimer.Add_Tick({
     }
     catch { }
 })
-# the supervising head-tilt: while sessions are working, the bird glances
-# at the work every minute or so. One 560ms render-only animation - the
-# cost is nothing, the effect is a coworker
+# the LIFE timer: while sessions work, the bird supervises (head-tilt /
+# peck every minute or so). While he's awake with nothing running, he does
+# idle antics - look around, feather ruffle, hop-turn - on a quicker beat,
+# because a creature that just stands there is a status icon. All
+# render-only animations on a ~60px surface; the cost is nothing. Never
+# mid-drag: the dispatcher pumps this timer during DragMove and an antic
+# would fight the carry pendulum.
 $script:BirdTiltTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds(52)
 $script:BirdTiltTimer.Add_Tick({
     try {
         $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 45 -Maximum 76))
-        if ($script:Compact -and -not $script:BirdDozing -and $script:PillWorkCount -gt 0) {
-            # variety is life: sometimes a head-tilt, sometimes a peck
+        if (-not $script:Compact -or $script:BirdDozing -or $script:PillDragging) { return }
+        if ($script:PillWorkCount -gt 0) {
+            # supervising: sometimes a head-tilt, sometimes a peck
             Invoke-BirdMotion $(if ((Get-Random -Minimum 0 -Maximum 2) -eq 0) { 'tilt' } else { 'bob' })
+        }
+        else {
+            # awake, nothing running: he entertains himself
+            Invoke-BirdMotion (Get-Random -InputObject @('look', 'ruffle', 'hopturn'))
+            $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 22 -Maximum 49))
         }
     }
     catch { }
 })
 $script:BirdTiltTimer.Start()
-# the blink: every 4-9s, the neutral face closes its eyes for 140ms. Direct
-# Source swaps (no crossfade) - a blink IS a hard cut. Only on the neutral
-# face: blinking away the glasses/hat/props of other faces reads as a glitch.
+# the blink/sip beat: every 4-9s, the neutral face closes its eyes for
+# 140ms - and the parked SIDEEYE raises the cup and sips for 400ms. Same
+# machinery, direct Source swaps (no crossfade) - both ARE hard cuts.
+# Other faces sit this out: blinking away glasses/hats reads as a glitch.
 $script:BirdUnblinkTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:BirdUnblinkTimer.Interval = [TimeSpan]::FromMilliseconds(140)
 $script:BirdUnblinkTimer.Add_Tick({
     $script:BirdUnblinkTimer.Stop()
     try {
-        if ($script:BirdFaceKey -eq 'neutral' -and $null -ne $script:PillBirdA) {
-            $script:PillBirdA.Source = $script:BirdFaces['neutral']
+        if (($script:BirdFaceKey -eq 'neutral' -or $script:BirdFaceKey -eq 'sideeye') -and
+            $null -ne $script:PillBirdA) {
+            $script:PillBirdA.Source = $script:BirdFaces[$script:BirdFaceKey]
         }
     }
     catch { }
@@ -2745,17 +2812,59 @@ $script:BirdBlinkTimer.Interval = [TimeSpan]::FromSeconds(6)
 $script:BirdBlinkTimer.Add_Tick({
     try {
         $script:BirdBlinkTimer.Interval = [TimeSpan]::FromMilliseconds((Get-Random -Minimum 4000 -Maximum 9000))
-        if ($script:Compact -and $script:PillCard.Visibility -eq 'Visible' -and
-            $script:BirdFaceKey -eq 'neutral' -and $null -ne $script:BirdFaces['blink'] -and
-            $null -ne $script:PillBirdA -and (Get-Date) -ge $script:BirdFaceHoldUntil) {
+        if (-not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible' -and
+                  $null -ne $script:PillBirdA -and (Get-Date) -ge $script:BirdFaceHoldUntil)) { return }
+        if ($script:BirdFaceKey -eq 'neutral' -and $null -ne $script:BirdFaces['blink']) {
             $script:PillBirdA.Source = $script:BirdFaces['blink']
-            $script:BirdUnblinkTimer.Stop()
-            $script:BirdUnblinkTimer.Start()
+            $script:BirdUnblinkTimer.Interval = [TimeSpan]::FromMilliseconds(140)
         }
+        elseif ($script:BirdFaceKey -eq 'sideeye' -and $null -ne $script:BirdFaces['sideeye2']) {
+            # parked: he periodically SIPS while judging you
+            $script:PillBirdA.Source = $script:BirdFaces['sideeye2']
+            $script:BirdUnblinkTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+        }
+        else { return }
+        $script:BirdUnblinkTimer.Stop()
+        $script:BirdUnblinkTimer.Start()
     }
     catch { }
 })
 $script:BirdBlinkTimer.Start()
+# the flap burst: while the happy hop plays, happy/happy2 alternate every
+# 90ms - eight swaps of ACTUAL wing-flapping with confetti physics. Fired
+# by the done-count rise (same place as the hop), self-stopping.
+$script:BirdFlapTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:BirdFlapTimer.Interval = [TimeSpan]::FromMilliseconds(90)
+$script:BirdFlapTimer.Add_Tick({
+    try {
+        $script:BirdFlapN++
+        if ($script:BirdFlapN -gt 8 -or $script:BirdFaceKey -ne 'happy' -or
+            $null -eq $script:PillBirdA -or $null -eq $script:BirdFaces['happy2']) {
+            $script:BirdFlapTimer.Stop()
+            if ($script:BirdFaceKey -eq 'happy' -and $null -ne $script:PillBirdA) {
+                $script:PillBirdA.Source = $script:BirdFaces['happy']
+            }
+            return
+        }
+        $script:PillBirdA.Source = $script:BirdFaces[$(if ($script:BirdFlapN % 2 -eq 1) { 'happy2' } else { 'happy' })]
+    }
+    catch { $script:BirdFlapTimer.Stop() }
+})
+# the frantic fan: while the resting face is HOT, hot/hot2 alternate every
+# 180ms - he fans himself in real time for as long as he's cooking. Armed
+# by Update-BirdFace, stops itself when the face or the pill goes away.
+$script:BirdFanTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:BirdFanTimer.Interval = [TimeSpan]::FromMilliseconds(180)
+$script:BirdFanTimer.Add_Tick({
+    try {
+        if ($script:BirdFaceKey -ne 'hot' -or -not $script:Compact -or
+            $script:PillCard.Visibility -ne 'Visible' -or $null -eq $script:PillBirdA -or
+            $null -eq $script:BirdFaces['hot2']) { $script:BirdFanTimer.Stop(); return }
+        $script:BirdFanFlip = -not $script:BirdFanFlip
+        $script:PillBirdA.Source = $script:BirdFaces[$(if ($script:BirdFanFlip) { 'hot2' } else { 'hot' })]
+    }
+    catch { $script:BirdFanTimer.Stop() }
+})
 # CARRY PHYSICS: while you drag him, a 30ms sampler reads the window's
 # horizontal velocity and drives a spring-damped pendulum - he tilts
 # against the motion, overshoots, and wobbles back when you stop. The
@@ -4852,6 +4961,7 @@ function Update-List {
     }
     $script:PillAttCount = $att
     $script:PillErrCount = @($visible | Where-Object { $_.Status -in @('error', 'retrying') }).Count
+    $script:PillParkedCount = @($visible | Where-Object { $_.Status -eq 'parked' }).Count
     $script:PillDoneAll = ($done -gt 0 -and $att -eq 0 -and $work -eq 0)
     Update-PillCluster $att $work $done $quiet
     if ($done -gt $script:PrevDoneCount) {
@@ -4859,6 +4969,12 @@ function Update-List {
         if ($null -ne $script:BirdFaces['happy']) {
             $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)
             Set-BirdFace 'happy'
+            if ($null -ne $script:BirdFaces['happy2'] -and $script:Compact -and
+                $script:PillCard.Visibility -eq 'Visible') {
+                # and he FLAPS through the hop
+                $script:BirdFlapN = 0
+                $script:BirdFlapTimer.Stop(); $script:BirdFlapTimer.Start()
+            }
         }
     }
     $script:PrevDoneCount = $done
@@ -5014,6 +5130,18 @@ $Window.Add_MouseMove({
                                [System.Windows.Media.ScaleTransform]::ScaleYProperty)) {
                 $script:BirdScale.BeginAnimation($sp2, $null)
             }
+            $script:BirdScale.ScaleX = 1.0
+            $script:BirdScale.ScaleY = 1.0
+        }
+        if ($null -ne $script:BirdShift) {
+            # an idle antic mid-grab would keep tugging the translate and pull
+            # the scruff off the cursor pin - release both axes
+            foreach ($tp2 in @([System.Windows.Media.TranslateTransform]::XProperty,
+                               [System.Windows.Media.TranslateTransform]::YProperty)) {
+                $script:BirdShift.BeginAnimation($tp2, $null)
+            }
+            $script:BirdShift.X = 0.0
+            $script:BirdShift.Y = 0.0
         }
         if ($null -ne $script:BirdImgGrid) {
             $script:BirdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.08)

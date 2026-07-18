@@ -66,18 +66,24 @@ keep everything identical to its parent except the named moving part.
 | 18 | `bird-sideeye2.png` | `bird-sideeye.png` | identical but the coffee cup RAISED to the beak mid-sip, eyes still dead flat — swapped in for ~400ms every few seconds, so the parked bird periodically SIPS while judging you |
 | 19 | `bird-hot2.png` | `bird-hot.png` | identical but the paper fan at the opposite angle of its arc — alternated at ~180ms = frantic real-time fanning while he cooks |
 
-## what gets wired once files land
+## wiring status: ALL LIVE ✓
 
-- face state machine from dominant status (blocked > attention > error >
-  working > done-all > quiet), 120ms opacity crossfades between faces
-- random blink every 4–9s overlaid on whatever face is showing
-- `bird-grabbed` swaps in the instant a drag starts, back on drop
-- `bird-hatch` plays once on boot, then crossfades to the live state
-- `bird-launch` flashes ~400ms when you click the red count, right as
-  Perch throws you into the terminal
-- moment animations layer on top: perk wiggle on alert, hop (with flap
-  frames if present) on happy, breath on sleep, squash on grabbed-drop
-- transitions: `bird-drowsy` bridges into/out of sleep (~250ms each way);
-  sudden states (grabbed, alert, knocked, launch) stay HARD CUTS on purpose
-- loop pairs: sip every few seconds on parked, frantic fan alternation on
-  hot, flap alternation during the hop — one extra frame each, endless life
+Every state above is installed and wired, sprite tier included:
+
+- face state machine from dominant status (knocked > worried > hot >
+  sideeye/parked > crown > focused > sleep > neutral), 120ms crossfades;
+  moment faces (alert/happy/wave/grabbed/hatch/launch/drowsy) hold on top
+- blink every 4–9s on neutral; the same beat makes parked SIP (~400ms
+  `bird-sideeye2` swap) — he drinks his coffee while judging you
+- `bird-drowsy` bridges into AND out of sleep — no hard snap to unconscious
+- flap burst: `bird-happy`/`bird-happy2` alternate at 90ms through the
+  victory hop — real wing-flaps with confetti physics
+- frantic fan: `bird-hot`/`bird-hot2` alternate at 180ms the whole time
+  he's cooking past 90% — self-stopping loop, armed by the face machine
+- sudden states (grabbed, alert, knocked, launch) stay HARD CUTS on purpose
+- idle antics (no art needed): look-around, feather ruffle, hop-turn-
+  and-sulk play every ~20-50s when he's awake with nothing running
+
+Still unwired: `bird-offline` (waiting on an offline-mode flag in the
+face machine). Want more life? Generate more loop pairs — any state can
+get a `-2` frame and join the sprite tier in a few lines.

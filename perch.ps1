@@ -32,13 +32,6 @@ trap {
 $AgentFocusDir = Join-Path $env:LOCALAPPDATA 'AgentFocus'
 $StatusDir     = Join-Path $AgentFocusDir 'status'
 $CfgPath       = Join-Path $AgentFocusDir 'settings.json'
-# TAB BADGES: per-session OSC files the claude statusline command appends
-# to its output - Windows Terminal renders ConEmu progress state as a tab
-# tint (red = needs you, green = done). Proved live: claude's statusline
-# passes OSC 9;4 through ConPTY to WT untouched.
-$BadgeDir      = Join-Path $AgentFocusDir 'badges'
-try { if (-not (Test-Path -LiteralPath $BadgeDir)) { New-Item -ItemType Directory -Path $BadgeDir -Force | Out-Null } } catch { }
-$script:BadgeCache = @{}       # session id -> last written badge state
 $StatePath     = Join-Path $PSScriptRoot 'hud-state.json'
 $PrefsPath     = Join-Path $PSScriptRoot 'hud-prefs.json'
 $ProgressPreference = 'SilentlyContinue'
@@ -5079,33 +5072,6 @@ function Update-List {
             Move-Item -LiteralPath $tmp -Destination $SnapPath -Force
         }
         catch { }
-    }
-
-    # TAB BADGES: keep each session's badge file loaded with the right
-    # ConEmu progress OSC - its own statusline cat's the file, WT tints
-    # the tab. RED = needs you / broke, GREEN = finished and waiting,
-    # clear otherwise (working keeps its title spinner; parked stays
-    # muted by design - a badge would un-park it visually). Written only
-    # on state change; orphan files deleted when their session dies.
-    foreach ($s in $visible) {
-        if ($s.Provider -ne 'claude' -or [string]::IsNullOrWhiteSpace($s.Id)) { continue }
-        $bState = 'clear'
-        if ($s.Status -in @('attention', 'error', 'retrying')) { $bState = 'red' }
-        elseif ($s.Status -eq 'idle') { $bState = 'green' }
-        if ([string]$script:BadgeCache[$s.Id] -eq $bState) { continue }
-        $script:BadgeCache[$s.Id] = $bState
-        $bOsc = switch ($bState) {
-            'red'   { [char]27 + ']9;4;2;0' + [char]7 }
-            'green' { [char]27 + ']9;4;1;100' + [char]7 }
-            default { [char]27 + ']9;4;0' + [char]7 }
-        }
-        try { [IO.File]::WriteAllText((Join-Path $BadgeDir ($s.Id + '.txt')), $bOsc) } catch { }
-    }
-    foreach ($bid in @($script:BadgeCache.Keys)) {
-        if (-not $liveIds.ContainsKey($bid)) {
-            [void]$script:BadgeCache.Remove($bid)
-            try { Remove-Item -LiteralPath (Join-Path $BadgeDir ($bid + '.txt')) -Force -Confirm:$false -ErrorAction SilentlyContinue } catch { }
-        }
     }
 
     # DIFF rendering: rows persist across ticks and only changed properties

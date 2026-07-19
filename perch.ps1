@@ -945,17 +945,20 @@ function Invoke-BusyVerify {
     # vanish with a timed-out hook. Either way a session sits painted
     # 'working'/'compacting' forever. The console screen is ground truth:
     # slow-probe stale busy rows and OVERRIDE the painted status once the
-    # screen provably stopped cooking - two clean sightings 15s apart, since
+    # screen provably stopped cooking - two clean sightings 10s apart, since
     # a single frame without busy markers lies (the hint line rotates).
+    # (grace 25s / first look 20s: a killed-under-load Stop hook or an Esc
+    # interrupt now flips in ~35-55s instead of ~60-90s; clean finishes
+    # never ride this lane at all)
     # Any newer hook write invalidates the override instantly.
     foreach ($q in @($script:BusyVerifyQueue)) {
         $apid = [int]$q.Pid
         $st = $script:BusyVerify[$apid]
         if ($null -eq $st -or $st.FileTs -ne $q.Ts) {
-            $st = @{ FileTs = $q.Ts; Stamp = [datetime]::MinValue; Wait = 40; Misses = 0 }
+            $st = @{ FileTs = $q.Ts; Stamp = [datetime]::MinValue; Wait = 20; Misses = 0 }
             $script:BusyVerify[$apid] = $st
         }
-        if (((Get-Date) - $q.Ts).TotalSeconds -lt 45) { continue }     # let the hooks speak first
+        if (((Get-Date) - $q.Ts).TotalSeconds -lt 25) { continue }     # let the hooks speak first
         if (((Get-Date) - $st.Stamp).TotalSeconds -lt $st.Wait) { continue }
         $r = Request-ConsoleInfo -TargetPid $apid
         if ($null -eq $r) { continue }                                  # pending or out of budget
@@ -997,7 +1000,7 @@ function Invoke-BusyVerify {
             continue
         }
         $st.Misses++
-        $st.Wait = 15                                                   # suspicious: look again soon
+        $st.Wait = 10                                                   # suspicious: look again soon
         if ($st.Misses -ge 2 -or $txt.Contains('interruptedbyuser')) {
             $script:BusyOverride[$apid] = @{ Status = 'idle'; FileTs = $q.Ts }
         }

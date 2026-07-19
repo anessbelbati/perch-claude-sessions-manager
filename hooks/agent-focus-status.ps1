@@ -19,6 +19,21 @@ function Get-SafeFileName {
     return ($Value -replace '[^a-zA-Z0-9_.-]', '_')
 }
 
+function Write-HookTiming {
+    # field evidence for done-lag hunts: one line per hook run with the
+    # spawn->outcome latency. Truncated when it grows past 256KB.
+    param([string]$EventName, [string]$SessionId, [datetime]$T0, [string]$Outcome)
+    try {
+        $log = Join-Path $env:LOCALAPPDATA 'AgentFocus\hook-timing.log'
+        $it = Get-Item -LiteralPath $log -ErrorAction SilentlyContinue
+        if ($null -ne $it -and $it.Length -gt 262144) { Clear-Content -LiteralPath $log -ErrorAction SilentlyContinue }
+        $sid = $SessionId
+        if ($sid.Length -gt 8) { $sid = $sid.Substring(0, 8) }
+        Add-Content -LiteralPath $log -Value ("{0:o} {1} {2} {3}ms {4}" -f (Get-Date).ToUniversalTime(), $EventName, $sid, [int]((Get-Date) - $T0).TotalMilliseconds, $Outcome) -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+
 function Get-StableId {
     param(
         [string]$ProviderName,
@@ -575,6 +590,11 @@ function Get-ConsoleTabHint {
 }
 
 try {
+    # spawn stamp FIRST: hook_seq (event-order guard) and the timing log both
+    # key off it. Ticks of script start ~= the order claude fired the events.
+    $t0 = Get-Date
+    $spawnTicks = $t0.ToUniversalTime().Ticks
+
     # read stdin as UTF-8 BYTES, not through [Console]::In - the console
     # reader decodes with the OEM codepage (CP850 here), which turned every
     # em-dash / curly quote in last_assistant_message into mojibake that we
@@ -651,6 +671,28 @@ try {
         catch {
             $existing = $null
         }
+    }
+
+    # -- EVENT-ORDER GUARD: mutex wake order is NOT first-come-first-served.
+    # Every turn ends with PostToolUse (working) racing Stop (idle); when the
+    # OLDER PostToolUse process wins the mutex LAST it used to overwrite the
+    # freshly-written idle with a fresh-looking 'working' - and since no hook
+    # ever fires again, the row sat lying until the slow screen prober caught
+    # it (the mystery 10-30s done-lag). A later spawn always outranks an
+    # earlier one: if the file was written by a NEWER event, we are stale
+    # news - drop our write entirely.
+    $existingSeq = [long]0
+    if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['hook_seq']) {
+        $existingSeq = [long]$existing.hook_seq
+    }
+    if ($existingSeq -gt $spawnTicks) {
+        Write-HookTiming $eventName $stableId $t0 'stale-skip'
+        if ($null -ne $mutex) {
+            try { $mutex.ReleaseMutex() } catch { }
+            try { $mutex.Dispose() } catch { }
+            $mutex = $null
+        }
+        Write-HookSuccess
     }
 
     # -- agent pid first: console capture needs it to attach --
@@ -741,6 +783,7 @@ try {
 
     $record = [ordered]@{
         schema = 1
+        hook_seq = $spawnTicks
         provider = $Provider.ToLowerInvariant()
         status = $status
         session_id = $stableId
@@ -766,6 +809,18 @@ try {
     $tempPath = "$statusPath.$PID.tmp"
     $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
     Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
+    Write-HookTiming $eventName $stableId $t0 'wrote'
+
+    # release the mutex NOW: the read-modify-write critical section is done.
+    # The capture below can take SECONDS (UIA scan / AttachConsole RPC), and
+    # holding the lock through it made the Stop hook queue behind a slow
+    # PostToolUse title-refresh - the finish-line write waiting on cosmetics.
+    # The rewrite below re-acquires briefly and merge-guards on hook_seq.
+    if ($null -ne $mutex) {
+        try { $mutex.ReleaseMutex() } catch { }
+        try { $mutex.Dispose() } catch { }
+        $mutex = $null
+    }
 
     $rewrite = $false
     if ($needCapture) {
@@ -816,10 +871,42 @@ try {
         }
     }
     if ($rewrite) {
-        $record.window = $window
-        $record.headless = $headless
-        $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
-        Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
+        # we captured WITHOUT the lock - another hook may have written since.
+        # Re-acquire briefly and check hook_seq: if the file moved past us,
+        # graft ONLY the window fields onto the CURRENT record. Never
+        # resurrect our own stale status over a newer event's write.
+        $m2 = $null
+        try {
+            $m2 = New-Object System.Threading.Mutex($false, ("Local\AgentFocus-" + (Get-SafeFileName "$Provider-$stableId")))
+            if (-not $m2.WaitOne(4000)) {
+                try { $m2.Dispose() } catch { }
+                $m2 = $null
+            }
+        }
+        catch { $m2 = $null }
+        try {
+            $cur = $null
+            try { $cur = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json } catch { $cur = $null }
+            $curSeq = [long]0
+            if ($null -ne $cur -and $null -ne $cur.PSObject.Properties['hook_seq']) { $curSeq = [long]$cur.hook_seq }
+            if ($null -ne $cur -and $curSeq -ne $spawnTicks) {
+                $cur | Add-Member -NotePropertyName window -NotePropertyValue $window -Force
+                $cur | Add-Member -NotePropertyName headless -NotePropertyValue $headless -Force
+                $cur | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+            }
+            else {
+                $record.window = $window
+                $record.headless = $headless
+                $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+            }
+            Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
+        }
+        finally {
+            if ($null -ne $m2) {
+                try { $m2.ReleaseMutex() } catch { }
+                try { $m2.Dispose() } catch { }
+            }
+        }
     }
 
     }

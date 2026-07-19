@@ -41,6 +41,7 @@ $RefreshSeconds = 2
 $HideAfterFocus = $false
 $AgentProcNames = @('claude', 'codex', 'gemini', 'opencode', 'aider')
 $script:ChirpOn = $false
+$script:ChirpDoneOn = $true   # a finish SOUND is the thing you're waiting for - on by default
 $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
 $script:ShowTimers = $true
@@ -53,6 +54,7 @@ try {
         if ($cfg.RefreshSeconds) { $RefreshSeconds = [int]$cfg.RefreshSeconds }
         if ($null -ne $cfg.PSObject.Properties['HideAfterFocus']) { $HideAfterFocus = [bool]$cfg.HideAfterFocus }
         if ($null -ne $cfg.PSObject.Properties['ChirpOnAttention']) { $script:ChirpOn = [bool]$cfg.ChirpOnAttention }
+        if ($null -ne $cfg.PSObject.Properties['ChirpOnDone']) { $script:ChirpDoneOn = [bool]$cfg.ChirpOnDone }
         if ($null -ne $cfg.PSObject.Properties['ChirpVolume']) { $script:ChirpVolume = [int]$cfg.ChirpVolume }
         if ($null -ne $cfg.PSObject.Properties['ParkAfterMinutes']) { $script:ParkMinutes = [int]$cfg.ParkAfterMinutes }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
@@ -2099,6 +2101,7 @@ $script:BirdFlapN = 0           # flap-burst frame counter (happy/happy2)
 $script:BirdFanFlip = $false    # hot/hot2 alternation phase
 $script:BirdFanTimer = $null    # created with the other timers below
 $script:PrevDoneCount = 0       # done-count rises -> happy hop
+$script:BootStamp = Get-Date    # suppresses the done-chirp for already-done sessions found at launch
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
 $script:PillBirdA = $null       # visible face Image
@@ -3761,12 +3764,13 @@ function Update-AccountsPanel {
     [void]$script:AcctPanel.Children.Add($add)
 }
 
-function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '') {
+function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true) {
     if ($script:ThemeSpecs.Keys -contains $Theme -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
         Apply-Theme
     }
     $script:ChirpOn = $Chirp
+    $script:ChirpDoneOn = $ChirpDone
     $script:ShowTimers = $Timers
     $script:HudHideAfterFocus = $HideAfter
 
@@ -3823,6 +3827,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName RefreshSeconds    -NotePropertyValue $script:RefreshSeconds -Force
         $cfg | Add-Member -NotePropertyName HideAfterFocus    -NotePropertyValue $script:HudHideAfterFocus -Force
         $cfg | Add-Member -NotePropertyName ChirpOnAttention  -NotePropertyValue $script:ChirpOn -Force
+        $cfg | Add-Member -NotePropertyName ChirpOnDone       -NotePropertyValue $script:ChirpDoneOn -Force
         $cfg | Add-Member -NotePropertyName ChirpVolume       -NotePropertyValue $script:ChirpVolume -Force
         $cfg | Add-Member -NotePropertyName ParkAfterMinutes  -NotePropertyValue $script:ParkMinutes -Force
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
@@ -3906,10 +3911,11 @@ function Show-SettingsDialog {
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
+    $rowChirpDn = New-SettingRow 'double-chirp when a session finishes' $script:ChirpDoneOn
     $rowTimers  = New-SettingRow 'show work timers on busy sessions'  $script:ShowTimers
     $rowHide    = New-SettingRow 'minimize after click-to-focus'      $script:HudHideAfterFocus
     $rowStartup = New-SettingRow 'start with windows'                 (Test-Path -LiteralPath $startupLnk)
-    foreach ($r in @($rowChirp, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
+    foreach ($r in @($rowChirp, $rowChirpDn, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
 
     $sep = New-Object System.Windows.Controls.Border
     $sep.Height = 1
@@ -3981,7 +3987,7 @@ function Show-SettingsDialog {
     $dlg.Content = $card
 
     $dlg.Tag = @{
-        Chirp = $rowChirp.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
+        Chirp = $rowChirp.Tag; ChirpDone = $rowChirpDn.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
         Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child; Park = $inPark.Child
     }
     $btnSave.Tag = $dlg
@@ -3992,7 +3998,7 @@ function Show-SettingsDialog {
         $script:ThemeSaved = $true
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
-                           ([string]$c.Park.Text)
+                           ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
@@ -4036,6 +4042,48 @@ function Invoke-Chirp {
         # no wavs installed: the trusty old synth chirp
         [Console]::Beep(1568, 70)
         [Console]::Beep(2093, 90)
+    }
+    catch { }
+}
+
+$script:DoneEchoPlayer = $null   # second player so chirp #1 rings out under chirp #2
+$script:DoneEchoTimer = $null
+function Invoke-DoneChirp {
+    # a session FINISHED: a happy DOUBLE chirp - two quick calls, so your ear
+    # can tell it from the single needs-you chirp (which also flashes/pulses;
+    # done only sings). Done was completely SILENT before this: the pre-perch
+    # sound hook chirped on Stop, and perch quietly moved the sound's meaning
+    # to attention - this gives the finish line its voice back.
+    if (-not $script:ChirpDoneOn) { return }
+    if (((Get-Date) - $script:BootStamp).TotalSeconds -lt 8) { return }   # boot roll-call is old news
+    try {
+        $wavs = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'sounds') -Filter '*.wav' -ErrorAction SilentlyContinue)
+        if ($wavs.Count -eq 0) {
+            try { [Console]::Beep(1319, 80); [Console]::Beep(1760, 110) } catch { }
+            return
+        }
+        $vol = [Math]::Max(0.0, [Math]::Min(1.0, $script:ChirpVolume / 100.0))
+        if ($null -eq $script:ChirpPlayer) { $script:ChirpPlayer = New-Object System.Windows.Media.MediaPlayer }
+        $script:ChirpPlayer.Open([Uri]$wavs[(Get-Random -Maximum $wavs.Count)].FullName)
+        $script:ChirpPlayer.Volume = $vol
+        $script:ChirpPlayer.Play()
+        if ($null -eq $script:DoneEchoTimer) {
+            $script:DoneEchoTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:DoneEchoTimer.Interval = [TimeSpan]::FromMilliseconds(320)
+            $script:DoneEchoTimer.Add_Tick({
+                $script:DoneEchoTimer.Stop()
+                try {
+                    $w = @(Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot 'sounds') -Filter '*.wav' -ErrorAction SilentlyContinue)
+                    if ($w.Count -eq 0) { return }
+                    if ($null -eq $script:DoneEchoPlayer) { $script:DoneEchoPlayer = New-Object System.Windows.Media.MediaPlayer }
+                    $script:DoneEchoPlayer.Open([Uri]$w[(Get-Random -Maximum $w.Count)].FullName)
+                    $script:DoneEchoPlayer.Volume = [Math]::Max(0.0, [Math]::Min(1.0, $script:ChirpVolume / 100.0))
+                    $script:DoneEchoPlayer.Play()
+                }
+                catch { }
+            })
+        }
+        $script:DoneEchoTimer.Stop(); $script:DoneEchoTimer.Start()
     }
     catch { }
 }
@@ -5213,6 +5261,7 @@ function Update-List {
     $script:PillDoneAll = ($done -gt 0 -and $att -eq 0 -and $work -eq 0)
     Update-PillCluster $att $work $done $quiet
     if ($done -gt $script:PrevDoneCount) {
+        Invoke-DoneChirp          # the finish line SINGS (double chirp)
         Invoke-BirdMotion 'hop'   # work finished!
         if ($null -ne $script:BirdFaces['happy']) {
             $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)

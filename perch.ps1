@@ -435,7 +435,7 @@ function Get-Sessions {
                 # (or an idle flip that was wrong) gets lifted by the next
                 # probe when busy markers reappear on screen
                 if (-not $script:UntrackedPids.ContainsKey($apid)) {
-                    [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts })
+                    [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts; Transcript = [string]$s.Transcript })
                 }
                 continue                                   # corrected: not busy anymore
             }
@@ -446,7 +446,7 @@ function Get-Sessions {
         # untracked rows (codex &co) already run their own screen inference -
         # only hook-fed rows need the stale-busy lie detector
         if (-not $script:UntrackedPids.ContainsKey($apid)) {
-            [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts })
+            [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts; Transcript = [string]$s.Transcript })
         }
     }
     $script:BusyVerifyQueue = $queue
@@ -950,6 +950,15 @@ function Invoke-BusyVerify {
     # (grace 25s / first look 20s: a killed-under-load Stop hook or an Esc
     # interrupt now flips in ~35-55s instead of ~60-90s; clean finishes
     # never ride this lane at all)
+    # TRANSCRIPT HEARTBEAT: claude appends to its transcript every few
+    # seconds while a turn runs; when the chat ends (or the user Escs) it
+    # goes silent. One NTFS metadata stat - free, zero conhost contention -
+    # so a quiet transcript (>=8s) collapses the wait: grace 25s -> 6s and
+    # ONE clean sighting flips instead of two (two independent signals
+    # agree). The screen still has to look calm - a long Bash call has a
+    # quiet transcript but its elapsed-timer row and braille title spinner
+    # never stop, so Test-ScreenLooksBusy keeps it working. Worst case
+    # drops ~39s -> ~10-13s.
     # Any newer hook write invalidates the override instantly.
     foreach ($q in @($script:BusyVerifyQueue)) {
         $apid = [int]$q.Pid
@@ -958,7 +967,16 @@ function Invoke-BusyVerify {
             $st = @{ FileTs = $q.Ts; Stamp = [datetime]::MinValue; Wait = 20; Misses = 0 }
             $script:BusyVerify[$apid] = $st
         }
-        if (((Get-Date) - $q.Ts).TotalSeconds -lt 25) { continue }     # let the hooks speak first
+        $tQuiet = $false
+        if ($null -ne $q.Transcript -and -not [string]::IsNullOrWhiteSpace([string]$q.Transcript)) {
+            try {
+                $tw = [System.IO.File]::GetLastWriteTimeUtc([string]$q.Transcript)
+                if (((Get-Date).ToUniversalTime() - $tw).TotalSeconds -ge 8) { $tQuiet = $true }
+            } catch { }
+        }
+        $grace = $(if ($tQuiet) { 6 } else { 25 })
+        if (((Get-Date) - $q.Ts).TotalSeconds -lt $grace) { continue }  # let the hooks speak first
+        if ($tQuiet -and $st.Stamp -eq [datetime]::MinValue) { $st.Wait = 0 }  # quiet transcript: first look NOW
         if (((Get-Date) - $st.Stamp).TotalSeconds -lt $st.Wait) { continue }
         $r = Request-ConsoleInfo -TargetPid $apid
         if ($null -eq $r) { continue }                                  # pending or out of budget
@@ -1001,7 +1019,8 @@ function Invoke-BusyVerify {
         }
         $st.Misses++
         $st.Wait = 10                                                   # suspicious: look again soon
-        if ($st.Misses -ge 2 -or $txt.Contains('interruptedbyuser')) {
+        $needed = $(if ($tQuiet) { 1 } else { 2 })                      # quiet transcript = second witness
+        if ($st.Misses -ge $needed -or $txt.Contains('interruptedbyuser')) {
             $script:BusyOverride[$apid] = @{ Status = 'idle'; FileTs = $q.Ts }
         }
     }
@@ -5470,6 +5489,29 @@ $script:Timer = New-Object System.Windows.Threading.DispatcherTimer
 $script:Timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
 $script:Timer.Add_Tick({ Update-List })
 $script:Timer.Start()
+
+# PULSE LANE: hooks write status files via tmp+rename, and NTFS bumps the
+# parent DIRECTORY's mtime on every create/rename inside it. One metadata
+# stat every 250ms (no handles held, no conhost contention, no per-file
+# enumeration) means a Stop hook's write reaches the UI in <0.3s instead of
+# waiting out the poll - the done-chirp lands the moment the hook lands,
+# same latency as a plain sound-playing hook. The 2s Timer stays as the
+# fallback truth (probes, untracked scans, decay states don't touch files).
+$script:StatusDirPath  = $StatusDir
+$script:StatusDirStamp = [datetime]::MinValue
+try { $script:StatusDirStamp = [System.IO.Directory]::GetLastWriteTimeUtc($StatusDir) } catch { }
+$script:PulseTimer = New-Object System.Windows.Threading.DispatcherTimer
+$script:PulseTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$script:PulseTimer.Add_Tick({
+    try {
+        $ts = [System.IO.Directory]::GetLastWriteTimeUtc($script:StatusDirPath)
+        if ($ts -ne $script:StatusDirStamp) {
+            $script:StatusDirStamp = $ts
+            Update-List
+        }
+    } catch { }
+})
+$script:PulseTimer.Start()
 
 # defer the first untracked-process scan: the window must be visible before
 # any potentially slow console probing happens

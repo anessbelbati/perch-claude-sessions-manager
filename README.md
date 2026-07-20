@@ -12,7 +12,12 @@
 </p>
 
 <p align="center">
-  <img src="screenshot.png" width="320" alt="perch watching 7 real sessions">
+  <img src="demo.gif" width="380" alt="a session finishes: double chirp, party hat, confetti">
+</p>
+<p align="center"><sub>a session finishes → double chirp, party hat, confetti. that's the whole pitch.</sub></p>
+
+<p align="center">
+  <img src="screenshot.png" width="340" alt="perch watching sessions: needs-you, working, done, and the one-click compact button">
 </p>
 
 ---
@@ -23,9 +28,9 @@ i run a LOT of claude code sessions at once. multiple windows terminal windows, 
 
 so i made perch. it's a tiny card that sits in the corner of your screen and just... tells you:
 
-- 🔴 **needs you** — waiting for permission or input (pulses + resurfaces so you actually notice)
-- 🟠 **working** — still cooking
-- 🟢 **done** — finished, waiting for your next prompt
+- 🔴 **needs you** — waiting for permission or input (pulses + resurfaces + a single chirp so you actually notice)
+- 🟠 **working** — still cooking (background tasks included — perch sees those even though hooks can't)
+- 🟢 **done** — finished **and readable**: perch waits for the terminal to stop typing before it says so, then double-chirps
 - 🔵 **quiet** — a live agent perch found on its own, no events from it yet
 
 and the best part: **click a row and it jumps to the EXACT windows terminal tab.** not "roughly the right window" — the exact tab, deterministically. (this took an embarrassing amount of effort, see war stories below.)
@@ -38,7 +43,9 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 - pin the widget = always on top. unpin = it stays out of your way and just flashes the taskbar when something needs you
 - also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
 - dead sessions disappear on their own, headless subagents / agent-team workers are hidden
-- **statuses that can't get stuck**: pressing esc mid-turn or finishing a `/compact` fires no hook event at all, which normally leaves a session painted "working" forever. perch notices a suspiciously stale busy row, quietly reads the console's actual screen, and corrects the label — a permission prompt hiding under "working" gets promoted to **needs you**, and a session stuck in `Unable to connect to API … retrying` shows as **api retry** (and flips back to working on its own the moment a retry gets through)
+- **done means DONE — three independent truth lanes**: hooks report events, but hooks alone lie in both directions (they fire when the *model* finishes while the terminal is still typing the answer, and they're structurally blind to background tasks that keep cooking after `Stop`). so perch cross-examines: **(1)** the hook trail, **(2)** claude code's own live self-report in `~/.claude/sessions/<pid>.json` — busy/idle/asking, background tasks included, flips instantly on esc, and **(3)** the console's actual pixels — a "done" row holds at working until one probe shows the screen calm and the answer is *readable*. the finish chirp additionally demands that the hooks *authored* the idle, so a manual `/compact` or an esc-interrupt never fakes a celebration
+- **statuses that can't get stuck**: for sessions without the native self-report (codex, gemini, anything hookless) perch notices a suspiciously stale busy row, quietly reads the console's actual screen, and corrects the label — a permission prompt hiding under "working" gets promoted to **needs you**, and a session stuck in `Unable to connect to API … retrying` shows as **api retry** (and flips back to working on its own the moment a retry gets through)
+- **one-click `/compact`**: past a context threshold you set (default 120k tokens, `0` = off) a purple **compact** chip appears on the row. click it and perch attaches to that session's console **by PID** and types `/compact` + Enter straight into its input buffer — no focus steal, no tab switch, works even minimized, wrong-window impossible. **never automatic** — you click, or nothing happens
 - **prompt peek**: hover any row → a little tooltip with the last thing you asked and the last thing claude answered, without touching the tab. read lazily from the transcript tail, cached, costs nothing until you linger
 - **parked**: a needs-you you've ignored for 30+ minutes (configurable) clearly wasn't that urgent — it demotes itself below "done", goes muted, stops pulsing. a fresh notification instantly brings the red back. fresh reds keep meaning *fresh*
 - **crash insurance**: perch keeps a rolling snapshot of every live session (id + folder). power cut, BSOD, accidental shutdown? on the next boot a quiet banner offers "*↻ 3 lost sessions — resume all*" — one click relaunches each one in its own terminal tab via `claude --resume`, staggered so they don't stampede. **nothing is ever relaunched automatically** — you click, or you dismiss and it's forgotten
@@ -48,7 +55,7 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 - **themes**: seven rooms for the bird to perch in — **midnight** (classic), **oled** (pure black, disappears into a dark desktop), **liquid glass** (real acrylic backdrop blur through DWM, specular rim light, reflection streaks — drag it over something colorful), **phosphor** (CRT green terminal, with actual scanlines), **nord** (polar night, frost-blue hairline), **catppuccin** (mocha walls, mauve rim), and **synthwave** (deep violet with a neon sun setting just below the card's bottom edge). the bird's halo re-tints to match whichever room you pick. status colors never change — those are semantics, not decoration. flip themes in ⚙ settings with live preview
 - **live limit bars**: how much of your 5-hour window and weekly caps you've burned and exactly when they reset, straight from the same endpoint the CLI's `/usage` screen uses. green → amber → red as you cook, with burn-rate prediction (`caps ~15:40`) when you're on pace to hit the wall before the reset. fetched by a background child every **5 minutes** (10 when the network's down) — deliberately gentle on the API, and the UI never waits on the network. and when *everything* is unreachable (offline, api down, rate-limited), a **local estimate** takes over: perch buckets your own transcripts into the same 5-hour billing windows (ccusage-style, anchored to the server's actual reset time) and calibrates tokens-per-window against official percentages it saw earlier — so the `5h ~local` bar keeps working with zero network at all
 - **account switcher**: got more than one paid Claude subscription? save each one once (`claude setup-token` → paste into ⚙ settings → claude accounts) and switching becomes one click instead of the whole logout-browser-login ritual. tokens are DPAPI-encrypted, switches apply to new sessions (`claude --continue` in a stuck tab brings your conversation back on the new account). manual only — perch never auto-switches, and honesty corner: we're not sure where Anthropic's ToS stands on rotating accounts around usage limits, so that call is yours
-- **actual bird chirps**: three lovely [mixkit](https://mixkit.co/free-sound-effects/bird/) chirps ship in `sounds/` — a random one plays whenever a session needs you (enable + set volume in ⚙ settings). drop your own `.wav`s in the folder to override; no wavs at all = a humble synth beep
+- **actual bird chirps**: three lovely [mixkit](https://mixkit.co/free-sound-effects/bird/) chirps ship in `sounds/` — a **single chirp** means a session needs you, a **double chirp** means work finished and the answer is ready to read. separate toggles + volume in ⚙ settings. drop your own `.wav`s in the folder to override; no wavs at all = a humble synth beep
 - one powershell script. no electron. no node_modules. your grandma's windows can run it
 
 ## "isn't there already something like this?"
@@ -110,6 +117,8 @@ the trick: claude code hooks run as child processes of the claude process, so th
 
 clicking a row re-matches against live tabs (fresh title first, UIA runtime id as tiebreaker), restores the window if minimized, selects the tab, brings it forward.
 
+the *other* hard problem is knowing when a session is actually **done**. the `Stop` hook fires when the model finishes — but a fullscreen TUI keeps typewriter-rendering the answer for 5–15 more seconds (we measured it live), and background tasks can keep working for *minutes* after `Stop` with no hook ever firing again. so "done" is a verdict, not an event: the hook trail, claude's native per-pid self-report (`~/.claude/sessions/<pid>.json`), and a console-screen probe all have to agree. the hook write is detected in ~250ms via a cheeky NTFS trick (a directory's mtime bumps when a child file is created or renamed — one stat call, four times a second, zero file watching), the native file covers everything hooks can't see, and the screen probe holds the "done" until the answer is actually on screen. the chirp only sings when the hooks themselves wrote the idle — so nothing that *isn't* a finish can ever sound like one.
+
 ## war stories
 
 things that bit me so they don't have to bite you:
@@ -124,6 +133,10 @@ things that bit me so they don't have to bite you:
 - **no hook fires on esc.** claude code's `Stop` hook deliberately skips user interrupts, and `/compact` has a `PreCompact` but no post — two officially invisible transitions that left rows painted "working" forever. the console screen is the only witness.
 - **the TUI's hint line rotates.** "esc to interrupt" vanishes every few seconds in favor of random tips — a session 9 minutes into a bash call showed only a tip. deciding a session stopped because that hint is absent flips live sessions to done; trust the elapsed-timer/token row and the title's spinner glyph instead, and demand two clean sightings before believing anything.
 - **`[Console]::In` decodes stdin with the OEM codepage.** claude pipes UTF-8 JSON into hooks; the console reader read it as CP437, so every em-dash and curly quote stored from assistant messages became `ΓÇö`-style mojibake in the session rows. read `OpenStandardInput()` through a UTF-8 StreamReader instead — and the widget carries a strict round-trip reverse-repair (re-encode CP437, strict-decode UTF-8, keep only if both succeed) that heals records written before the fix without ever touching organic text.
+- **a mutex is not a queue.** windows wakes mutex waiters in whatever order it feels like. every turn ends with `PostToolUse` (working) and `Stop` (idle) racing for the same status file, and whenever the *older* event won the wake order last, finished sessions stayed painted "working" for 10–30 seconds. atomicity is not ordering — events now carry a spawn-tick sequence number and stale ones politely discard themselves.
+- **your terminal lies about the present.** the `Stop` hook fires when the *model* finishes — but the TUI keeps typewriter-rendering the answer long after. we probed consoles at the exact instant status files flipped idle: 2 of 3 were still typing, one for 14 more seconds. "done" before you can read the answer is a lie, so idle rows hold at working until one probe shows the console calm.
+- **hooks are turn-blind.** a background task can keep cooking for ten minutes after `Stop` fired, and no hook will ever tell you. turns out claude code self-reports live per-process state in `~/.claude/sessions/<pid>.json` — busy/idle/asking, rewritten the instant it changes, background tasks included, flips on esc instantly. the CLI's own word, and it outranks the hook trail.
+- **the bird sang for a compact.** `SessionStart(source=compact)` repaints "working" so mid-turn auto-compacts don't flash a false done — but a *manual* `/compact` has nothing running, so the row bounced working→idle and the finish chirp fired for... a compact. the tell: on a real finish `Stop` *authors* the idle; on the phantom nothing ever writes it. the chirp now demands the hooks' signature on the idle (and esc-interrupts stopped chirping too — you stopped it, you know).
 - **you cannot recolor windows terminal tabs from outside. we tried everything. accept it.** the dream: tabs turn red when their session needs you. reality, in order of death: WT has no API for tab colors (manual menu or profile `tabColor` only); `SetConsoleTitle`-style external state never propagates through ConPTY (the marker-title corpse above already knew this); the ConEmu progress OSC (`ESC]9;4`) *does* reach WT — but renders as a tiny ring on the tab icon, not a tint, and claude code's statusline sanitizes OSC out anyway, so there's no delivery path into a claude tab at all. bonus humiliation: our first "successful" test was a tab that was red because *a human had right-clicked it and picked red* weeks earlier. always test against a control. the pill exists precisely because tabs can't say how they feel — turns out that's load-bearing. *(entry filed by the claude that fell for it. the human has been identified. it was the boss.)*
 
 ## stolen with love
@@ -135,6 +148,7 @@ perch is windows-native and proud, but a bunch of its best tricks were shameless
 - [ccmanager](https://github.com/kbwo/ccmanager) — the screen-content state detectors ("press enter to confirm…", "esc to interrupt") that power hookless needs-you detection. best pattern list in the business.
 - [CodexBar](https://github.com/steipete/CodexBar) — the *identify yourself as the CLI* User-Agent trick on the usage endpoint. one header, night and day difference in how you get rate-limited.
 - [ccseva](https://github.com/Iamshankhadeep/ccseva) and the rest of the menubar companion crowd — the conviction that a tiny always-visible meter beats a dashboard you have to open, plus the hover prompt-peek.
+- [claude-busy-monitor](https://github.com/pbauermeister/claude-busy-monitor) — the discovery that claude code self-reports live state in `~/.claude/sessions/<pid>.json`. perch's entire native truth lane exists because their readme mentioned that directory. (theirs is linux-only; the idea ported beautifully.)
 - [claude-squad](https://github.com/smtg-ai/claude-squad) — not robbed yet, but the git-worktree session spawning is on the list.
 
 no code was copied — everything here is hand-rolled PowerShell 5.1 (their stacks are TypeScript/Python/Go/Swift anyway, the trench coat wouldn't fit). *ideas*, however, were taken without hesitation, and a few came out upgraded: their 5h blocks floor to the hour, ours snap to the server's actual reset time; their caps are plan presets or P90 guesses, ours calibrate against official percentages. that's the deal with building in the open — thanks for doing it 🐦
@@ -149,6 +163,9 @@ no code was copied — everything here is hand-rolled PowerShell 5.1 (their stac
 | `Perch.vbs` | consoleless launcher |
 | `codex-notify-adapter.ps1` | codex notify → status adapter |
 | `blocks-probe.ps1` | local 5h-window usage math (offline limit bars) |
+| `console-probe.ps1` | disposable console screen reader (busy verification + landing gate) |
+| `console-inject.ps1` | by-PID keystroke injection (the compact button's hands) |
+| `usage-probe.ps1` | usage endpoint fetcher (limit bars) |
 | `gen-icon.ps1` | rebuilds the icon from `logo.png` |
 
 debugging: `perch.ps1 -Probe` prints the session table. `hud-error.log` has survived errors, `hud-boot.log` has startup stages.

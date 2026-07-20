@@ -1,3 +1,6 @@
+# backstage (never ship)
+LAUNCH-COPY.md
+
 # runtime state (per-user, not part of the project)
 hud-state.json
 hud-prefs.json

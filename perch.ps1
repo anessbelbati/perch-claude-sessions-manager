@@ -1596,13 +1596,14 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
 $script:CompactBusy = $false
 $script:CompactTarget = $null
 $script:CompactKeyTimer = $null
-function Invoke-CompactSession($Sess) {
-    # the compact button's whole job: jump to the session's tab and TYPE
-    # /compact for the human. NEVER automatic - the button appearing is the
-    # reminder, the click is the consent. SendKeys goes to the FOREGROUND
-    # window, so before typing a single character we verify focus actually
-    # landed on the terminal we aimed at - typing /compact into an email
-    # is a horror film.
+$script:CompactInjProc = $null
+$script:CompactInjTimer = $null
+$script:CompactInjStart = [datetime]::MinValue
+function Invoke-CompactFallback($Sess) {
+    # visible-dance fallback (only when silent injection failed): jump to the
+    # tab, then SendKeys. Keys go to the FOREGROUND window, so we verify the
+    # focus landed on the terminal we aimed at before typing a single char -
+    # typing /compact into an email is a horror film.
     if ($script:CompactBusy) { return }
     $script:CompactBusy = $true
     $ok = $false
@@ -1636,6 +1637,61 @@ function Invoke-CompactSession($Sess) {
     }
     $script:CompactTarget = $Sess
     $script:CompactKeyTimer.Stop(); $script:CompactKeyTimer.Start()
+}
+
+function Invoke-CompactSession($Sess) {
+    # the compact button's whole job, the CIVILIZED way: console-inject.ps1
+    # attaches to the session's console BY PID and writes /compact + Enter
+    # straight into its input buffer (WriteConsoleInput). No focus steal, no
+    # tab switch, wrong-window impossible, works while minimized - the user
+    # never leaves what they were doing. NEVER automatic: the button
+    # appearing is the reminder, the click is the consent. Falls back to the
+    # visible focus+SendKeys dance only if attach fails (exit != 0).
+    if ($script:CompactBusy) { return }
+    if ([int]$Sess.AgentPid -le 0) { return }
+    $inj = Join-Path $PSScriptRoot 'console-inject.ps1'
+    if (-not (Test-Path -LiteralPath $inj)) { Invoke-CompactFallback $Sess; return }
+    $script:CompactBusy = $true
+    $script:CompactTarget = $Sess
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$inj`" -TargetPid $([int]$Sess.AgentPid) -Text /compact -Enter"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    try { $script:CompactInjProc = [System.Diagnostics.Process]::Start($psi) } catch { $script:CompactInjProc = $null }
+    if ($null -eq $script:CompactInjProc) {
+        $script:CompactBusy = $false
+        Invoke-CompactFallback $Sess
+        return
+    }
+    if ($null -eq $script:CompactInjTimer) {
+        $script:CompactInjTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:CompactInjTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+        $script:CompactInjTimer.Add_Tick({
+            $p = $script:CompactInjProc
+            if ($null -eq $p) { $script:CompactInjTimer.Stop(); $script:CompactBusy = $false; return }
+            if (-not $p.HasExited) {
+                if (((Get-Date) - $script:CompactInjStart).TotalSeconds -gt 8) {
+                    try { $p.Kill() } catch { }
+                    try { $p.Dispose() } catch { }
+                    $script:CompactInjProc = $null
+                    $script:CompactInjTimer.Stop()
+                    $script:CompactBusy = $false
+                    Invoke-CompactFallback $script:CompactTarget
+                }
+                return
+            }
+            $code = 1
+            try { $code = $p.ExitCode } catch { }
+            try { $p.Dispose() } catch { }
+            $script:CompactInjProc = $null
+            $script:CompactInjTimer.Stop()
+            $script:CompactBusy = $false
+            if ($code -ne 0) { Invoke-CompactFallback $script:CompactTarget }
+        })
+    }
+    $script:CompactInjStart = Get-Date
+    $script:CompactInjTimer.Stop(); $script:CompactInjTimer.Start()
 }
 
 # single instance: launching again while one is running just exits, so HUDs

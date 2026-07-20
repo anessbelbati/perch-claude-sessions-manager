@@ -196,6 +196,46 @@ function Get-StatusMeta([string]$Status) {
     return @{ Rank = 5; Color = '#71717A'; Label = $Status }
 }
 
+$script:NativeCache = @{}   # pid -> {LWT; Val}: parse-once cache for the native state files
+function Get-NativeAgentStatus([int]$AgentPid, $Proc) {
+    # THE STEAL (thanks, claude-busy-monitor): claude code self-reports live
+    # per-process state in ~/.claude/sessions/<pid>.json - status busy/shell/
+    # idle/waiting, rewritten the moment it changes. It is the CLI's own word:
+    # it knows about BACKGROUND TASKS the hook lane is blind to (a bg agent
+    # filming for 10 minutes keeps status=busy while the hooks said idle at
+    # Stop), and it flips idle instantly on Esc-interrupts the hooks skip.
+    # pid reuse is guarded by procStart (process start ticks, 10ms tolerance -
+    # claude reads the start time via a different API and lands 1 tick off).
+    try {
+        $f = Join-Path $env:USERPROFILE ".claude\sessions\$AgentPid.json"
+        $fi = [System.IO.FileInfo]::new($f)
+        if (-not $fi.Exists) { return $null }
+        $cached = $script:NativeCache[$AgentPid]
+        if ($null -ne $cached -and $cached.LWT -eq $fi.LastWriteTimeUtc) { return $cached.Val }
+        $j = [IO.File]::ReadAllText($f) | ConvertFrom-Json
+        $val = $null
+        $ok = $true
+        if ($null -ne $j.PSObject.Properties['procStart'] -and $null -ne $Proc) {
+            [long]$ps = 0
+            if ([long]::TryParse([string]$j.procStart, [ref]$ps)) {
+                if ([Math]::Abs($Proc.StartTime.Ticks - $ps) -gt 100000) { $ok = $false }   # 10ms: pid was reused
+            }
+        }
+        if ($ok) {
+            $val = switch ([string]$j.status) {
+                'busy'    { 'working'; break }
+                'shell'   { 'working'; break }
+                'waiting' { 'attention'; break }
+                'idle'    { 'idle'; break }
+                default   { $null }
+            }
+        }
+        $script:NativeCache[$AgentPid] = @{ LWT = $fi.LastWriteTimeUtc; Val = $val }
+        return $val
+    }
+    catch { return $null }
+}
+
 function Format-Age([datetime]$Ts) {
     $span = (Get-Date) - $Ts
     if ($span.TotalSeconds -lt 60) { return 'now' }
@@ -264,6 +304,21 @@ function Get-Sessions {
         }
         elseif ($f.LastWriteTime -lt $now.AddMinutes(-30)) { continue }
 
+        # NATIVE STATE LANE: the CLI's own live self-report outranks the hook
+        # trail for the busy/idle/asking axis. Hooks still own everything else
+        # (identity, tab hints, messages, transcript, context). Two richer
+        # hook truths survive: error (native shows busy through api retries)
+        # and compacting (cosmetic purple, native calls it busy).
+        $nativeApplied = $false
+        if ($agentPid -gt 0 -and $null -ne $proc) {
+            $native = Get-NativeAgentStatus $agentPid $proc
+            if ($null -ne $native) {
+                $nativeApplied = $true
+                $keep = ($native -eq 'working' -and $status -in @('error', 'compacting'))
+                if (-not $keep -and $native -ne $status) { $status = $native }
+            }
+        }
+
         # sessions without a usable tab id (headless-flagged: second WT window
         # or manually RENAMED tabs blind the hook's marker trick; or hint-less:
         # capture keeps failing) go through our own resolver - which also feeds
@@ -331,6 +386,7 @@ function Get-Sessions {
             Window   = $s.window
             Context  = $(if ($null -ne $s.PSObject.Properties['context_tokens']) { [long]$s.context_tokens } else { 0 })
             Transcript = $(if ($null -ne $s.PSObject.Properties['transcript_path']) { [string]$s.transcript_path } else { '' })
+            Native   = $nativeApplied
             Rank     = (Get-StatusMeta $status).Rank
         })
     }
@@ -428,6 +484,16 @@ function Get-Sessions {
     foreach ($s in $kept) {
         if ($s.Status -notin @('working', 'compacting') -or $s.AgentPid -le 0) { continue }
         $apid = [int]$s.AgentPid
+        if ([bool]$s.Native) {
+            # the CLI vouches for this row itself - no stale-busy lie possible
+            # (Esc flips its native file to idle instantly). Never probe it,
+            # and drop any prober override so an old screen sighting can't
+            # fight the CLI's own word (bg-task busy looked calm to a probe).
+            [void]$script:BusyOverride.Remove($apid)
+            [void]$script:BusyVerify.Remove($apid)
+            $script:BusyPids[$apid] = $true
+            continue
+        }
         $ov = $script:BusyOverride[$apid]
         if ($null -ne $ov) {
             if ($ov.FileTs -eq $s.Ts) {

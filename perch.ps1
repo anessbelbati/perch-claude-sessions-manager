@@ -955,12 +955,12 @@ function Invoke-BusyVerify {
     # TRANSCRIPT HEARTBEAT: claude appends to its transcript every few
     # seconds while a turn runs; when the chat ends (or the user Escs) it
     # goes silent. One NTFS metadata stat - free, zero conhost contention -
-    # so a quiet transcript (>=8s) collapses the wait: grace 25s -> 6s and
-    # ONE clean sighting flips instead of two (two independent signals
-    # agree). The screen still has to look calm - a long Bash call has a
-    # quiet transcript but its elapsed-timer row and braille title spinner
-    # never stop, so Test-ScreenLooksBusy keeps it working. Worst case
-    # drops ~39s -> ~10-13s.
+    # so a quiet transcript (>=8s) collapses the WAITING: grace 25s -> 6s,
+    # first probe immediately, second look after 4s instead of 10. It NEVER
+    # waives the two-sighting rule: transcript silence is a weak witness
+    # (long pure-prose streams append the transcript only when the message
+    # COMPLETES), so one rotation-lie frame + a quiet transcript must not
+    # flip a still-writing session to done. Worst case ~39s -> ~15s.
     # Any newer hook write invalidates the override instantly.
     foreach ($q in @($script:BusyVerifyQueue)) {
         $apid = [int]$q.Pid
@@ -1020,9 +1020,8 @@ function Invoke-BusyVerify {
             continue
         }
         $st.Misses++
-        $st.Wait = 10                                                   # suspicious: look again soon
-        $needed = $(if ($tQuiet) { 1 } else { 2 })                      # quiet transcript = second witness
-        if ($st.Misses -ge $needed -or $txt.Contains('interruptedbyuser')) {
+        $st.Wait = $(if ($tQuiet) { 4 } else { 10 })                    # suspicious: look again soon(er if the transcript is silent)
+        if ($st.Misses -ge 2 -or $txt.Contains('interruptedbyuser')) {
             $script:BusyOverride[$apid] = @{ Status = 'idle'; FileTs = $q.Ts }
         }
     }
@@ -5570,6 +5569,11 @@ $script:PulseTimer.Add_Tick({
     try {
         $ts = [System.IO.Directory]::GetLastWriteTimeUtc($script:StatusDirPath)
         if ($ts -ne $script:StatusDirStamp) {
+            # DEBOUNCE: with many busy sessions the hooks write several times
+            # a second, and every full tick resets ProbeBudget - probe spam is
+            # exactly the conhost contention we swore off. Skip WITHOUT
+            # updating the stamp: the diff persists, the next pulse catches it.
+            if (((Get-Date) - $script:InTickStamp).TotalMilliseconds -lt 400) { return }
             $script:StatusDirStamp = $ts
             Update-List
         }

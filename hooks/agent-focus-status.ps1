@@ -621,6 +621,7 @@ try {
     $lastAssistantMessage = [string]$inputObject.last_assistant_message
     $prompt = [string]$inputObject.prompt
     $notification = [string]$inputObject.message
+    $startSource = [string]$inputObject.source
 
     $status = switch ($eventName) {
         "PreToolUse" { "working"; break }
@@ -629,7 +630,15 @@ try {
         "PreCompact" { "compacting"; break }
         "Stop" { "idle"; break }
         "StopFailure" { "error"; break }
-        "SessionStart" { "idle"; break }
+        "SessionStart" {
+            # compact-end is NOT a finish: the turn usually RESUMES right
+            # after, and a pure-prose continuation fires no hook until Stop -
+            # painting idle here showed DONE for minutes while claude was
+            # visibly writing. Paint working; a manual /compact that really
+            # ends idle gets corrected by the screen prober in ~15s.
+            if ($startSource -eq "compact") { "working" } else { "idle" }
+            break
+        }
         "Notification" { "attention"; break }
         "SessionEnd" { "ended"; break }
         default { "unknown" }

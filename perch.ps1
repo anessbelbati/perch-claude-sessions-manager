@@ -2100,7 +2100,7 @@ $script:PillParkedCount = 0     # parked (ignored 30+ min) -> the judging sideey
 $script:BirdFlapN = 0           # flap-burst frame counter (happy/happy2)
 $script:BirdFanFlip = $false    # hot/hot2 alternation phase
 $script:BirdFanTimer = $null    # created with the other timers below
-$script:PrevDoneCount = 0       # done-count rises -> happy hop
+$script:PrevStatusById = @{}    # session id -> last status: a real FINISH is working->idle per session
 $script:BootStamp = Get-Date    # suppresses the done-chirp for already-done sessions found at launch
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
@@ -5260,7 +5260,23 @@ function Update-List {
     $script:PillParkedCount = @($visible | Where-Object { $_.Status -eq 'parked' }).Count
     $script:PillDoneAll = ($done -gt 0 -and $att -eq 0 -and $work -eq 0)
     Update-PillCluster $att $work $done $quiet
-    if ($done -gt $script:PrevDoneCount) {
+    # a FINISH is a per-session working->idle transition - NOT the aggregate
+    # done-count rising. The count lied constantly: every compact bounce
+    # (compacting -> SessionStart repaints idle for a beat -> resumes
+    # working), every new tab born idle, every reappearing row bumped it,
+    # so the bird sang at state changes that finished nothing. compacting->
+    # idle is deliberately NOT a finish (that is the compact bounce), and a
+    # session with no previous state (new tab, boot, unhidden) never sings.
+    $newlyDone = $false
+    $curStatus = @{}
+    foreach ($s in $visible) {
+        $sid = [string]$s.Id
+        $prev = [string]$script:PrevStatusById[$sid]
+        if ($s.Status -eq 'idle' -and ($prev -eq 'working' -or $prev -eq 'retrying')) { $newlyDone = $true }
+        $curStatus[$sid] = [string]$s.Status
+    }
+    $script:PrevStatusById = $curStatus
+    if ($newlyDone) {
         Invoke-DoneChirp          # the finish line SINGS (double chirp)
         Invoke-BirdMotion 'hop'   # work finished!
         if ($null -ne $script:BirdFaces['happy']) {
@@ -5274,7 +5290,6 @@ function Update-List {
             }
         }
     }
-    $script:PrevDoneCount = $done
 
     # resurface the HUD when a session NEWLY needs attention
     $curAtt = @{}

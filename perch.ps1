@@ -454,6 +454,52 @@ function Get-Sessions {
     $script:BusyVerifyQueue = $queue
     try { Invoke-BusyVerify } catch { }
 
+    # LANDING GATE: a Stop write means the MODEL finished - but the terminal
+    # keeps TYPING the answer for 5-15s after (proven live: 2 of 3 real
+    # flips still showed a busy console AT the flip instant; one was still
+    # typing 14s later). Done should mean READABLE, so a hook-flipped idle
+    # row holds at 'working' until one probe shows the console calm - the
+    # hook already says idle, screen-calm is the second independent witness.
+    # Capped at 25s / 2 failed probes (headless consoles land immediately).
+    # Prober-lane overrides never enter: their screens are proven calm.
+    foreach ($s in $kept) {
+        $apid = [int]$s.AgentPid
+        if ($apid -le 0 -or $s.Status -ne 'idle') {
+            if ($apid -gt 0) { [void]$script:LandingByPid.Remove($apid) }
+            continue
+        }
+        $land = $script:LandingByPid[$apid]
+        if ($null -eq $land) {
+            $prevSt = [string]$script:PrevStatusById[[string]$s.Id]
+            if ($prevSt -notin @('working', 'retrying', 'compacting')) { continue }
+            $land = @{ Since = Get-Date; Fails = 0 }
+            $script:LandingByPid[$apid] = $land
+        }
+        if (((Get-Date) - $land.Since).TotalSeconds -ge 25) {
+            [void]$script:LandingByPid.Remove($apid)          # cap: land regardless
+            continue
+        }
+        $hold = $true
+        $r = Request-ConsoleInfo -TargetPid $apid
+        if ($null -ne $r) {
+            if ($null -ne $r.PSObject.Properties['Failed']) {
+                $land.Fails = [int]$land.Fails + 1
+                if ($land.Fails -ge 2) {
+                    [void]$script:LandingByPid.Remove($apid)  # unprobeable: land now
+                    $hold = $false
+                }
+            }
+            elseif (-not (Test-ScreenLooksBusy ([string]$r.Screen) ([string]$r.Title))) {
+                [void]$script:LandingByPid.Remove($apid)      # calm: the answer is READABLE - land (chirp fires this tick)
+                $hold = $false
+            }
+        }
+        if ($hold) {
+            $s.Status = 'working'
+            $s.Rank   = (Get-StatusMeta 'working').Rank
+        }
+    }
+
     # a needs-you left hanging past N minutes isn't urgent anymore - you saw
     # it, you moved on. Demote it to PARKED: muted, below 'done', no pulse,
     # no chirp - fresh reds keep meaning fresh. A NEW notification (newer
@@ -664,6 +710,7 @@ $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same co
 $script:BusyPids = @{}          # pids of WORKING sessions - background probing leaves them alone
 $script:BusyVerify = @{}        # pid -> {FileTs; Stamp; Wait; Misses}: stale-busy verification state
 $script:BusyOverride = @{}      # pid -> {Status; FileTs}: screen-proven correction of a stuck status
+$script:LandingByPid = @{}      # pid -> {Since; Fails}: hook says idle but the console is still TYPING the answer
 $script:BusyVerifyQueue = @()   # busy rows eligible for verification, rebuilt every tick
 $script:AttnSince = @{}         # session id -> when it started needing you (parked-demotion clock)
 $script:UntrackedPids = @{}     # pids currently shown as untracked rows (screen-state detection)

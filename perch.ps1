@@ -44,6 +44,7 @@ $script:ChirpOn = $false
 $script:ChirpDoneOn = $true   # a finish SOUND is the thing you're waiting for - on by default
 $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
+$script:CompactAtK = 120   # context (k tokens) past which a row grows its compact button (0 = never)
 $script:ShowTimers = $true
 $script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (midnight/oled/glass/phosphor/nord/catppuccin/synthwave)
 $script:AcctDisclaimerOk = $false
@@ -57,6 +58,7 @@ try {
         if ($null -ne $cfg.PSObject.Properties['ChirpOnDone']) { $script:ChirpDoneOn = [bool]$cfg.ChirpOnDone }
         if ($null -ne $cfg.PSObject.Properties['ChirpVolume']) { $script:ChirpVolume = [int]$cfg.ChirpVolume }
         if ($null -ne $cfg.PSObject.Properties['ParkAfterMinutes']) { $script:ParkMinutes = [int]$cfg.ParkAfterMinutes }
+        if ($null -ne $cfg.PSObject.Properties['CompactAtK']) { $script:CompactAtK = [int]$cfg.CompactAtK }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($null -ne $cfg.PSObject.Properties['ThemeName']) { $script:ThemeName = [string]$cfg.ThemeName }
         if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
@@ -166,6 +168,7 @@ namespace ClaudeHud {
             FlashWindowEx(ref fi);
         }
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
@@ -178,6 +181,7 @@ namespace ClaudeHud {
 }
 Add-Type -AssemblyName UIAutomationClient -ErrorAction SilentlyContinue
 Add-Type -AssemblyName UIAutomationTypes  -ErrorAction SilentlyContinue
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue   # SendKeys for the compact button
 
 # ---------- session model ----------
 $script:StatusMeta = @{
@@ -1587,6 +1591,51 @@ if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA',
         '-WindowStyle', 'Hidden', '-File', $PSCommandPath) | Out-Null
     exit 0
+}
+
+$script:CompactBusy = $false
+$script:CompactTarget = $null
+$script:CompactKeyTimer = $null
+function Invoke-CompactSession($Sess) {
+    # the compact button's whole job: jump to the session's tab and TYPE
+    # /compact for the human. NEVER automatic - the button appearing is the
+    # reminder, the click is the consent. SendKeys goes to the FOREGROUND
+    # window, so before typing a single character we verify focus actually
+    # landed on the terminal we aimed at - typing /compact into an email
+    # is a horror film.
+    if ($script:CompactBusy) { return }
+    $script:CompactBusy = $true
+    $ok = $false
+    try { $ok = Invoke-FocusSession $Sess } catch { }
+    if (-not $ok) { $script:CompactBusy = $false; return }
+    if ($null -eq $script:CompactKeyTimer) {
+        $script:CompactKeyTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:CompactKeyTimer.Interval = [TimeSpan]::FromMilliseconds(650)   # let WT land the tab switch
+        $script:CompactKeyTimer.Add_Tick({
+            $script:CompactKeyTimer.Stop()
+            try {
+                $fg = [ClaudeHud.Native]::GetForegroundWindow()
+                $fpid = [uint32]0
+                [void][ClaudeHud.Native]::GetWindowThreadProcessId($fg, [ref]$fpid)
+                $fname = ''
+                try { $fname = (Get-Process -Id ([int]$fpid) -ErrorAction Stop).ProcessName } catch { }
+                $sess = $script:CompactTarget
+                $expected = [long]0
+                if ($null -ne $sess -and $null -ne $sess.Window -and
+                    $null -ne $sess.Window.PSObject.Properties['hwnd']) {
+                    $expected = [long]$sess.Window.hwnd
+                }
+                if (($expected -gt 0 -and [long]$fg -eq $expected) -or
+                    $fname -in @('WindowsTerminal', 'OpenConsole', 'conhost')) {
+                    [System.Windows.Forms.SendKeys]::SendWait('/compact{ENTER}')
+                }
+            }
+            catch { }
+            finally { $script:CompactBusy = $false }
+        })
+    }
+    $script:CompactTarget = $Sess
+    $script:CompactKeyTimer.Stop(); $script:CompactKeyTimer.Start()
 }
 
 # single instance: launching again while one is running just exits, so HUDs
@@ -3876,7 +3925,7 @@ function Update-AccountsPanel {
     [void]$script:AcctPanel.Children.Add($add)
 }
 
-function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true) {
+function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true, [string]$CompactRaw = '') {
     if ($script:ThemeSpecs.Keys -contains $Theme -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
         Apply-Theme
@@ -3901,6 +3950,11 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
     if ([int]::TryParse($ParkRaw.Trim(), [ref]$park) -and $park -ge 0 -and $park -le 1440) {
         $script:ParkMinutes = $park
         if ($park -eq 0) { $script:AttnSince = @{} }   # never park: forget the clocks
+    }
+
+    $cak = 0
+    if ([int]::TryParse($CompactRaw.Trim(), [ref]$cak) -and $cak -ge 0 -and $cak -le 5000) {
+        $script:CompactAtK = $cak
     }
 
     $names = @()
@@ -3942,6 +3996,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName ChirpOnDone       -NotePropertyValue $script:ChirpDoneOn -Force
         $cfg | Add-Member -NotePropertyName ChirpVolume       -NotePropertyValue $script:ChirpVolume -Force
         $cfg | Add-Member -NotePropertyName ParkAfterMinutes  -NotePropertyValue $script:ParkMinutes -Force
+        $cfg | Add-Member -NotePropertyName CompactAtK        -NotePropertyValue $script:CompactAtK -Force
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
@@ -4062,6 +4117,18 @@ function Show-SettingsDialog {
     [void]$numRow.Children.Add($colPark)
     [void]$stack.Children.Add($numRow)
 
+    $numRow2 = New-Object System.Windows.Controls.StackPanel
+    $numRow2.Orientation = 'Horizontal'
+    $numRow2.Margin = New-Object System.Windows.Thickness(0, 6, 0, 0)
+    $colCompact = New-Object System.Windows.Controls.StackPanel
+    [void]$colCompact.Children.Add((New-DarkLabel 'compact button past (k tokens, 0=off)'))
+    $inCompact = New-InputBox ([string]$script:CompactAtK)
+    $inCompact.Width = 64
+    $inCompact.HorizontalAlignment = 'Left'
+    [void]$colCompact.Children.Add($inCompact)
+    [void]$numRow2.Children.Add($colCompact)
+    [void]$stack.Children.Add($numRow2)
+
     [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
     $inProcs = New-InputBox ($script:AgentProcNames -join ', ')
     [void]$stack.Children.Add($inProcs)
@@ -4101,6 +4168,7 @@ function Show-SettingsDialog {
     $dlg.Tag = @{
         Chirp = $rowChirp.Tag; ChirpDone = $rowChirpDn.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
         Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child; Park = $inPark.Child
+        Compact = $inCompact.Child
     }
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
@@ -4110,7 +4178,7 @@ function Show-SettingsDialog {
         $script:ThemeSaved = $true
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
-                           ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag)
+                           ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag) ([string]$c.Compact.Text)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
@@ -4908,7 +4976,7 @@ function New-SessionRow($Sess) {
     [System.Windows.Controls.Grid]::SetColumn($mid, 1)
 
     $line1 = New-Object System.Windows.Controls.Grid
-    foreach ($wdef in @('*', 'Auto', 'Auto')) {
+    foreach ($wdef in @('*', 'Auto', 'Auto', 'Auto')) {
         $cd = New-Object System.Windows.Controls.ColumnDefinition
         if ($wdef -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
         else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
@@ -4921,6 +4989,38 @@ function New-SessionRow($Sess) {
     $name.TextTrimming = 'CharacterEllipsis'
     [System.Windows.Controls.Grid]::SetColumn($name, 0)
     [void]$line1.Children.Add($name)
+    # the compact button: appears when this session's head is past YOUR
+    # threshold (settings, 0=off). Click = jump to the tab and type /compact
+    # for you. NEVER automatic - appearing is the reminder, clicking is the
+    # consent. Purple on purpose: it foreshadows the compacting state.
+    $cbtn = New-Object System.Windows.Controls.Border
+    $cbtn.CornerRadius = New-Object System.Windows.CornerRadius(6)
+    $cbtn.Background = Get-Brush '#26B48EF0'
+    $cbtn.BorderBrush = Get-Brush '#59B48EF0'
+    $cbtn.BorderThickness = New-Object System.Windows.Thickness(1)
+    $cbtn.Padding = New-Object System.Windows.Thickness(6, 1, 6, 2)
+    $cbtn.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
+    $cbtn.VerticalAlignment = 'Center'
+    $cbtn.Cursor = [System.Windows.Input.Cursors]::Hand
+    $cbtn.Visibility = 'Collapsed'
+    $cbtn.ToolTip = 'context past your threshold - click: jump there and type /compact for you'
+    $cbtnTxt = New-Object System.Windows.Controls.TextBlock
+    $cbtnTxt.Text = 'compact'
+    $cbtnTxt.FontSize = 9.5
+    $cbtnTxt.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $cbtnTxt.Foreground = Get-Brush '#CBB2F5'
+    $cbtn.Child = $cbtnTxt
+    $cbtn.Tag = $row
+    $cbtn.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#40B48EF0' })
+    $cbtn.Add_MouseLeave({ param($s, $e) $s.Background = Get-Brush '#26B48EF0' })
+    $cbtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+    $cbtn.Add_MouseLeftButtonUp({
+        param($s, $e)
+        $e.Handled = $true
+        Invoke-CompactSession $s.Tag.Tag   # row.Tag = the LIVE session object
+    })
+    [System.Windows.Controls.Grid]::SetColumn($cbtn, 1)
+    [void]$line1.Children.Add($cbtn)
     # context meter: how full this session's head is (e.g. 178k). muted while
     # comfy, amber past 180k, red past 256k - compact when YOU decide to.
     $ctx = New-Object System.Windows.Controls.TextBlock
@@ -4931,14 +5031,14 @@ function New-SessionRow($Sess) {
     $ctx.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
     $ctx.Visibility = 'Collapsed'
     $ctx.ToolTip = 'context in this session''s head'
-    [System.Windows.Controls.Grid]::SetColumn($ctx, 1)
+    [System.Windows.Controls.Grid]::SetColumn($ctx, 2)
     [void]$line1.Children.Add($ctx)
     $age = New-Object System.Windows.Controls.TextBlock
     $age.FontSize = 10.5
     $age.Foreground = Get-Brush '#5F5F6A'
     $age.VerticalAlignment = 'Center'
     $age.Margin = New-Object System.Windows.Thickness(8, 0, 0, 0)
-    [System.Windows.Controls.Grid]::SetColumn($age, 2)
+    [System.Windows.Controls.Grid]::SetColumn($age, 3)
     [void]$line1.Children.Add($age)
     [void]$mid.Children.Add($line1)
 
@@ -5071,8 +5171,8 @@ function New-SessionRow($Sess) {
 
     $entry = @{
         Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age; Ctx = $ctx
-        RunStatus = $runStatus; RunMsg = $runMsg
-        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''
+        RunStatus = $runStatus; RunMsg = $runMsg; CompactBtn = $cbtn
+        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''; CompactKey = ''
     }
     Update-SessionRow $entry $Sess
     return $entry
@@ -5126,6 +5226,16 @@ function Update-SessionRow($Entry, $Sess) {
             $Entry.Ctx.Foreground = Get-Brush $col
             $Entry.Ctx.Visibility = 'Visible'
         }
+    }
+
+    # compact button: threshold from settings, claude rows only (/compact is
+    # his dialect), hidden while already compacting
+    $showCompact = ($script:CompactAtK -gt 0 -and $ctxVal -ge ([long]$script:CompactAtK * 1000) -and
+                    $Sess.Status -ne 'compacting' -and [string]$Sess.Provider -eq 'claude')
+    $compactKey = [string]$showCompact
+    if ($Entry.CompactKey -ne $compactKey) {
+        $Entry.CompactKey = $compactKey
+        $Entry.CompactBtn.Visibility = $(if ($showCompact) { 'Visible' } else { 'Collapsed' })
     }
 
     $snippet = ($Sess.Message -replace '\s+', ' ').Trim()

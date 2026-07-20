@@ -314,6 +314,8 @@ function Get-Sessions {
         # hook truths survive: error (native shows busy through api retries)
         # and compacting (cosmetic purple, native calls it busy).
         $nativeApplied = $false
+        $hookStatus = $status   # the hooks' own word, pre-override: the done
+                                # chirp trusts ONLY a hook-authored idle
         if ($agentPid -gt 0 -and $null -ne $proc) {
             $native = Get-NativeAgentStatus $agentPid $proc
             if ($null -ne $native) {
@@ -391,6 +393,7 @@ function Get-Sessions {
             Context  = $(if ($null -ne $s.PSObject.Properties['context_tokens']) { [long]$s.context_tokens } else { 0 })
             Transcript = $(if ($null -ne $s.PSObject.Properties['transcript_path']) { [string]$s.transcript_path } else { '' })
             Native   = $nativeApplied
+            HookStatus = $hookStatus
             Rank     = (Get-StatusMeta $status).Rank
         })
     }
@@ -2318,6 +2321,9 @@ $script:BirdFlapN = 0           # flap-burst frame counter (happy/happy2)
 $script:BirdFanFlip = $false    # hot/hot2 alternation phase
 $script:BirdFanTimer = $null    # created with the other timers below
 $script:PrevStatusById = @{}    # session id -> last status: a real FINISH is working->idle per session
+$script:PendingDoneById = @{}   # session id -> when the NATIVE lane landed an idle the hooks never wrote:
+                                # a real finish gets Stop's idle within seconds - a manual /compact or an
+                                # Esc-interrupt never does, and must not sing
 $script:BootStamp = Get-Date    # suppresses the done-chirp for already-done sessions found at launch
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
@@ -5538,19 +5544,38 @@ function Update-List {
     $script:PillParkedCount = @($visible | Where-Object { $_.Status -eq 'parked' }).Count
     $script:PillDoneAll = ($done -gt 0 -and $att -eq 0 -and $work -eq 0)
     Update-PillCluster $att $work $done $quiet
-    # a FINISH is a per-session working->idle transition - NOT the aggregate
-    # done-count rising. The count lied constantly: every compact bounce
-    # (compacting -> SessionStart repaints idle for a beat -> resumes
-    # working), every new tab born idle, every reappearing row bumped it,
-    # so the bird sang at state changes that finished nothing. compacting->
-    # idle is deliberately NOT a finish (that is the compact bounce), and a
-    # session with no previous state (new tab, boot, unhidden) never sings.
+    # a FINISH is a per-session working->idle transition WHERE THE HOOKS
+    # THEMSELVES WROTE THE IDLE. Two generations of lies led here: the
+    # aggregate done-count sang at compact bounces / new tabs / reappearing
+    # rows; then per-session transitions still sang when a MANUAL /compact
+    # bounced through SessionStart(source=compact)'s 'working' repaint and
+    # the native lane landed it back to idle with nothing having run at all.
+    # The tell: on a real finish Stop AUTHORS the idle in the status file -
+    # on the phantom (and on Esc-interrupts, where you stopped it yourself)
+    # nothing ever writes idle, the native lane lands it alone. So a native-
+    # led idle holds the note: if the hooks' idle arrives within 6s (native
+    # usually beats Stop's write by under a second on real finishes) the
+    # bird sings then - if nothing arrives, nothing finished. Silence.
     $newlyDone = $false
     $curStatus = @{}
     foreach ($s in $visible) {
         $sid = [string]$s.Id
         $prev = [string]$script:PrevStatusById[$sid]
-        if ($s.Status -eq 'idle' -and ($prev -eq 'working' -or $prev -eq 'retrying')) { $newlyDone = $true }
+        $wasWork = ($prev -eq 'working' -or $prev -eq 'retrying')
+        if ($s.Status -eq 'idle') {
+            $hookIdle = ([string]$s.HookStatus -eq 'idle')
+            if ($wasWork) {
+                if ($hookIdle) { $newlyDone = $true; [void]$script:PendingDoneById.Remove($sid) }
+                else { $script:PendingDoneById[$sid] = Get-Date }
+            }
+            elseif ($script:PendingDoneById.ContainsKey($sid)) {
+                if ($hookIdle) { $newlyDone = $true; [void]$script:PendingDoneById.Remove($sid) }
+                elseif (((Get-Date) - [datetime]$script:PendingDoneById[$sid]).TotalSeconds -ge 6) {
+                    [void]$script:PendingDoneById.Remove($sid)   # nothing finished: stay silent
+                }
+            }
+        }
+        else { [void]$script:PendingDoneById.Remove($sid) }
         $curStatus[$sid] = [string]$s.Status
     }
     $script:PrevStatusById = $curStatus

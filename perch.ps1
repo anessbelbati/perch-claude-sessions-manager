@@ -586,6 +586,7 @@ function Get-Sessions {
             [void]$script:AttnTickByPid.Remove($apid)
             continue
         }
+        if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid st=$($s.Status) prov=$($s.Provider) tick=$([int]$script:AttnTickByPid[$apid] + 1)" -ErrorAction SilentlyContinue }
         # DEBOUNCE: only a row that STAYS blocked earns an attach. A status
         # flicker (working -> attention -> working) on a session that is
         # actually rendering must never cost it a console probe - attached
@@ -596,16 +597,22 @@ function Get-Sessions {
         if ($null -ne $cool -and ((Get-Date) - [datetime]$cool).TotalSeconds -lt 8) { continue }
         $cap = $script:PromptCapByPid[$apid]
         if ($null -ne $cap -and ((Get-Date) - [datetime]$cap.Stamp).TotalSeconds -lt 20) { continue }
-        $r = Request-ConsoleInfo -TargetPid $apid -Raw
-        if ($null -eq $r) { continue }   # probe in flight or budget-starved: next tick
+        $preFlight = $script:ProbeJobs.ContainsKey($apid)
+        $preAge = -1
+        if ($preFlight) { try { $preAge = [int]((Get-Date) - $script:ProbeJobs[$apid].Started).TotalSeconds } catch { $preAge = -2 } }
+        $r = Request-ConsoleInfo -TargetPid $apid -Raw -Priority
+        if ($null -eq $r) { if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid probe null: preflight=$preFlight age=$preAge budget=$($script:ProbeBudget) nowflight=$($script:ProbeJobs.ContainsKey($apid))" -ErrorAction SilentlyContinue }; continue }   # probe in flight: next tick
         if ($null -ne $r.PSObject.Properties['Failed']) {
+            if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid probe FAILED" -ErrorAction SilentlyContinue }
             $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = $null }
             continue
         }
         # collected some OTHER lane's plain (no-raw) probe for this pid:
         # don't cache an empty parse for 20s - retry with a raw probe next tick
-        if (-not [bool]$r.RawProbe) { continue }
-        $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = (ConvertTo-PendingPrompt ([string]$r.RawTail)) }
+        if (-not [bool]$r.RawProbe) { if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid collected PLAIN probe, retrying raw" -ErrorAction SilentlyContinue }; continue }
+        $parsedP = ConvertTo-PendingPrompt ([string]$r.RawTail)
+        if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid CAPTURED rawlen=$(([string]$r.RawTail).Length) parsed=$($null -ne $parsedP) q=$(if ($parsedP) { $parsedP.Question })" -ErrorAction SilentlyContinue }
+        $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = $parsedP }
     }
 
     # a needs-you left hanging past N minutes isn't urgent anymore - you saw
@@ -616,6 +623,12 @@ function Get-Sessions {
         foreach ($s in $kept) {
             $sid = [string]$s.Id
             if ($s.Status -ne 'attention') { [void]$script:AttnSince.Remove($sid); continue }
+            # a captured pending prompt = one-click answerable. That row is
+            # the whole point of the answer lane - it never fades to parked
+            # (observed live: park demoted the row AFTER the lane captured,
+            # so the buttons existed but the strip gate never dressed them)
+            $capP = $script:PromptCapByPid[[int]$s.AgentPid]
+            if ($null -ne $capP -and $null -ne $capP.Prompt) { [void]$script:AttnSince.Remove($sid); continue }
             $seed = $script:AttnSince[$sid]
             if ($null -eq $seed -or $s.Ts -gt $seed) { $seed = $s.Ts; $script:AttnSince[$sid] = $seed }
             if (((Get-Date) - $seed).TotalMinutes -ge $script:ParkMinutes) {
@@ -737,7 +750,12 @@ function Request-ConsoleInfo {
     # -Raw: ask the probe child for the raw visible rows too (answer lane
     # only) - the collected result carries RawProbe so a caller who NEEDS
     # raw can tell when it collected some other lane's plain probe instead.
-    param([int]$TargetPid, [switch]$Raw)
+    # -Priority: exempt from the per-tick start budget. The budget exists to
+    # pace BACKGROUND probing; a blocked row waiting for a human is the
+    # highest-value probe in the building, and on a busy fleet the shared
+    # budget is burned by busy-verify/learner before this lane ever runs
+    # (observed live: answer lane starved for minutes, buttons never came).
+    param([int]$TargetPid, [switch]$Raw, [switch]$Priority)
 
     if ($script:ProbeJobs.ContainsKey($TargetPid)) {
         $job = $script:ProbeJobs[$TargetPid]
@@ -753,19 +771,23 @@ function Request-ConsoleInfo {
         [void]$script:ProbeJobs.Remove($TargetPid)
         try {
             if ($job.Proc.ExitCode -ne 0) { return [pscustomobject]@{ Failed = $true } }
-            $title = $job.Proc.StandardOutput.ReadLine()
+            # stdout was drained ASYNC while the child ran. Reading only after
+            # exit DEADLOCKED the child on wide consoles: a ~210-col raw tail
+            # overflows the 4KB pipe buffer, the child blocks mid-WriteLine,
+            # never exits, and eats the 8s kill - forever (observed live:
+            # answer buttons never appeared; spawn-kill-respawn every 8s).
+            $all = ''
+            try { $all = [string]$job.Out.Result } catch { $all = '' }
+            $lines = $all -split "`r?`n"
+            $title = $(if ($lines.Count -ge 1) { $lines[0] } else { '' })
             [long]$hwnd = 0
-            $hwndLine = $job.Proc.StandardOutput.ReadLine()
-            if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
-            $screen = $job.Proc.StandardOutput.ReadLine()
-            if ($null -eq $screen) { $screen = '' }
+            if ($lines.Count -ge 2) { [void][long]::TryParse($lines[1].Trim(), [ref]$hwnd) }
+            $screen = $(if ($lines.Count -ge 3) { [string]$lines[2] } else { '' })
             [long]$conPid = 0
-            $conLine = $job.Proc.StandardOutput.ReadLine()
-            if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
+            if ($lines.Count -ge 4) { [void][long]::TryParse($lines[3].Trim(), [ref]$conPid) }
             $rawTail = ''
-            $rawLine = $job.Proc.StandardOutput.ReadLine()
-            if (-not [string]::IsNullOrWhiteSpace($rawLine)) {
-                try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawLine.Trim())) } catch { $rawTail = '' }
+            if ($lines.Count -ge 5 -and -not [string]::IsNullOrWhiteSpace($lines[4])) {
+                try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lines[4].Trim())) } catch { $rawTail = '' }
             }
             return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail; RawProbe = [bool]$job.Raw }
         }
@@ -773,10 +795,14 @@ function Request-ConsoleInfo {
         finally { try { $job.Proc.Dispose() } catch { } }
     }
 
-    if ($script:ProbeBudget -le 0) { return $null }
-    $script:ProbeBudget--
+    if (-not $Priority -and $script:ProbeBudget -le 0) { return $null }
+    if ($script:ProbeBudget -gt 0) { $script:ProbeBudget-- }
     $p = Start-ConsoleProbe -TargetPid $TargetPid -Raw:$Raw
-    if ($null -ne $p) { $script:ProbeJobs[$TargetPid] = @{ Proc = $p; Started = Get-Date; Raw = [bool]$Raw } }
+    if ($null -ne $p) {
+        # begin draining stdout NOW (see deadlock note in the collect path)
+        $t = $p.StandardOutput.ReadToEndAsync()
+        $script:ProbeJobs[$TargetPid] = @{ Proc = $p; Started = Get-Date; Raw = [bool]$Raw; Out = $t }
+    }
     return $null
 }
 
@@ -788,24 +814,27 @@ function Read-ConsoleInfoBounded {
     $p = Start-ConsoleProbe -TargetPid $TargetPid
     if ($null -eq $p) { return $null }
     try {
+        # drain stdout ASYNC before waiting: a screen bigger than the 4KB
+        # pipe buffer otherwise deadlocks the child (same law as the async
+        # collect path in Request-ConsoleInfo)
+        $tOut = $p.StandardOutput.ReadToEndAsync()
         if (-not $p.WaitForExit(3000)) {
             try { $p.Kill() } catch { }
             return $null
         }
         if ($p.ExitCode -ne 0) { return $null }
-        $title = $p.StandardOutput.ReadLine()
+        $all = ''
+        try { $all = [string]$tOut.Result } catch { $all = '' }
+        $lines = $all -split "`r?`n"
+        $title = $(if ($lines.Count -ge 1) { $lines[0] } else { '' })
         [long]$hwnd = 0
-        $hwndLine = $p.StandardOutput.ReadLine()
-        if ($null -ne $hwndLine) { [void][long]::TryParse($hwndLine.Trim(), [ref]$hwnd) }
-        $screen = $p.StandardOutput.ReadLine()
-        if ($null -eq $screen) { $screen = '' }
+        if ($lines.Count -ge 2) { [void][long]::TryParse($lines[1].Trim(), [ref]$hwnd) }
+        $screen = $(if ($lines.Count -ge 3) { [string]$lines[2] } else { '' })
         [long]$conPid = 0
-        $conLine = $p.StandardOutput.ReadLine()
-        if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
+        if ($lines.Count -ge 4) { [void][long]::TryParse($lines[3].Trim(), [ref]$conPid) }
         $rawTail = ''
-        $rawLine = $p.StandardOutput.ReadLine()
-        if (-not [string]::IsNullOrWhiteSpace($rawLine)) {
-            try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawLine.Trim())) } catch { $rawTail = '' }
+        if ($lines.Count -ge 5 -and -not [string]::IsNullOrWhiteSpace($lines[4])) {
+            try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($lines[4].Trim())) } catch { $rawTail = '' }
         }
         return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail }
     }
@@ -1755,6 +1784,7 @@ function Invoke-CompactSession($Sess) {
 # (The SDK-bound tools closed this as impossible. It isn't, down here.)
 $script:PromptCapByPid = @{}    # pid -> @{ Stamp; Prompt }: parsed pending prompt per blocked row
 $script:AttnTickByPid = @{}     # pid -> consecutive attention ticks (debounce: flickers never earn a probe)
+$script:AnswerDebug = $false    # trace the answer lane to hud-answer.log (flip on when field-debugging)
 $script:AnswerCoolByPid = @{}   # pid -> when an answer was injected (mute stale strip while the screen catches up)
 $script:AnswerBusy = $false
 $script:AnswerInjProc = $null
@@ -2188,7 +2218,8 @@ try {
                 -not [string]::IsNullOrWhiteSpace([string]$p.cwd) -and
                 (Test-Path -LiteralPath ([string]$p.cwd))) {
                 [void]$script:RestorePending.Add(@{
-                    Id = [string]$p.id; Cwd = [string]$p.cwd; Name = [string]$p.name })
+                    Id = [string]$p.id; Cwd = [string]$p.cwd; Name = [string]$p.name
+                    Flags = [string]$p.flags })   # absent in old snapshots -> ''
             }
         }
     }
@@ -2214,17 +2245,41 @@ function Update-RestoreBar {
         catch { }
     }
     $tip += ":`n"
-    foreach ($p in $script:RestorePending) { $tip += ('  ' + $p.Name + '  -  ' + $p.Cwd + "`n") }
-    $tip += "resume all = one terminal tab per session, each running 'claude --resume'. nothing happens until you click."
+    foreach ($p in $script:RestorePending) {
+        $pf = $(if (-not [string]::IsNullOrWhiteSpace([string]$p.Flags)) { '  [' + $p.Flags + ']' } else { '' })
+        $tip += ('  ' + $p.Name + '  -  ' + $p.Cwd + $pf + "`n")
+    }
+    $tip += "resume all = one terminal tab per session, each running 'claude --resume' with the permission flags it was born with. nothing happens until you click."
     if ([string]$script:RestoreBar.ToolTip -ne $tip) { $script:RestoreBar.ToolTip = $tip }
     if ($script:RestoreBar.Visibility -ne 'Visible') { $script:RestoreBar.Visibility = 'Visible' }
 }
+$script:PermFlagsByPid = @{}   # pid -> permission flags the session was LAUNCHED with (one cmdline query per pid, ever)
+function Get-SessionPermFlags([int]$AgentPid) {
+    # a bypass-permissions fleet restored into DEFAULT mode is a downgrade
+    # trap: every restored session starts blocking on prompts the user never
+    # sees. Read the live process's command line ONCE and remember exactly
+    # which permission posture it was born with, so --resume can inherit it.
+    if ($AgentPid -le 0) { return '' }
+    if ($script:PermFlagsByPid.ContainsKey($AgentPid)) { return [string]$script:PermFlagsByPid[$AgentPid] }
+    $flags = ''
+    try {
+        $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId = $AgentPid" -ErrorAction Stop).CommandLine
+        if ($cl -match '--dangerously-skip-permissions') { $flags = '--dangerously-skip-permissions' }
+        elseif ($cl -match '--permission-mode[= ]+([A-Za-z]+)') { $flags = '--permission-mode ' + $Matches[1] }
+    }
+    catch { }
+    $script:PermFlagsByPid[$AgentPid] = $flags
+    return $flags
+}
 function Invoke-ResumeSession($P) {
     # one dead session -> one fresh terminal tab in its old cwd, claude
-    # picking the conversation back up. cmd /k keeps the tab (and any
-    # resume error) visible instead of vanishing on failure.
+    # picking the conversation back up WITH the permission flags it was
+    # born with (bare --resume silently downgraded a bypass session to
+    # default mode). cmd /k keeps the tab (and any resume error) visible
+    # instead of vanishing on failure.
     try {
         $cmd = 'claude --resume ' + $P.Id
+        if (-not [string]::IsNullOrWhiteSpace([string]$P.Flags)) { $cmd += ' ' + [string]$P.Flags }
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
         if ($null -ne $wt) {
             Start-Process wt.exe -ArgumentList ('-w 0 nt -d "' + $P.Cwd + '" cmd /k ' + $cmd)
@@ -5307,17 +5362,34 @@ function New-SessionRow($Sess) {
     # row's pending question, it renders here - the question + the exact
     # thing being approved, and one button per option. Clicking injects the
     # digit BY PID: answering never steals focus or leaves this window.
-    $ans = New-Object System.Windows.Controls.StackPanel
+    # answer strip: a proper CARD, not loose text - accent edge on the left
+    # (this is a pending approval, it should read like one), question dim,
+    # the command being approved in MONOSPACE (that's the thing you're
+    # signing), buttons below with real hit targets
+    $ans = New-Object System.Windows.Controls.Border
     $ans.Visibility = 'Collapsed'
-    $ans.Margin = New-Object System.Windows.Thickness(0, 4, 0, 1)
+    $ans.CornerRadius = New-Object System.Windows.CornerRadius(7)
+    $ans.Background = Get-Brush '#12FFFFFF'
+    $ans.BorderBrush = Get-Brush '#66FF6B8A'
+    $ans.BorderThickness = New-Object System.Windows.Thickness(2, 0, 0, 0)
+    $ans.Padding = New-Object System.Windows.Thickness(9, 5, 8, 6)
+    $ans.Margin = New-Object System.Windows.Thickness(0, 5, 0, 2)
+    $ansStack = New-Object System.Windows.Controls.StackPanel
+    $ans.Child = $ansStack
     $ansTxt = New-Object System.Windows.Controls.TextBlock
-    $ansTxt.FontSize = 10
-    $ansTxt.Foreground = Get-Brush '#C9C9D2'
+    $ansTxt.FontSize = 10.5
+    $ansTxt.Foreground = Get-Brush '#B9B9C4'
     $ansTxt.TextTrimming = 'CharacterEllipsis'
-    $ansTxt.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
-    [void]$ans.Children.Add($ansTxt)
+    [void]$ansStack.Children.Add($ansTxt)
+    $ansCmd = New-Object System.Windows.Controls.TextBlock
+    $ansCmd.FontFamily = New-Object System.Windows.Media.FontFamily('Cascadia Mono,Consolas,monospace')
+    $ansCmd.FontSize = 11
+    $ansCmd.Foreground = Get-Brush '#F0F0F5'
+    $ansCmd.TextTrimming = 'CharacterEllipsis'
+    $ansCmd.Margin = New-Object System.Windows.Thickness(0, 2, 0, 6)
+    [void]$ansStack.Children.Add($ansCmd)
     $ansBtns = New-Object System.Windows.Controls.WrapPanel
-    [void]$ans.Children.Add($ansBtns)
+    [void]$ansStack.Children.Add($ansBtns)
     [void]$mid.Children.Add($ans)
     [void]$grid.Children.Add($mid)
 
@@ -5438,7 +5510,7 @@ function New-SessionRow($Sess) {
     $entry = @{
         Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age; Ctx = $ctx
         RunStatus = $runStatus; RunMsg = $runMsg; CompactBtn = $cbtn
-        Ans = $ans; AnsTxt = $ansTxt; AnsBtns = $ansBtns
+        Ans = $ans; AnsTxt = $ansTxt; AnsCmd = $ansCmd; AnsBtns = $ansBtns
         StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''; CompactKey = ''; AnsKey = ''
     }
     Update-SessionRow $entry $Sess
@@ -5509,7 +5581,7 @@ function Update-SessionRow($Entry, $Sess) {
     # rebuild only when the CAPTURE changes (rare), never per tick.
     $prompt = $null
     $apidA = [int]$Sess.AgentPid
-    if ($Sess.Status -eq 'attention' -and $apidA -gt 0) {
+    if (($Sess.Status -eq 'attention' -or $Sess.Status -eq 'parked') -and $apidA -gt 0) {
         $capA = $script:PromptCapByPid[$apidA]
         if ($null -ne $capA) { $prompt = $capA.Prompt }
     }
@@ -5526,32 +5598,42 @@ function Update-SessionRow($Entry, $Sess) {
             $hdr = [string]$prompt.Question
             if ($hdr.Length -eq 0) { $hdr = 'claude is asking:' }
             $dt = [string]$prompt.Detail
-            $Entry.AnsTxt.Text = $(if ($dt.Length -gt 0) { "$dt$($script:Sep)$hdr" } else { $hdr })
-            $Entry.AnsTxt.ToolTip = $(if ($dt.Length -gt 0) { "$dt`n$hdr" } else { $hdr })
+            $Entry.AnsTxt.Text = $hdr
+            $Entry.Ans.ToolTip = $(if ($dt.Length -gt 0) { "$dt`n$hdr" } else { $hdr })
+            if ($dt.Length -gt 0) { $Entry.AnsCmd.Text = $dt; $Entry.AnsCmd.Visibility = 'Visible' }
+            else { $Entry.AnsCmd.Visibility = 'Collapsed' }
             foreach ($o in @($prompt.Options)) {
                 $n = [int]$o.Num
                 $lbl = [string]$o.Label
-                $short = $(if ($lbl.Length -gt 24) { $lbl.Substring(0, 24).TrimEnd() + [string][char]0x2026 } else { $lbl })
-                $pal = '#2EFFFFFF|#4AFFFFFF|#D8D8DF'
-                if ($lbl -match '^(?i)yes') { $pal = '#265ED584|#4A5ED584|#9FE8BC' }
-                elseif ($lbl -match '^(?i)no') { $pal = '#26FF6B6B|#4AFF6B6B|#F5B0B0' }
+                $short = $(if ($lbl.Length -gt 30) { $lbl.Substring(0, 30).TrimEnd() + [string][char]0x2026 } else { $lbl })
+                # bg | border | label | hover-bg | number
+                $pal = '#22FFFFFF|#42FFFFFF|#E2E2E8|#3AFFFFFF|#9A9AA6'
+                if ($lbl -match '^(?i)yes') { $pal = '#2E5ED584|#5C5ED584|#C9F4DC|#455ED584|#8FD9AF' }
+                elseif ($lbl -match '^(?i)no') { $pal = '#2EFF6B6B|#5CFF6B6B|#F7C2C2|#45FF6B6B|#E09B9B' }
                 $cols = $pal.Split('|')
                 $b = New-Object System.Windows.Controls.Border
-                $b.CornerRadius = New-Object System.Windows.CornerRadius(6)
+                $b.CornerRadius = New-Object System.Windows.CornerRadius(7)
                 $b.Background = Get-Brush $cols[0]
                 $b.BorderBrush = Get-Brush $cols[1]
                 $b.BorderThickness = New-Object System.Windows.Thickness(1)
-                $b.Padding = New-Object System.Windows.Thickness(7, 2, 7, 3)
-                $b.Margin = New-Object System.Windows.Thickness(0, 0, 6, 2)
+                $b.Padding = New-Object System.Windows.Thickness(11, 3, 11, 4)
+                $b.Margin = New-Object System.Windows.Thickness(0, 0, 7, 2)
                 $b.Cursor = [System.Windows.Input.Cursors]::Hand
                 $b.ToolTip = $lbl
                 $btTxt = New-Object System.Windows.Controls.TextBlock
-                $btTxt.FontSize = 10
-                $btTxt.FontWeight = [System.Windows.FontWeights]::SemiBold
-                $btTxt.Foreground = Get-Brush $cols[2]
-                $btTxt.Text = "$n $short"
+                $numRun = New-Object System.Windows.Documents.Run("$n")
+                $numRun.FontSize = 10
+                $numRun.Foreground = Get-Brush $cols[4]
+                [void]$btTxt.Inlines.Add($numRun)
+                $lblRun = New-Object System.Windows.Documents.Run("  $short")
+                $lblRun.FontSize = 11.5
+                $lblRun.FontWeight = [System.Windows.FontWeights]::SemiBold
+                $lblRun.Foreground = Get-Brush $cols[2]
+                [void]$btTxt.Inlines.Add($lblRun)
                 $b.Child = $btTxt
-                $b.Tag = @{ Row = $Entry.Row; Num = $n }
+                $b.Tag = @{ Row = $Entry.Row; Num = $n; NB = (Get-Brush $cols[0]); HB = (Get-Brush $cols[3]) }
+                $b.Add_MouseEnter({ param($s, $e) $s.Background = $s.Tag.HB })
+                $b.Add_MouseLeave({ param($s, $e) $s.Background = $s.Tag.NB })
                 $b.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
                 $b.Add_MouseLeftButtonUp({
                     param($s, $e)
@@ -5674,7 +5756,8 @@ function Update-List {
         if (($s.Provider -eq 'claude' -or $s.Id -match '^[0-9a-fA-F-]{32,}$') -and
             -not [string]::IsNullOrWhiteSpace($s.Id) -and
             -not [string]::IsNullOrWhiteSpace($s.Cwd)) {
-            $snapList += , @{ id = $s.Id; cwd = $s.Cwd; name = $s.CwdName }
+            $snapList += , @{ id = $s.Id; cwd = $s.Cwd; name = $s.CwdName
+                              flags = (Get-SessionPermFlags ([int]$s.AgentPid)) }
         }
     }
     $snapSig = (@($snapList | ForEach-Object { $_.id }) -join '|')

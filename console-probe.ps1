@@ -83,8 +83,11 @@ try {
                         # parses pending numbered prompts out of these.
                         # OPT-IN: plain fingerprint probes skip this work.
                         if ($Raw) {
+                            # BOTTOM 30 rows only: the pending-prompt parser
+                            # is bottom-anchored, and a full 200-col screen
+                            # blows past the parent's 4KB stdout pipe buffer
                             $sbR = New-Object System.Text.StringBuilder
-                            for ($i = 0; $i -lt $rows; $i++) {
+                            for ($i = [Math]::Max(0, $rows - 30); $i -lt $rows; $i++) {
                                 $st = $i * $w
                                 if ($st -ge $rawStr.Length) { break }
                                 [void]$sbR.AppendLine($rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st)).TrimEnd())

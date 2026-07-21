@@ -10,13 +10,18 @@
 # stdout line 5: the RAW visible rows, base64(UTF8) - punctuation, digits
 #                and layout intact so the parent can PARSE pending prompts
 #                (numbered permission menus). base64 = encoding-proof.
+#                ONLY built when -Raw is passed: raw extraction is extra time
+#                ATTACHED to the target console, and attached time on a BUSY
+#                writing TUI is contention (the probe-contention law). Blocked
+#                rows can afford it; rendering rows must never pay it.
 #
 # All P/Invoke comes precompiled from AgentFocusNative.dll - this child used
 # to Add-Type inline C#, which spawned the C# COMPILER on every probe.
 param(
     [Parameter(Mandatory = $true)][int]$TargetPid,
     [string]$Marker = '',
-    [int]$MarkerMs = 900
+    [int]$MarkerMs = 900,
+    [switch]$Raw
 )
 
 $dll = Join-Path $env:LOCALAPPDATA 'AgentFocus\AgentFocusNative.dll'
@@ -75,14 +80,17 @@ try {
                         $screen = (($rawStr) -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
                         if ($screen.Length -gt 6000) { $screen = $screen.Substring(0, 6000) }
                         # raw rows, one per line, right-trimmed: the parent
-                        # parses pending numbered prompts out of these
-                        $sbR = New-Object System.Text.StringBuilder
-                        for ($i = 0; $i -lt $rows; $i++) {
-                            $st = $i * $w
-                            if ($st -ge $rawStr.Length) { break }
-                            [void]$sbR.AppendLine($rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st)).TrimEnd())
+                        # parses pending numbered prompts out of these.
+                        # OPT-IN: plain fingerprint probes skip this work.
+                        if ($Raw) {
+                            $sbR = New-Object System.Text.StringBuilder
+                            for ($i = 0; $i -lt $rows; $i++) {
+                                $st = $i * $w
+                                if ($st -ge $rawStr.Length) { break }
+                                [void]$sbR.AppendLine($rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st)).TrimEnd())
+                            }
+                            $rawB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sbR.ToString()))
                         }
-                        $rawB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sbR.ToString()))
                     }
                 }
             }

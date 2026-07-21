@@ -583,18 +583,28 @@ function Get-Sessions {
         if ($apid -le 0) { continue }
         if ($s.Status -ne 'attention' -or [string]$s.Provider -ne 'claude') {
             [void]$script:PromptCapByPid.Remove($apid)
+            [void]$script:AttnTickByPid.Remove($apid)
             continue
         }
+        # DEBOUNCE: only a row that STAYS blocked earns an attach. A status
+        # flicker (working -> attention -> working) on a session that is
+        # actually rendering must never cost it a console probe - attached
+        # time on a busy TUI is contention (see the probe-contention law).
+        $script:AttnTickByPid[$apid] = [int]$script:AttnTickByPid[$apid] + 1
+        if ([int]$script:AttnTickByPid[$apid] -lt 3) { continue }
         $cool = $script:AnswerCoolByPid[$apid]
         if ($null -ne $cool -and ((Get-Date) - [datetime]$cool).TotalSeconds -lt 8) { continue }
         $cap = $script:PromptCapByPid[$apid]
         if ($null -ne $cap -and ((Get-Date) - [datetime]$cap.Stamp).TotalSeconds -lt 20) { continue }
-        $r = Request-ConsoleInfo -TargetPid $apid
+        $r = Request-ConsoleInfo -TargetPid $apid -Raw
         if ($null -eq $r) { continue }   # probe in flight or budget-starved: next tick
         if ($null -ne $r.PSObject.Properties['Failed']) {
             $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = $null }
             continue
         }
+        # collected some OTHER lane's plain (no-raw) probe for this pid:
+        # don't cache an empty parse for 20s - retry with a raw probe next tick
+        if (-not [bool]$r.RawProbe) { continue }
         $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = (ConvertTo-PendingPrompt ([string]$r.RawTail)) }
     }
 
@@ -703,13 +713,14 @@ function Start-ConsoleProbe {
     # console RPC can hang FOREVER on a hosed conhost (observed live: one
     # agent process froze a probe for 2 minutes). Never attach from the HUD
     # process - spawn a disposable child that the caller can kill.
-    param([int]$TargetPid, [string]$Marker = '', [int]$MarkerMs = 900)
+    param([int]$TargetPid, [string]$Marker = '', [int]$MarkerMs = 900, [switch]$Raw)
 
     $probe = Join-Path $PSScriptRoot 'console-probe.ps1'
     if (-not (Test-Path -LiteralPath $probe)) { return $null }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$probe`" -TargetPid $TargetPid" +
+                     $(if ($Raw) { ' -Raw' } else { '' }) +
                      $(if ($Marker.Length -gt 0) { " -Marker `"$Marker`" -MarkerMs $MarkerMs" } else { '' })
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
@@ -723,7 +734,10 @@ function Request-ConsoleInfo {
     # a later call collects the finished result. The UI thread never waits on
     # console RPC anymore - waiting synchronously froze the widget for ~1s
     # per probe and native apps don't hitch every two seconds.
-    param([int]$TargetPid)
+    # -Raw: ask the probe child for the raw visible rows too (answer lane
+    # only) - the collected result carries RawProbe so a caller who NEEDS
+    # raw can tell when it collected some other lane's plain probe instead.
+    param([int]$TargetPid, [switch]$Raw)
 
     if ($script:ProbeJobs.ContainsKey($TargetPid)) {
         $job = $script:ProbeJobs[$TargetPid]
@@ -753,7 +767,7 @@ function Request-ConsoleInfo {
             if (-not [string]::IsNullOrWhiteSpace($rawLine)) {
                 try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawLine.Trim())) } catch { $rawTail = '' }
             }
-            return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail }
+            return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail; RawProbe = [bool]$job.Raw }
         }
         catch { return [pscustomobject]@{ Failed = $true } }
         finally { try { $job.Proc.Dispose() } catch { } }
@@ -761,8 +775,8 @@ function Request-ConsoleInfo {
 
     if ($script:ProbeBudget -le 0) { return $null }
     $script:ProbeBudget--
-    $p = Start-ConsoleProbe -TargetPid $TargetPid
-    if ($null -ne $p) { $script:ProbeJobs[$TargetPid] = @{ Proc = $p; Started = Get-Date } }
+    $p = Start-ConsoleProbe -TargetPid $TargetPid -Raw:$Raw
+    if ($null -ne $p) { $script:ProbeJobs[$TargetPid] = @{ Proc = $p; Started = Get-Date; Raw = [bool]$Raw } }
     return $null
 }
 
@@ -1740,6 +1754,7 @@ function Invoke-CompactSession($Sess) {
 # Never blind: you see exactly what you're approving before you click.
 # (The SDK-bound tools closed this as impossible. It isn't, down here.)
 $script:PromptCapByPid = @{}    # pid -> @{ Stamp; Prompt }: parsed pending prompt per blocked row
+$script:AttnTickByPid = @{}     # pid -> consecutive attention ticks (debounce: flickers never earn a probe)
 $script:AnswerCoolByPid = @{}   # pid -> when an answer was injected (mute stale strip while the screen catches up)
 $script:AnswerBusy = $false
 $script:AnswerInjProc = $null
@@ -1834,6 +1849,7 @@ function Invoke-AnswerPrompt($Sess, [int]$Num) {
     try { $script:AnswerInjProc = [System.Diagnostics.Process]::Start($psi) } catch { $script:AnswerInjProc = $null }
     if ($null -eq $script:AnswerInjProc) { $script:AnswerBusy = $false; return }
     [void]$script:PromptCapByPid.Remove($apid)
+    [void]$script:AttnTickByPid.Remove($apid)
     $script:AnswerCoolByPid[$apid] = Get-Date
     if ($null -eq $script:AnswerInjTimer) {
         $script:AnswerInjTimer = New-Object System.Windows.Threading.DispatcherTimer

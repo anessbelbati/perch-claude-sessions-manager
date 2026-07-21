@@ -7,6 +7,9 @@
 # stdout line 3: the console's VISIBLE screen text, normalized (content
 #                fingerprint - works even for manually renamed tabs)
 # stdout line 4: the conhost pid that OWNS this console (session identity)
+# stdout line 5: the RAW visible rows, base64(UTF8) - punctuation, digits
+#                and layout intact so the parent can PARSE pending prompts
+#                (numbered permission menus). base64 = encoding-proof.
 #
 # All P/Invoke comes precompiled from AgentFocusNative.dll - this child used
 # to Add-Type inline C#, which spawned the C# COMPILER on every probe.
@@ -51,6 +54,7 @@ try {
     # per-row reads made ~50 conhost round-trips that contended with the
     # agent TUI's own rendering.
     $screen = ''
+    $rawB64 = ''
     try {
         # 3221225472 = GENERIC_READ|GENERIC_WRITE (0xC0000000 parses as a
         # NEGATIVE Int32 literal in PowerShell 5.1 and breaks uint marshaling)
@@ -67,8 +71,18 @@ try {
                     $coord.X = 0; $coord.Y = [int16][int]$info.srWindow.Top
                     [uint32]$read = 0
                     if ([AgentFocus.ProbeKit]::ReadConsoleOutputCharacterW($h, $buf, [uint32]$len, $coord, [ref]$read)) {
-                        $screen = ((New-Object string($buf, 0, [int]$read)) -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
+                        $rawStr = New-Object string($buf, 0, [int]$read)
+                        $screen = (($rawStr) -replace '[^\p{L}\p{Nd}]', '').ToLowerInvariant()
                         if ($screen.Length -gt 6000) { $screen = $screen.Substring(0, 6000) }
+                        # raw rows, one per line, right-trimmed: the parent
+                        # parses pending numbered prompts out of these
+                        $sbR = New-Object System.Text.StringBuilder
+                        for ($i = 0; $i -lt $rows; $i++) {
+                            $st = $i * $w
+                            if ($st -ge $rawStr.Length) { break }
+                            [void]$sbR.AppendLine($rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st)).TrimEnd())
+                        }
+                        $rawB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($sbR.ToString()))
                     }
                 }
             }
@@ -81,6 +95,7 @@ try {
     $out.WriteLine([string]$cwOut)
     $out.WriteLine($screen)
     $out.WriteLine([string]$conPid)
+    $out.WriteLine($rawB64)
     $out.Flush()
     if ($Marker.Length -gt 0) {
         [void][AgentFocus.ConsoleApi]::SetConsoleTitle($Marker)

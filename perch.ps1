@@ -573,6 +573,31 @@ function Get-Sessions {
         }
     }
 
+    # ANSWER LANE: for blocked claude rows, read the actual pending question
+    # + numbered options off the console so the row can offer one-click
+    # answers. Async probe children, shared probe budget, 20s capture cache,
+    # cleared the moment the row stops asking. A just-answered pid rests 8s
+    # so a lagging screen can't resurrect the old dialog.
+    foreach ($s in $kept) {
+        $apid = [int]$s.AgentPid
+        if ($apid -le 0) { continue }
+        if ($s.Status -ne 'attention' -or [string]$s.Provider -ne 'claude') {
+            [void]$script:PromptCapByPid.Remove($apid)
+            continue
+        }
+        $cool = $script:AnswerCoolByPid[$apid]
+        if ($null -ne $cool -and ((Get-Date) - [datetime]$cool).TotalSeconds -lt 8) { continue }
+        $cap = $script:PromptCapByPid[$apid]
+        if ($null -ne $cap -and ((Get-Date) - [datetime]$cap.Stamp).TotalSeconds -lt 20) { continue }
+        $r = Request-ConsoleInfo -TargetPid $apid
+        if ($null -eq $r) { continue }   # probe in flight or budget-starved: next tick
+        if ($null -ne $r.PSObject.Properties['Failed']) {
+            $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = $null }
+            continue
+        }
+        $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = (ConvertTo-PendingPrompt ([string]$r.RawTail)) }
+    }
+
     # a needs-you left hanging past N minutes isn't urgent anymore - you saw
     # it, you moved on. Demote it to PARKED: muted, below 'done', no pulse,
     # no chirp - fresh reds keep meaning fresh. A NEW notification (newer
@@ -723,7 +748,12 @@ function Request-ConsoleInfo {
             [long]$conPid = 0
             $conLine = $job.Proc.StandardOutput.ReadLine()
             if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
-            return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid }
+            $rawTail = ''
+            $rawLine = $job.Proc.StandardOutput.ReadLine()
+            if (-not [string]::IsNullOrWhiteSpace($rawLine)) {
+                try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawLine.Trim())) } catch { $rawTail = '' }
+            }
+            return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail }
         }
         catch { return [pscustomobject]@{ Failed = $true } }
         finally { try { $job.Proc.Dispose() } catch { } }
@@ -758,7 +788,12 @@ function Read-ConsoleInfoBounded {
         [long]$conPid = 0
         $conLine = $p.StandardOutput.ReadLine()
         if ($null -ne $conLine) { [void][long]::TryParse($conLine.Trim(), [ref]$conPid) }
-        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid }
+        $rawTail = ''
+        $rawLine = $p.StandardOutput.ReadLine()
+        if (-not [string]::IsNullOrWhiteSpace($rawLine)) {
+            try { $rawTail = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($rawLine.Trim())) } catch { $rawTail = '' }
+        }
+        return [pscustomobject]@{ Title = $title; ConsoleHwnd = $hwnd; Screen = [string]$screen; ConsoleId = $conPid; RawTail = $rawTail }
     }
     catch { return $null }
     finally { try { $p.Dispose() } catch { } }
@@ -1695,6 +1730,135 @@ function Invoke-CompactSession($Sess) {
     }
     $script:CompactInjStart = Get-Date
     $script:CompactInjTimer.Stop(); $script:CompactInjTimer.Start()
+}
+
+# ====== ANSWER FROM THE PERCH (experimental) ============================
+# When a claude session blocks on a numbered prompt (permission ask, plan
+# approval, AskUserQuestion), the prober reads the ACTUAL question and
+# options off its screen and the row grows one-click answer buttons that
+# inject the digit BY PID - no focus steal, no tab switch, works minimized.
+# Never blind: you see exactly what you're approving before you click.
+# (The SDK-bound tools closed this as impossible. It isn't, down here.)
+$script:PromptCapByPid = @{}    # pid -> @{ Stamp; Prompt }: parsed pending prompt per blocked row
+$script:AnswerCoolByPid = @{}   # pid -> when an answer was injected (mute stale strip while the screen catches up)
+$script:AnswerBusy = $false
+$script:AnswerInjProc = $null
+$script:AnswerInjTimer = $null
+$script:AnswerInjStart = [datetime]::MinValue
+
+function ConvertTo-PendingPrompt([string]$RawTail) {
+    # parse the console's raw visible rows into @{ Question; Detail; Options }
+    # or $null. Anchor = the BOTTOM-most numbered list starting at "1." with
+    # ascending numbers (claude renders one option per line, the selected one
+    # prefixed with a caret). Wrapped option text on the following line is
+    # glued back on. Context above the block: nearest "...?" line = question,
+    # the rest = detail (usually the tool name + the exact command).
+    if ([string]::IsNullOrWhiteSpace($RawTail)) { return $null }
+    $clean = New-Object System.Collections.ArrayList
+    foreach ($ln in ($RawTail -split "`r?`n")) {
+        # box-drawing + block glyphs -> space (claude draws the dialog border
+        # in these; real TUI uses them, degraded/ASCII terminals use '|' '+')
+        $cl = ($ln -replace ('[' + [char]0x2500 + '-' + [char]0x259F + ']'), ' ').Trim()
+        # strip only EDGE border pipes/plus - interior '|' survives so a
+        # piped command (cat x | grep y) stays intact in the detail line
+        $cl = ($cl -replace '^[|+]\s?', '' -replace '\s?[|+]$', '').Trim()
+        [void]$clean.Add($cl)
+    }
+    $best = $null
+    $cur = $null
+    for ($i = 0; $i -lt $clean.Count; $i++) {
+        $t = [string]$clean[$i]
+        # selected-option caret variants: U+276F heavy chevron, >, U+00BB, U+2192 arrow
+        $m = [regex]::Match($t, ('^(?:[' + [char]0x276F + '>' + [char]0x00BB + [char]0x2192 + ']\s*)?(\d)\.\s+(\S.*)$'))
+        if ($m.Success) {
+            $n = [int]$m.Groups[1].Value
+            $lbl = $m.Groups[2].Value.Trim()
+            if ($n -eq 1) {
+                $cur = @{ Start = $i; Opts = (New-Object System.Collections.ArrayList) }
+                [void]$cur.Opts.Add(@{ Num = 1; Label = $lbl })
+            }
+            elseif ($null -ne $cur -and $n -eq ($cur.Opts.Count + 1)) {
+                [void]$cur.Opts.Add(@{ Num = $n; Label = $lbl })
+            }
+            else { $cur = $null }
+            if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
+        }
+        elseif ($null -ne $cur -and $t.Length -gt 0) {
+            # wrapped option text continues on the next screen row
+            $last = $cur.Opts[$cur.Opts.Count - 1]
+            if (([string]$last.Label).Length -lt 200) { $last.Label = ([string]$last.Label + ' ' + $t).Trim() }
+        }
+        else {
+            if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
+            $cur = $null
+        }
+    }
+    if ($null -eq $best) { return $null }
+    $ctx = New-Object System.Collections.ArrayList
+    for ($i = [int]$best.Start - 1; $i -ge 0 -and $ctx.Count -lt 4 -and ([int]$best.Start - $i) -le 10; $i--) {
+        $t = [string]$clean[$i]
+        if ($t.Length -eq 0) { continue }
+        [void]$ctx.Insert(0, $t)
+    }
+    $q = ''
+    for ($i = $ctx.Count - 1; $i -ge 0; $i--) {
+        if ([string]$ctx[$i] -match '\?\s*$') { $q = [string]$ctx[$i]; $ctx.RemoveAt($i); break }
+    }
+    $ctxSep = ' ' + [string][char]0x00B7 + ' '
+    $detail = (@($ctx) -join $ctxSep).Trim()
+    if ($detail.Length -gt 160) { $detail = $detail.Substring(0, 160) }
+    foreach ($o in $best.Opts) {
+        if (([string]$o.Label).Length -gt 90) { $o.Label = ([string]$o.Label).Substring(0, 90).TrimEnd() }
+    }
+    return @{ Question = $q; Detail = $detail; Options = $best.Opts }
+}
+
+function Invoke-AnswerPrompt($Sess, [int]$Num) {
+    # inject the chosen option's digit into the blocked session BY PID (no
+    # Enter - claude's numbered menus act on the digit itself). There is NO
+    # SendKeys fallback ON PURPOSE: blindly typing digits at whatever holds
+    # focus is exactly the auto-yes bug class the rest of the ecosystem
+    # suffers from. If attach fails, the row click (jump to tab) is right
+    # there and the prompt is still on screen. Nothing is ever automatic.
+    if ($script:AnswerBusy) { return }
+    $apid = [int]$Sess.AgentPid
+    if ($apid -le 0 -or $Num -lt 1 -or $Num -gt 9) { return }
+    $inj = Join-Path $PSScriptRoot 'console-inject.ps1'
+    if (-not (Test-Path -LiteralPath $inj)) { return }
+    $script:AnswerBusy = $true
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$inj`" -TargetPid $apid -Text $Num"
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    try { $script:AnswerInjProc = [System.Diagnostics.Process]::Start($psi) } catch { $script:AnswerInjProc = $null }
+    if ($null -eq $script:AnswerInjProc) { $script:AnswerBusy = $false; return }
+    [void]$script:PromptCapByPid.Remove($apid)
+    $script:AnswerCoolByPid[$apid] = Get-Date
+    if ($null -eq $script:AnswerInjTimer) {
+        $script:AnswerInjTimer = New-Object System.Windows.Threading.DispatcherTimer
+        $script:AnswerInjTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+        $script:AnswerInjTimer.Add_Tick({
+            $p = $script:AnswerInjProc
+            if ($null -eq $p) { $script:AnswerInjTimer.Stop(); $script:AnswerBusy = $false; return }
+            if (-not $p.HasExited) {
+                if (((Get-Date) - $script:AnswerInjStart).TotalSeconds -gt 8) {
+                    try { $p.Kill() } catch { }
+                    try { $p.Dispose() } catch { }
+                    $script:AnswerInjProc = $null
+                    $script:AnswerInjTimer.Stop()
+                    $script:AnswerBusy = $false
+                }
+                return
+            }
+            try { $p.Dispose() } catch { }
+            $script:AnswerInjProc = $null
+            $script:AnswerInjTimer.Stop()
+            $script:AnswerBusy = $false
+        })
+    }
+    $script:AnswerInjStart = Get-Date
+    $script:AnswerInjTimer.Stop(); $script:AnswerInjTimer.Start()
 }
 
 # single instance: launching again while one is running just exits, so HUDs
@@ -3337,11 +3501,18 @@ $script:CarrySwingTimer.Add_Tick({
     catch { }
 })
 # boot = hatch: he arrives in his egg, then the first tick hatches him into
-# whatever the day actually looks like
+# whatever the day actually looks like. The hold is re-armed at first render:
+# on slow boots (powershell host takes seconds to show the window) a hold
+# started here would expire before anyone could see the egg.
 if ($null -ne $script:BirdFaces['hatch'] -and $null -ne $script:PillBirdA) {
-    $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2200)
+    $script:BirdFaceHoldUntil = (Get-Date).AddSeconds(30)   # guard until first render
     $script:BirdFaceKey = 'hatch'
     $script:PillBirdA.Source = $script:BirdFaces['hatch']
+    $Window.Add_ContentRendered({
+        if ($script:BirdFaceKey -eq 'hatch') {
+            $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2200)
+        }
+    })
 }
 # hover triggers NOTHING - peek opens on click only (see HeaderClick)
 $Window.Add_SizeChanged({
@@ -4883,7 +5054,7 @@ function Update-LimitsPanel {
 
 function Repair-Mojibake([string]$T) {
     # the hook used to read stdin with the OEM codepage, so UTF-8 punctuation
-    # arrived as CP850 mojibake (em-dash = 'ΓÇö'). Reverse it: re-encode as
+    # arrived as CP850 mojibake (em-dash showed as garble). Reverse it: re-encode as
     # CP850, re-decode as STRICT UTF-8 - both steps throw unless the text
     # really is mojibake, so organic text (even actual Greek) survives intact.
     if ([string]::IsNullOrEmpty($T) -or $T.IndexOf([char]0x0393) -lt 0) { return $T }
@@ -5115,6 +5286,23 @@ function New-SessionRow($Sess) {
     $runMsg.Foreground = Get-Brush '#8B8B95'
     [void]$sub.Inlines.Add($runMsg)
     [void]$mid.Children.Add($sub)
+
+    # ANSWER STRIP (experimental): when the prober has parsed this blocked
+    # row's pending question, it renders here - the question + the exact
+    # thing being approved, and one button per option. Clicking injects the
+    # digit BY PID: answering never steals focus or leaves this window.
+    $ans = New-Object System.Windows.Controls.StackPanel
+    $ans.Visibility = 'Collapsed'
+    $ans.Margin = New-Object System.Windows.Thickness(0, 4, 0, 1)
+    $ansTxt = New-Object System.Windows.Controls.TextBlock
+    $ansTxt.FontSize = 10
+    $ansTxt.Foreground = Get-Brush '#C9C9D2'
+    $ansTxt.TextTrimming = 'CharacterEllipsis'
+    $ansTxt.Margin = New-Object System.Windows.Thickness(0, 0, 0, 3)
+    [void]$ans.Children.Add($ansTxt)
+    $ansBtns = New-Object System.Windows.Controls.WrapPanel
+    [void]$ans.Children.Add($ansBtns)
+    [void]$mid.Children.Add($ans)
     [void]$grid.Children.Add($mid)
 
     $row.Child = $grid
@@ -5234,7 +5422,8 @@ function New-SessionRow($Sess) {
     $entry = @{
         Row = $row; Dot = $dot; Glow = $glow; Name = $name; Age = $age; Ctx = $ctx
         RunStatus = $runStatus; RunMsg = $runMsg; CompactBtn = $cbtn
-        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''; CompactKey = ''
+        Ans = $ans; AnsTxt = $ansTxt; AnsBtns = $ansBtns
+        StatusKey = ''; NameKey = ''; SubKey = ''; TipKey = ''; CtxKey = ''; CompactKey = ''; AnsKey = ''
     }
     Update-SessionRow $entry $Sess
     return $entry
@@ -5298,6 +5487,65 @@ function Update-SessionRow($Entry, $Sess) {
     if ($Entry.CompactKey -ne $compactKey) {
         $Entry.CompactKey = $compactKey
         $Entry.CompactBtn.Visibility = $(if ($showCompact) { 'Visible' } else { 'Collapsed' })
+    }
+
+    # answer strip: pending prompt captured off this row's console. Buttons
+    # rebuild only when the CAPTURE changes (rare), never per tick.
+    $prompt = $null
+    $apidA = [int]$Sess.AgentPid
+    if ($Sess.Status -eq 'attention' -and $apidA -gt 0) {
+        $capA = $script:PromptCapByPid[$apidA]
+        if ($null -ne $capA) { $prompt = $capA.Prompt }
+    }
+    $ansKey = ''
+    if ($null -ne $prompt) {
+        $ansKey = "$($prompt.Question)|$($prompt.Detail)|" +
+                  ((@($prompt.Options) | ForEach-Object { "$($_.Num):$($_.Label)" }) -join '|')
+    }
+    if ($Entry.AnsKey -ne $ansKey) {
+        $Entry.AnsKey = $ansKey
+        $Entry.AnsBtns.Children.Clear()
+        if ($ansKey.Length -eq 0) { $Entry.Ans.Visibility = 'Collapsed' }
+        else {
+            $hdr = [string]$prompt.Question
+            if ($hdr.Length -eq 0) { $hdr = 'claude is asking:' }
+            $dt = [string]$prompt.Detail
+            $Entry.AnsTxt.Text = $(if ($dt.Length -gt 0) { "$dt$($script:Sep)$hdr" } else { $hdr })
+            $Entry.AnsTxt.ToolTip = $(if ($dt.Length -gt 0) { "$dt`n$hdr" } else { $hdr })
+            foreach ($o in @($prompt.Options)) {
+                $n = [int]$o.Num
+                $lbl = [string]$o.Label
+                $short = $(if ($lbl.Length -gt 24) { $lbl.Substring(0, 24).TrimEnd() + [string][char]0x2026 } else { $lbl })
+                $pal = '#2EFFFFFF|#4AFFFFFF|#D8D8DF'
+                if ($lbl -match '^(?i)yes') { $pal = '#265ED584|#4A5ED584|#9FE8BC' }
+                elseif ($lbl -match '^(?i)no') { $pal = '#26FF6B6B|#4AFF6B6B|#F5B0B0' }
+                $cols = $pal.Split('|')
+                $b = New-Object System.Windows.Controls.Border
+                $b.CornerRadius = New-Object System.Windows.CornerRadius(6)
+                $b.Background = Get-Brush $cols[0]
+                $b.BorderBrush = Get-Brush $cols[1]
+                $b.BorderThickness = New-Object System.Windows.Thickness(1)
+                $b.Padding = New-Object System.Windows.Thickness(7, 2, 7, 3)
+                $b.Margin = New-Object System.Windows.Thickness(0, 0, 6, 2)
+                $b.Cursor = [System.Windows.Input.Cursors]::Hand
+                $b.ToolTip = $lbl
+                $btTxt = New-Object System.Windows.Controls.TextBlock
+                $btTxt.FontSize = 10
+                $btTxt.FontWeight = [System.Windows.FontWeights]::SemiBold
+                $btTxt.Foreground = Get-Brush $cols[2]
+                $btTxt.Text = "$n $short"
+                $b.Child = $btTxt
+                $b.Tag = @{ Row = $Entry.Row; Num = $n }
+                $b.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+                $b.Add_MouseLeftButtonUp({
+                    param($s, $e)
+                    $e.Handled = $true
+                    Invoke-AnswerPrompt $s.Tag.Row.Tag ([int]$s.Tag.Num)
+                })
+                [void]$Entry.AnsBtns.Children.Add($b)
+            }
+            $Entry.Ans.Visibility = 'Visible'
+        }
     }
 
     $snippet = ($Sess.Message -replace '\s+', ' ').Trim()

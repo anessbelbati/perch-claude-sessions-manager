@@ -248,6 +248,50 @@ function Format-Age([datetime]$Ts) {
     return ('{0}d' -f [int][math]::Floor($span.TotalDays))
 }
 
+# these two string helpers MUST live above Get-Sessions: PowerShell only
+# registers a function when its `function` statement EXECUTES (no hoisting),
+# and -Probe mode calls Get-Sessions from mid-script - with the helpers
+# defined at the bottom, the probe path exploded on CommandNotFoundException
+# while the GUI (whose loop starts after the last line) never noticed.
+# First external install caught it. Thanks, friend.
+function Repair-Mojibake([string]$T) {
+    # the hook used to read stdin with the OEM codepage, so UTF-8 punctuation
+    # arrived as CP850 mojibake (em-dash showed as garble). Reverse it: re-encode as
+    # CP850, re-decode as STRICT UTF-8 - both steps throw unless the text
+    # really is mojibake, so organic text (even actual Greek) survives intact.
+    if ([string]::IsNullOrEmpty($T) -or $T.IndexOf([char]0x0393) -lt 0) { return $T }
+    foreach ($cp in @(437, 850)) {   # U+0393 at 0xE2 is CP437; 850 kept as spare
+        try {
+            $enc = [System.Text.Encoding]::GetEncoding($cp,
+                (New-Object System.Text.EncoderExceptionFallback),
+                (New-Object System.Text.DecoderExceptionFallback))
+            $bytes = $enc.GetBytes($T)
+            return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
+        }
+        catch { }
+    }
+    return $T
+}
+
+function Get-PeekDisplayText([string]$T, [int]$Max) {
+    # raw transcript text is hostile to a one-glance tooltip: control chars,
+    # markdown emphasis, box-drawing rules from pasted terminal output, and
+    # blind Substring() that can cut an emoji in half mid-surrogate (the
+    # broken half renders as the classic weird box)
+    if ([string]::IsNullOrWhiteSpace($T)) { return '' }
+    $t = $T -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ''
+    $t = $t -replace '[\u2500-\u259F]+', ' '      # box drawing / block elements
+    $t = $t -replace '```[a-zA-Z]*', ' '          # code fences
+    $t = $t -replace '[`]|\*{1,3}', ''            # backticks / md emphasis
+    $t = ($t -replace '\s+', ' ').Trim()
+    if ($t.Length -gt $Max) {
+        $cut = $Max
+        if ([char]::IsHighSurrogate($t[$cut - 1])) { $cut-- }   # never split a pair
+        $t = $t.Substring(0, $cut) + [string][char]0x2026
+    }
+    return $t
+}
+
 function Get-Sessions {
     $now = Get-Date
     # follow-the-process learning: map agents to tabs from whatever tab the
@@ -868,6 +912,19 @@ $script:UntrackedPids = @{}     # pids currently shown as untracked rows (screen
 $script:FileCache = @{}         # status file path -> {LWT; Skip|Obj} (parse only what changed)
 $script:ProcSnapshot = @{}      # pid -> Process, refreshed at most every 4s
 $script:ProcSnapStamp = [datetime]::MinValue
+# state Get-Sessions touches MUST initialize before the -Probe branch calls it
+$script:PrevStatusById = @{}    # session id -> last status: a real FINISH is working->idle per session
+$script:PendingDoneById = @{}   # session id -> when the NATIVE lane landed an idle the hooks never wrote:
+                                # a real finish gets Stop's idle within seconds - a manual /compact or an
+                                # Esc-interrupt never does, and must not sing
+$script:PromptCapByPid = @{}    # pid -> @{ Stamp; Prompt }: parsed pending prompt per blocked row
+$script:AttnTickByPid = @{}     # pid -> consecutive attention ticks (debounce: flickers never earn a probe)
+$script:AnswerDebug = $false    # trace the answer lane to hud-answer.log (flip on when field-debugging)
+$script:AnswerCoolByPid = @{}   # pid -> when an answer was injected (mute stale strip while the screen catches up)
+$script:AnswerBusy = $false
+$script:AnswerInjProc = $null
+$script:AnswerInjTimer = $null
+$script:AnswerInjStart = [datetime]::MinValue
 
 function Invoke-PassiveTabLearn {
     # follow the PROCESS, not names: whatever tab the user has open exposes
@@ -1782,14 +1839,6 @@ function Invoke-CompactSession($Sess) {
 # inject the digit BY PID - no focus steal, no tab switch, works minimized.
 # Never blind: you see exactly what you're approving before you click.
 # (The SDK-bound tools closed this as impossible. It isn't, down here.)
-$script:PromptCapByPid = @{}    # pid -> @{ Stamp; Prompt }: parsed pending prompt per blocked row
-$script:AttnTickByPid = @{}     # pid -> consecutive attention ticks (debounce: flickers never earn a probe)
-$script:AnswerDebug = $false    # trace the answer lane to hud-answer.log (flip on when field-debugging)
-$script:AnswerCoolByPid = @{}   # pid -> when an answer was injected (mute stale strip while the screen catches up)
-$script:AnswerBusy = $false
-$script:AnswerInjProc = $null
-$script:AnswerInjTimer = $null
-$script:AnswerInjStart = [datetime]::MinValue
 
 function ConvertTo-PendingPrompt([string]$RawTail) {
     # parse the console's raw visible rows into @{ Question; Detail; Options }
@@ -2555,10 +2604,6 @@ $script:PillParkedCount = 0     # parked (ignored 30+ min) -> the judging sideey
 $script:BirdFlapN = 0           # flap-burst frame counter (happy/happy2)
 $script:BirdFanFlip = $false    # hot/hot2 alternation phase
 $script:BirdFanTimer = $null    # created with the other timers below
-$script:PrevStatusById = @{}    # session id -> last status: a real FINISH is working->idle per session
-$script:PendingDoneById = @{}   # session id -> when the NATIVE lane landed an idle the hooks never wrote:
-                                # a real finish gets Stop's idle within seconds - a manual /compact or an
-                                # Esc-interrupt never does, and must not sing
 $script:BootStamp = Get-Date    # suppresses the done-chirp for already-done sessions found at launch
 $script:PillWorkCount = 0       # gates the supervising head-tilt
 $script:BirdFaces = @{}         # state -> BitmapImage (from assets/bird)
@@ -5121,44 +5166,6 @@ function Update-LimitsPanel {
         catch { }
     }
     catch { }
-}
-
-function Repair-Mojibake([string]$T) {
-    # the hook used to read stdin with the OEM codepage, so UTF-8 punctuation
-    # arrived as CP850 mojibake (em-dash showed as garble). Reverse it: re-encode as
-    # CP850, re-decode as STRICT UTF-8 - both steps throw unless the text
-    # really is mojibake, so organic text (even actual Greek) survives intact.
-    if ([string]::IsNullOrEmpty($T) -or $T.IndexOf([char]0x0393) -lt 0) { return $T }
-    foreach ($cp in @(437, 850)) {   # 'Γ' at 0xE2 is CP437; 850 kept as spare
-        try {
-            $enc = [System.Text.Encoding]::GetEncoding($cp,
-                (New-Object System.Text.EncoderExceptionFallback),
-                (New-Object System.Text.DecoderExceptionFallback))
-            $bytes = $enc.GetBytes($T)
-            return (New-Object System.Text.UTF8Encoding($false, $true)).GetString($bytes)
-        }
-        catch { }
-    }
-    return $T
-}
-
-function Get-PeekDisplayText([string]$T, [int]$Max) {
-    # raw transcript text is hostile to a one-glance tooltip: control chars,
-    # markdown emphasis, box-drawing rules from pasted terminal output, and
-    # blind Substring() that can cut an emoji in half mid-surrogate (the
-    # broken half renders as the classic weird box)
-    if ([string]::IsNullOrWhiteSpace($T)) { return '' }
-    $t = $T -replace '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ''
-    $t = $t -replace '[\u2500-\u259F]+', ' '      # box drawing / block elements
-    $t = $t -replace '```[a-zA-Z]*', ' '          # code fences
-    $t = $t -replace '[`]|\*{1,3}', ''            # backticks / md emphasis
-    $t = ($t -replace '\s+', ' ').Trim()
-    if ($t.Length -gt $Max) {
-        $cut = $Max
-        if ([char]::IsHighSurrogate($t[$cut - 1])) { $cut-- }   # never split a pair
-        $t = $t.Substring(0, $cut) + [string][char]0x2026
-    }
-    return $t
 }
 
 $script:PeekCache = @{}   # transcript path -> {LWT; You; Bot} (re-read only on file change)

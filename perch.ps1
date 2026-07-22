@@ -6197,7 +6197,58 @@ $PinBtn.Add_MouseLeftButtonUp({
 })
 if (-not $script:UserTopmost) { $PinBtn.Opacity = 0.35 }
 
-$Window.Add_Closing({ Save-HudState })
+# ===== TRAY RESIDENCY ====================================================
+# closing the HUD is NOT quitting the app. The bird moves to the system
+# tray and keeps watching - timers, hooks, chirps, the answer lane, all of
+# it stays live with zero windows on screen. Quitting is a DELIBERATE act:
+# tray right-click -> quit perch. This is what resident apps do, and perch
+# is a resident.
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$script:TrayQuit = $false          # set ONLY by the tray quit item: lets Closing actually close
+$script:TrayBalloonShown = $false  # first hide per run explains where the bird went
+function Invoke-TrayToggle {
+    if ($script:Window.IsVisible) { $script:Window.Hide() }
+    else { $script:Window.Show() }   # Topmost + ShowActivated=False: reappears without stealing focus
+}
+$script:Tray = New-Object System.Windows.Forms.NotifyIcon
+try { $script:Tray.Icon = New-Object System.Drawing.Icon((Join-Path $PSScriptRoot 'icon.ico')) } catch { }
+$script:Tray.Text = 'perch - watching your sessions'
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$miShow = $trayMenu.Items.Add('show / hide perch')
+$miShow.add_Click({ Invoke-TrayToggle })
+[void]$trayMenu.Items.Add('-')
+$miQuit = $trayMenu.Items.Add('quit perch')
+$miQuit.add_Click({
+    $script:TrayQuit = $true
+    try { $script:Tray.Visible = $false; $script:Tray.Dispose() } catch { }
+    $script:Window.Close()
+})
+$script:Tray.ContextMenuStrip = $trayMenu
+$script:Tray.add_MouseClick({
+    param($s, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Invoke-TrayToggle }
+})
+$script:Tray.Visible = $true
+
+$Window.Add_Closing({
+    param($s, $e)
+    Save-HudState
+    if (-not $script:TrayQuit) {
+        $e.Cancel = $true
+        $script:Window.Hide()
+        if (-not $script:TrayBalloonShown) {
+            $script:TrayBalloonShown = $true
+            try { $script:Tray.ShowBalloonTip(2500, 'perch', 'still watching from the tray - left-click to reopen, right-click to quit', [System.Windows.Forms.ToolTipIcon]::Info) } catch { }
+        }
+    }
+})
+$Window.Add_Closed({
+    # real quit: tear the tray icon down (or it ghosts in the tray until
+    # hover) and end the dispatcher loop the app now runs on
+    try { if ($null -ne $script:Tray) { $script:Tray.Visible = $false; $script:Tray.Dispose() } } catch { }
+    try { [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown() } catch { }
+})
 
 $script:Timer = New-Object System.Windows.Threading.DispatcherTimer
 $script:Timer.Interval = [TimeSpan]::FromSeconds($RefreshSeconds)
@@ -6238,5 +6289,10 @@ $script:UntrackedStamp = Get-Date
 
 Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) first-update" -ErrorAction SilentlyContinue
 Update-List
-Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) showdialog" -ErrorAction SilentlyContinue
-[void]$Window.ShowDialog()
+Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-boot.log') -Value "$(Get-Date -Format s) show+run" -ErrorAction SilentlyContinue
+# Show + Dispatcher.Run, NOT ShowDialog: hiding a dialog-shown window ENDS
+# its modal loop and the whole app with it - tray residency needs the
+# dispatcher to outlive the window's visibility. The Closed handler calls
+# InvokeShutdown, which is what ends this loop on a real quit.
+$Window.Show()
+[System.Windows.Threading.Dispatcher]::Run()

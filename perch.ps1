@@ -244,9 +244,17 @@ function Get-NativeAgentStatus([int]$AgentPid, $Proc) {
             }
         }
         if ($ok) {
+            # 'shell' is a TRAP: it does not mean "claude is running a shell
+            # command" - it means "a shell EXISTS", and a background dev
+            # server keeps it pinned long after the turn ends (observed live:
+            # 22 minutes of fake 'working' on an idle session whose footer
+            # said "1 shell"). Native rows skip busy-verify, so that lie had
+            # no detector. Foreground Bash work is already covered by the
+            # hook lane (PreToolUse paints working, Stop lands it) - so
+            # 'shell' claims NOTHING here and the hooks keep the axis.
             $val = switch ([string]$j.status) {
                 'busy'    { 'working'; break }
-                'shell'   { 'working'; break }
+                'shell'   { $null; break }
                 'waiting' { 'attention'; break }
                 'idle'    { 'idle'; break }
                 default   { $null }

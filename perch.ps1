@@ -2855,6 +2855,9 @@ $script:CarryLastSign = 0
 $script:CarryFlipStamp = [datetime]::MinValue
 $script:BirdBoopCount = 0       # boop-spam detector: pester the cooldown -> he swears
 $script:CarryWasShaken = $false # shaken mid-carry: the insult waits for the DROP
+$script:CarryStrokeX = 0.0      # stroke integrator: distance per direction, jitter-proof
+$script:CarryStrokeSign = 0
+$script:CarryStrokeDist = 0.0
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 # bird-first geometry, packed TIGHT: left margin 3 puts the ring's center
@@ -3878,32 +3881,40 @@ $script:CarrySwingTimer.Add_Tick({
             $script:BirdScale.ScaleY = 1.0 + $j
             $script:BirdScale.ScaleX = 1.0 - ($j * 0.5)
         }
-        # SHAKE detection: direction flips in quick succession = you're
-        # rattling the poor birb. Three brisk flips and he starts SWEARING
-        # at you mid-dangle (grawlix face, if the art exists) - direct
-        # Source set, same as the grab face: holds rule mid-carry.
-        # TUNED DOWN from 900 px/s x4 flips (field report: 'sometimes he
-        # does not get annoyed'): velocity passes through ZERO at every
-        # direction change, so the 30ms sampler only catches a flip when a
-        # brisk sample lands mid-stroke - 900 in DIP units demanded a
-        # genuinely violent shake, and honest medium rage went unrewarded.
-        # 520 px/s catches a normal wiggle; a plain reposition (one gentle
-        # correction flip at most) still never triggers it.
-        if ([Math]::Abs($vx) -gt 520) {
-            $sign = [Math]::Sign($vx)
-            if ($sign -ne $script:CarryLastSign) {
-                if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 1100) { $script:CarryFlips = 0 }
-                $script:CarryFlips++
-                $script:CarryFlipStamp = Get-Date
-                $script:CarryLastSign = $sign
-                if ($script:CarryFlips -ge 3 -and $script:BirdFaceKey -ne 'cursing' -and
-                    $null -ne $script:BirdFaces['cursing'] -and $null -ne $script:PillBirdA) {
-                    $script:BirdFaceKey = 'cursing'
-                    $script:PillBirdA.Source = $script:BirdFaces['cursing']
-                    # remember the offense: the insult lands at DROP (a popup
-                    # cannot chase a window mid-DragMove; he waits, seething)
-                    $script:CarryWasShaken = $true
+        # SHAKE detection v3: STROKE INTEGRATION, not instantaneous velocity.
+        # v1/v2 thresholded velocity AT the samples - but DragMove starves
+        # the 30ms timer (ticks stretch to 60-100ms mid-drag) and velocity
+        # passes through ZERO at every reversal, so whether a brisk sample
+        # landed mid-stroke was a coin toss ('still not working from time
+        # to time'). Distance INTEGRATES across however many ticks actually
+        # fire: a reversal that ends a stroke of >= 30px counts as one
+        # deliberate flip, any speed, any DPI, any timer weather. Three
+        # flips inside 1.2s windows = he blows up. A plain reposition (one
+        # long stroke + maybe one small correction) tops out at two.
+        $dxs = $x - $script:CarryStrokeX
+        $script:CarryStrokeX = $x
+        $sgn = [Math]::Sign($dxs)
+        if ($sgn -ne 0) {
+            if ($sgn -eq $script:CarryStrokeSign) { $script:CarryStrokeDist += [Math]::Abs($dxs) }
+            else {
+                if ($script:CarryStrokeDist -ge 30.0) {
+                    if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 1200) { $script:CarryFlips = 0 }
+                    $script:CarryFlips++
+                    $script:CarryFlipStamp = Get-Date
+                    if ($script:CarryFlips -ge 3 -and $script:BirdFaceKey -ne 'cursing' -and
+                        $null -ne $script:BirdFaces['cursing'] -and $null -ne $script:PillBirdA) {
+                        $script:BirdFaceKey = 'cursing'
+                        $script:PillBirdA.Source = $script:BirdFaces['cursing']
+                        # the insult still lands at DROP - ON PURPOSE. The
+                        # bubble can follow a moving window now, but a bubble
+                        # flailing around mid-shake reads as chaos; he wears
+                        # the grawlix face through the ride and tells you off
+                        # the moment you put him down. Dignity in rage.
+                        $script:CarryWasShaken = $true
+                    }
                 }
+                $script:CarryStrokeSign = $sgn
+                $script:CarryStrokeDist = [Math]::Abs($dxs)
             }
         }
     }
@@ -4362,6 +4373,22 @@ function Get-BirdGreeting {
         'your sessions cannot hide from me.'
     ))
 }
+
+# the bubble RIDES the window: a Popup only re-places itself on layout
+# changes, not when its owner window moves - dragging the HUD left the
+# bubble hanging in empty space where the mascot USED to be. An offset
+# nudge on every LocationChanged forces re-placement against the target's
+# current position (DragMove pumps the dispatcher, so this fires live
+# mid-carry and the bubble chases the creature).
+$Window.Add_LocationChanged({
+    try {
+        if ($null -ne $script:BirdBubble -and $script:BirdBubble.IsOpen) {
+            $script:BirdBubble.HorizontalOffset = $script:BirdBubble.HorizontalOffset + 0.001
+            $script:BirdBubble.HorizontalOffset = $script:BirdBubble.HorizontalOffset - 0.001
+        }
+    }
+    catch { }
+})
 
 # he says hello ~1s after the egg appears - while the hatch face still
 # holds, so the wide-eyed just-born look and the bubble land as ONE moment.
@@ -7207,6 +7234,9 @@ $Window.Add_MouseMove({
         $script:CarryAngVel = 0.0
         $script:CarryFlips = 0
         $script:CarryLastSign = 0
+        $script:CarryStrokeX = $script:Window.Left   # stale X here = a phantom first stroke
+        $script:CarryStrokeSign = 0
+        $script:CarryStrokeDist = 0.0
         $script:CarrySwingTimer.Start()
     }
     catch { }

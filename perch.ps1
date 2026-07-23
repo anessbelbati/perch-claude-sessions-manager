@@ -48,6 +48,7 @@ $script:CompactAtK = 120   # context (k tokens) past which a row grows its compa
 $script:ShowTimers = $true
 $script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (catalog below; settings builds its picker from the keys)
 $script:MascotPack = 'bird'      # 'bird' = built-in (root logo.png + assets\bird\); else assets\mascots\<name>\
+$script:ResumeShell = 'cmd'      # shell for restored session tabs: cmd | powershell | pwsh (settings dropdown)
 $script:AcctDisclaimerOk = $false
 $script:AcctPanel = $null
 try {
@@ -63,6 +64,10 @@ try {
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($null -ne $cfg.PSObject.Properties['ThemeName']) { $script:ThemeName = [string]$cfg.ThemeName }
         if ($null -ne $cfg.PSObject.Properties['MascotPack'] -and -not [string]::IsNullOrWhiteSpace([string]$cfg.MascotPack)) { $script:MascotPack = [string]$cfg.MascotPack }
+        if ($null -ne $cfg.PSObject.Properties['ResumeShell']) {
+            $rs = ([string]$cfg.ResumeShell).ToLowerInvariant()
+            if ($rs -in @('cmd', 'powershell', 'pwsh')) { $script:ResumeShell = $rs }
+        }
         if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
@@ -2403,8 +2408,22 @@ function Invoke-ResumeSession($P) {
     try {
         $cmd = 'claude --resume ' + $P.Id
         if (-not [string]::IsNullOrWhiteSpace([string]$P.Flags)) { $cmd += ' ' + [string]$P.Flags }
+        # YOUR shell, your rules (settings -> resume shell). Every choice
+        # keeps the tab alive on failure: /k for cmd, -NoExit for the
+        # powershells. A configured pwsh that is not installed falls back
+        # to Windows PowerShell instead of a tab that flashes and dies.
+        $sh = [string]$script:ResumeShell
+        if ($sh -eq 'pwsh' -and $null -eq (Get-Command pwsh.exe -ErrorAction SilentlyContinue)) { $sh = 'powershell' }
         $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
-        if ($null -ne $wt) {
+        if ($sh -eq 'powershell' -or $sh -eq 'pwsh') {
+            if ($null -ne $wt) {
+                Start-Process wt.exe -ArgumentList ('-w 0 nt -d "' + $P.Cwd + '" ' + $sh + ' -NoExit -Command "' + $cmd + '"')
+            }
+            else {
+                Start-Process ($sh + '.exe') -WorkingDirectory $P.Cwd -ArgumentList ('-NoExit -Command "' + $cmd + '"')
+            }
+        }
+        elseif ($null -ne $wt) {
             Start-Process wt.exe -ArgumentList ('-w 0 nt -d "' + $P.Cwd + '" cmd /k ' + $cmd)
         }
         else {
@@ -5011,6 +5030,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName CompactAtK        -NotePropertyValue $script:CompactAtK -Force
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
         $cfg | Add-Member -NotePropertyName MascotPack        -NotePropertyValue $script:MascotPack -Force
+        $cfg | Add-Member -NotePropertyName ResumeShell       -NotePropertyValue $script:ResumeShell -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
         Set-ContentAtomic $CfgPath ($cfg | ConvertTo-Json)
@@ -5131,6 +5151,34 @@ function Show-SettingsDialog {
     [void]$tmGrid.Children.Add($tCol)
     [void]$tmGrid.Children.Add($mCol)
     [void]$stack.Children.Add($tmGrid)
+
+    # resume shell: which terminal restored sessions come back in. A tiny
+    # dropdown (same compact picker as theme/mascot) - cmd boots instantly,
+    # powershell is home for powershell people, pwsh 7 only when installed.
+    $script:PickShell = $script:ResumeShell
+    $script:ShellOrig = $script:ResumeShell
+    $script:ShellSaved = $false
+    $shellItems = @(
+        [pscustomobject]@{ Key = 'cmd'; Text = 'cmd'; Dot = '#9A9AA3'; Thumb = $null }
+        [pscustomobject]@{ Key = 'powershell'; Text = 'powershell'; Dot = '#5391FE'; Thumb = $null }
+    )
+    if ($null -ne (Get-Command pwsh.exe -ErrorAction SilentlyContinue)) {
+        $shellItems += [pscustomobject]@{ Key = 'pwsh'; Text = 'pwsh 7'; Dot = '#2D9BF0'; Thumb = $null }
+    }
+    if (-not (@($shellItems | ForEach-Object { $_.Key }) -contains $script:PickShell)) {
+        $script:PickShell = 'powershell'   # configured pwsh vanished: show the fallback truth
+    }
+    $shellPick = New-CompactPicker $script:PickShell $shellItems {
+        param($k)
+        $script:PickShell = $k; $script:ResumeShell = $k
+    }
+    $shellCol = New-Object System.Windows.Controls.StackPanel
+    $shellCol.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+    [void]$shellCol.Children.Add((New-DarkLabel 'restore sessions in (shell)'))
+    $shellPick.Width = 150
+    $shellPick.HorizontalAlignment = 'Left'
+    [void]$shellCol.Children.Add($shellPick)
+    [void]$stack.Children.Add($shellCol)
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
@@ -5258,7 +5306,9 @@ function Show-SettingsDialog {
         $c = $s.Tag.Tag
         $script:ThemeSaved = $true
         $script:MascotSaved = $true
+        $script:ShellSaved = $true
         $script:MascotPack = [string]$script:PickMascot   # Save-PerchSettings persists $script:MascotPack
+        $script:ResumeShell = [string]$script:PickShell   # ...and $script:ResumeShell
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
                            ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag) ([string]$c.Compact.Text)
@@ -5277,6 +5327,8 @@ function Show-SettingsDialog {
             $script:ThemeName = $script:ThemeOrig
             try { Apply-Theme } catch { }
         }
+        # closed without saving: the shell pick never previews, just reverts
+        if (-not $script:ShellSaved) { $script:ResumeShell = $script:ShellOrig }
     })
 
     $script:UiHold++

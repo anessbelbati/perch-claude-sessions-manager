@@ -1369,10 +1369,24 @@ function Resolve-TabForPid {
         # manually-RENAMED tabs ignore console-title changes, so neither the
         # live title nor a stamped marker ever appears on them. People usually
         # rename the tab to the project name -> match the cwd folder name.
+        # IMPOSTER GUARD: codex titles its console with the BARE CWD FOLDER
+        # NAME - indistinguishable from a human-renamed tab. If any OTHER
+        # live agent's probed console title shows this same name, that tab
+        # is (almost certainly) that agent's console, not a rename - adopt
+        # it and a claude row starts jumping to codex (observed live: open
+        # claude then codex in one folder and the row 'became' codex).
         $wantCwd = Get-NormalizedTabName $CwdName
         if ($wantCwd.Length -gt 0) {
             $byCwd = @($tabs | Where-Object { $_.Norm -eq $wantCwd })
-            if ($byCwd.Count -eq 1) { $match = $byCwd[0] }
+            if ($byCwd.Count -eq 1) {
+                $imposter = $false
+                foreach ($opid in @($script:LastTitleByPid.Keys)) {
+                    if ([int]$opid -eq $TargetPid) { continue }
+                    if (-not $script:ProcSnapshot.ContainsKey([int]$opid)) { continue }
+                    if ((Get-NormalizedTabName ([string]$script:LastTitleByPid[$opid])) -eq $wantCwd) { $imposter = $true; break }
+                }
+                if (-not $imposter) { $match = $byCwd[0] }
+            }
         }
     }
     if ($null -eq $match -and $null -ne $info -and $info.ConsoleHwnd -gt 0) {
@@ -1468,7 +1482,13 @@ function Get-UntrackedSessions {
             }
 
             $dispName = Get-NormalizedTabName $match.Name
-            if ($dispName.Length -eq 0) { $dispName = "$($cand.Provider) session" }
+            # shell-noise names (cmd.exe path, powershell, conhost) are the
+            # HOST's title, not the agent's - show the provider instead of
+            # 'c:\windows\system32\cmd.exe - ...' (observed live with codex
+            # launched via cmd /k)
+            if ($dispName.Length -eq 0 -or $dispName -match '(?i)cmd\.exe|powershell|pwsh|conhost|windows terminal') {
+                $dispName = "$($cand.Provider) session"
+            }
             if ($dispName.Length -gt 34) { $dispName = $dispName.Substring(0, 34) }
             $ts = Get-Date
             try { $ts = $c.StartTime } catch { }

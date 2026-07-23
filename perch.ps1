@@ -4152,6 +4152,143 @@ function New-MascotSwatch([string]$Name) {
     return $wrap
 }
 
+function New-PickerIcon($It, [double]$Sz) {
+    # a tiny leading glyph for a dropdown item: a mascot thumbnail if the
+    # item carries one, else a color dot, else nothing.
+    if ($null -ne $It.Thumb) {
+        $im = New-Object System.Windows.Controls.Image
+        $im.Source = $It.Thumb; $im.Width = $Sz; $im.Height = $Sz
+        $im.VerticalAlignment = 'Center'
+        [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($im, 'HighQuality')
+        return $im
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$It.Dot)) {
+        $el = New-Object System.Windows.Shapes.Ellipse
+        $el.Width = 10; $el.Height = 10; $el.VerticalAlignment = 'Center'
+        $el.Fill = Get-Brush ([string]$It.Dot)
+        return $el
+    }
+    return $null
+}
+function New-CompactPicker($CurrentKey, $Items, $OnSelect) {
+    # a ONE-ROW dropdown: shows the current pick, click drops a list. Replaces
+    # the swatch grids that made settings a mile tall. $Items = array of
+    # @{ Key; Text; Dot; Thumb }. $OnSelect is invoked with the chosen key
+    # (live preview - the dialog's cancel path reverts it).
+    $cur = @($Items | Where-Object { $_.Key -eq $CurrentKey })[0]
+    if ($null -eq $cur) { $cur = $Items[0] }
+
+    $field = New-Object System.Windows.Controls.Border
+    $field.CornerRadius = New-Object System.Windows.CornerRadius(8)
+    $field.Background = Get-Brush '#16FFFFFF'
+    $field.BorderBrush = Get-Brush '#2AFFFFFF'
+    $field.BorderThickness = New-Object System.Windows.Thickness(1)
+    $field.Padding = New-Object System.Windows.Thickness(9, 5, 8, 5)
+    $field.Margin = New-Object System.Windows.Thickness(2, 0, 2, 5)
+    $field.Cursor = [System.Windows.Input.Cursors]::Hand
+
+    $fg = New-Object System.Windows.Controls.Grid
+    foreach ($w in @('Auto', '*', 'Auto')) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        $cd.Width = $(if ($w -eq '*') { New-Object System.Windows.GridLength(1, 'Star') } else { New-Object System.Windows.GridLength(0, 'Auto') })
+        $fg.ColumnDefinitions.Add($cd)
+    }
+    $iconHost = New-Object System.Windows.Controls.ContentControl
+    $iconHost.VerticalAlignment = 'Center'
+    $iconHost.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
+    $ic0 = New-PickerIcon $cur 17
+    if ($null -ne $ic0) { $iconHost.Content = $ic0 }
+    [System.Windows.Controls.Grid]::SetColumn($iconHost, 0)
+    [void]$fg.Children.Add($iconHost)
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = $cur.Text; $lbl.Foreground = Get-Brush '#EDEDF2'; $lbl.FontSize = 12
+    $lbl.VerticalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetColumn($lbl, 1)
+    [void]$fg.Children.Add($lbl)
+    $chev = New-Object System.Windows.Controls.TextBlock
+    $chev.Text = [string][char]0xE70D   # ChevronDown
+    $chev.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe MDL2 Assets')
+    $chev.FontSize = 8; $chev.Foreground = Get-Brush '#8A8A93'; $chev.VerticalAlignment = 'Center'
+    [System.Windows.Controls.Grid]::SetColumn($chev, 2)
+    [void]$fg.Children.Add($chev)
+    $field.Child = $fg
+
+    $popup = New-Object System.Windows.Controls.Primitives.Popup
+    $popup.PlacementTarget = $field
+    $popup.Placement = 'Bottom'
+    $popup.StaysOpen = $false
+    $popup.AllowsTransparency = $true
+    $popup.HorizontalOffset = 0; $popup.VerticalOffset = 2
+    $lb = New-Object System.Windows.Controls.Border
+    $lb.CornerRadius = New-Object System.Windows.CornerRadius(9)
+    $lb.Background = Get-Brush '#F71B1B23'
+    $lb.BorderBrush = Get-Brush '#33FFFFFF'
+    $lb.BorderThickness = New-Object System.Windows.Thickness(1)
+    $lb.Padding = New-Object System.Windows.Thickness(3)
+    $lb.MinWidth = 176
+    $sh = New-Object System.Windows.Media.Effects.DropShadowEffect
+    $sh.BlurRadius = 16; $sh.ShadowDepth = 0; $sh.Opacity = 0.55
+    $lb.Effect = $sh
+    $lsv = New-Object System.Windows.Controls.ScrollViewer
+    $lsv.VerticalScrollBarVisibility = 'Auto'; $lsv.HorizontalScrollBarVisibility = 'Disabled'
+    $lsv.MaxHeight = 260
+    $lstack = New-Object System.Windows.Controls.StackPanel
+    $lsv.Content = $lstack
+    $lb.Child = $lsv
+    $popup.Child = $lb
+
+    foreach ($it in $Items) {
+        $row = New-Object System.Windows.Controls.Border
+        $row.CornerRadius = New-Object System.Windows.CornerRadius(6)
+        $baseBg = $(if ($it.Key -eq $CurrentKey) { Get-Brush '#2E5ED584' } else { [System.Windows.Media.Brushes]::Transparent })
+        $row.Background = $baseBg
+        $row.Padding = New-Object System.Windows.Thickness(8, 5, 12, 6)
+        $row.Margin = New-Object System.Windows.Thickness(0, 0, 0, 1)
+        $row.Cursor = [System.Windows.Input.Cursors]::Hand
+        $rs = New-Object System.Windows.Controls.StackPanel
+        $rs.Orientation = 'Horizontal'
+        $ri = New-PickerIcon $it 17
+        if ($null -ne $ri) { $ri.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0); [void]$rs.Children.Add($ri) }
+        $rl = New-Object System.Windows.Controls.TextBlock
+        $rl.Text = $it.Text; $rl.Foreground = Get-Brush '#EDEDF2'; $rl.FontSize = 12
+        $rl.VerticalAlignment = 'Center'
+        [void]$rs.Children.Add($rl)
+        $row.Child = $rs
+        $row.Tag = @{ It = $it; Base = $baseBg; Field = $field; Lbl = $lbl; IconHost = $iconHost; Popup = $popup; OnSelect = $OnSelect }
+        $row.Add_MouseEnter({ param($s, $e) if ($s.Background -ne $s.Tag.Base -or $s.Tag.Base.Color.A -eq 0) { $s.Background = Get-Brush '#22FFFFFF' } })
+        $row.Add_MouseLeave({ param($s, $e) $s.Background = $s.Tag.Base })
+        $row.Add_MouseLeftButtonUp({
+            param($s, $e)
+            $e.Handled = $true
+            $t = $s.Tag
+            $t.Lbl.Text = [string]$t.It.Text
+            $ni = $null
+            if ($null -ne $t.It.Thumb) {
+                $ni = New-Object System.Windows.Controls.Image
+                $ni.Source = $t.It.Thumb; $ni.Width = 17; $ni.Height = 17; $ni.VerticalAlignment = 'Center'
+                [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($ni, 'HighQuality')
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$t.It.Dot)) {
+                $ni = New-Object System.Windows.Shapes.Ellipse
+                $ni.Width = 10; $ni.Height = 10; $ni.VerticalAlignment = 'Center'
+                $ni.Fill = Get-Brush ([string]$t.It.Dot)
+            }
+            $t.IconHost.Content = $ni
+            $t.Popup.IsOpen = $false
+            try { & $t.OnSelect ([string]$t.It.Key) } catch { }
+        })
+        [void]$lstack.Children.Add($row)
+    }
+
+    $field.Tag = @{ Popup = $popup }
+    $field.Add_MouseLeftButtonUp({ param($s, $e) $e.Handled = $true; $s.Tag.Popup.IsOpen = -not $s.Tag.Popup.IsOpen })
+    # the Popup is not in the visual tree - parent it so it renders/closes
+    $wrap = New-Object System.Windows.Controls.Grid
+    [void]$wrap.Children.Add($field)
+    [void]$wrap.Children.Add($popup)
+    return $wrap
+}
+
 function New-DialogButton([string]$Text, [bool]$Primary) {
     $b = New-Object System.Windows.Controls.Border
     $b.CornerRadius = New-Object System.Windows.CornerRadius(9)
@@ -4644,39 +4781,64 @@ function Show-SettingsDialog {
     $head.Add_MouseLeftButtonDown({ param($s, $e) try { $s.Tag.DragMove() } catch { } })
     [void]$stack.Children.Add($head)
 
-    # theme picker: swatches, live preview, cancel reverts
+    # theme + mascot: compact one-row DROPDOWNS side by side (swatch grids
+    # made this dialog a mile tall). Live preview on pick; cancel reverts.
     $script:PickTheme = $script:ThemeName
     $script:ThemeOrig = $script:ThemeName
     $script:ThemeSaved = $false
-    $script:ThemePickRings = @{}
-    [void]$stack.Children.Add((New-DarkLabel 'theme'))
-    $themeRow = New-Object System.Windows.Controls.WrapPanel
-    $themeRow.Orientation = 'Horizontal'
-    $themeRow.MaxWidth = 404
-    $themeRow.HorizontalAlignment = 'Left'
-    $themeRow.Margin = New-Object System.Windows.Thickness(2, 0, 0, 6)
-    foreach ($tn in @($script:ThemeSpecs.Keys)) {
-        [void]$themeRow.Children.Add((New-ThemeSwatch ([string]$tn)))
-    }
-    [void]$stack.Children.Add($themeRow)
-
-    # mascot picker: same live-preview-cancel-reverts pattern as the theme row.
-    # 'bird' is built in; drop a folder in assets\mascots\<name> and it shows
-    # up here (see assets\mascots\MASCOT-SPEC.md for the art an AI must make).
     $script:PickMascot = $script:MascotPack
     $script:MascotOrig = $script:MascotPack
     $script:MascotSaved = $false
-    $script:MascotPickRings = @{}
-    [void]$stack.Children.Add((New-DarkLabel 'mascot'))
-    $mascotRow = New-Object System.Windows.Controls.WrapPanel
-    $mascotRow.Orientation = 'Horizontal'
-    $mascotRow.MaxWidth = 404
-    $mascotRow.HorizontalAlignment = 'Left'
-    $mascotRow.Margin = New-Object System.Windows.Thickness(2, 0, 0, 6)
-    foreach ($mn in @(Get-MascotPacks)) {
-        [void]$mascotRow.Children.Add((New-MascotSwatch ([string]$mn)))
+
+    $themeItems = @()
+    foreach ($tn in @($script:ThemeSpecs.Keys)) {
+        $dot = '#E07B54'
+        $sw = $script:ThemeSpecs[$tn]
+        if ($null -ne $sw -and $sw.Glow) { $dot = [string]$sw.Glow }
+        $themeItems += [pscustomobject]@{ Key = [string]$tn; Text = [string]$tn; Dot = $dot; Thumb = $null }
     }
-    [void]$stack.Children.Add($mascotRow)
+    $themePick = New-CompactPicker $script:PickTheme $themeItems {
+        param($k)
+        $script:PickTheme = $k; $script:ThemeName = $k
+        try { Apply-Theme } catch { }
+    }
+
+    $mascotItems = @()
+    foreach ($mn in @(Get-MascotPacks)) {
+        $thumb = $null
+        $tp = $(if ($mn -eq 'bird') { Join-Path $PSScriptRoot 'logo.png' } else {
+            $c = $null
+            foreach ($n in @('logo.png', 'neutral.png')) { $q = Join-Path $PSScriptRoot ('assets\mascots\' + $mn + '\' + $n); if (Test-Path -LiteralPath $q) { $c = $q; break } }
+            $c
+        })
+        if ($null -ne $tp) { $thumb = Import-MascotBitmap $tp 40 }
+        $mascotItems += [pscustomobject]@{ Key = [string]$mn; Text = [string]$mn; Dot = $null; Thumb = $thumb }
+    }
+    $mascotPick = New-CompactPicker $script:PickMascot $mascotItems {
+        param($k)
+        $script:PickMascot = $k; $script:MascotPack = $k
+        try { Load-MascotFaces; Update-BirdFace } catch { }
+    }
+
+    # two labeled columns in one row
+    $tmGrid = New-Object System.Windows.Controls.Grid
+    $tmGrid.Margin = New-Object System.Windows.Thickness(0, 0, 0, 2)
+    foreach ($i in 0, 1) {
+        $cd = New-Object System.Windows.Controls.ColumnDefinition
+        $cd.Width = New-Object System.Windows.GridLength(1, 'Star')
+        $tmGrid.ColumnDefinitions.Add($cd)
+    }
+    $tCol = New-Object System.Windows.Controls.StackPanel
+    [void]$tCol.Children.Add((New-DarkLabel 'theme'))
+    [void]$tCol.Children.Add($themePick)
+    [System.Windows.Controls.Grid]::SetColumn($tCol, 0)
+    $mCol = New-Object System.Windows.Controls.StackPanel
+    [void]$mCol.Children.Add((New-DarkLabel 'mascot'))
+    [void]$mCol.Children.Add($mascotPick)
+    [System.Windows.Controls.Grid]::SetColumn($mCol, 1)
+    [void]$tmGrid.Children.Add($tCol)
+    [void]$tmGrid.Children.Add($mCol)
+    [void]$stack.Children.Add($tmGrid)
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
@@ -4778,9 +4940,11 @@ function Show-SettingsDialog {
     $scroller.Content = $stack
     try {
         $wa = [System.Windows.SystemParameters]::WorkArea
-        $scroller.MaxHeight = [Math]::Max(300.0, [double]$wa.Height - 210.0)   # never taller than the screen
+        # keep it COMPACT: cap well under the screen, and hard-cap at 430 so
+        # the dialog stays a tidy panel, not a full-height wall
+        $scroller.MaxHeight = [Math]::Min(430.0, [Math]::Max(240.0, [double]$wa.Height - 320.0))
     }
-    catch { $scroller.MaxHeight = 540.0 }
+    catch { $scroller.MaxHeight = 430.0 }
 
     $outer = New-Object System.Windows.Controls.StackPanel
     $outer.Width = 272   # 266 body + 6 for the scrollbar gutter

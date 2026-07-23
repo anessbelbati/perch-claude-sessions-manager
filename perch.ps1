@@ -3878,18 +3878,25 @@ $script:CarrySwingTimer.Add_Tick({
             $script:BirdScale.ScaleY = 1.0 + $j
             $script:BirdScale.ScaleX = 1.0 - ($j * 0.5)
         }
-        # SHAKE detection: violent direction flips in quick succession =
-        # you're rattling the poor birb. Four fast flips and he starts
-        # SWEARING at you mid-dangle (grawlix face, if the art exists) -
-        # direct Source set, same as the grab face: holds rule mid-carry
-        if ([Math]::Abs($vx) -gt 900) {
+        # SHAKE detection: direction flips in quick succession = you're
+        # rattling the poor birb. Three brisk flips and he starts SWEARING
+        # at you mid-dangle (grawlix face, if the art exists) - direct
+        # Source set, same as the grab face: holds rule mid-carry.
+        # TUNED DOWN from 900 px/s x4 flips (field report: 'sometimes he
+        # does not get annoyed'): velocity passes through ZERO at every
+        # direction change, so the 30ms sampler only catches a flip when a
+        # brisk sample lands mid-stroke - 900 in DIP units demanded a
+        # genuinely violent shake, and honest medium rage went unrewarded.
+        # 520 px/s catches a normal wiggle; a plain reposition (one gentle
+        # correction flip at most) still never triggers it.
+        if ([Math]::Abs($vx) -gt 520) {
             $sign = [Math]::Sign($vx)
             if ($sign -ne $script:CarryLastSign) {
-                if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 900) { $script:CarryFlips = 0 }
+                if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 1100) { $script:CarryFlips = 0 }
                 $script:CarryFlips++
                 $script:CarryFlipStamp = Get-Date
                 $script:CarryLastSign = $sign
-                if ($script:CarryFlips -ge 4 -and $script:BirdFaceKey -ne 'cursing' -and
+                if ($script:CarryFlips -ge 3 -and $script:BirdFaceKey -ne 'cursing' -and
                     $null -ne $script:BirdFaces['cursing'] -and $null -ne $script:PillBirdA) {
                     $script:BirdFaceKey = 'cursing'
                     $script:PillBirdA.Source = $script:BirdFaces['cursing']

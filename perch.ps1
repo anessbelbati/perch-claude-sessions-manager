@@ -3051,6 +3051,7 @@ function Update-PillCluster([int]$Att, [int]$Work, [int]$Done, [int]$Quiet) {
             $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(700)
         }
         Invoke-BirdMotion 'doze'
+        Invoke-BirdQuip 'sleep'
     }
     elseif ($wantZ -ne 'Visible' -and $script:BirdDozing) {
         $script:BirdDozing = $false
@@ -3763,6 +3764,7 @@ $script:BirdTiltTimer.Add_Tick({
             # awake, nothing running: he entertains himself
             Invoke-BirdMotion (Get-Random -InputObject @('look', 'ruffle', 'hopturn'))
             $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 22 -Maximum 49))
+            Invoke-BirdQuip 'idle'   # and, very rarely, thinks out loud
         }
     }
     catch { }
@@ -4045,6 +4047,73 @@ function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
         $script:BirdBubbleTimer.Stop()
         $script:BirdBubbleTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(1200, $HoldMs))
         $script:BirdBubbleTimer.Start()
+        $script:QuipLastAt = Get-Date   # ANY bubble arms the chatter cooldown
+    }
+    catch { }
+}
+
+# ---- AMBIENT QUIPS: the mascot occasionally has OPINIONS. Rarity is the
+# whole joke - a global cooldown plus a per-moment dice roll means most
+# finishes pass in silence and then, once in a while, he pipes up. A quip
+# machine that fires every time is a notification system; one that fires
+# rarely is a creature.
+$script:QuipLastAt = [datetime]::MinValue
+$script:QuipPrev5h = -1.0
+$script:QuipPrevCrown = $false
+$script:QuipPools = @{
+    done = @(              # a session finished (most common moment: quietest roll)
+        'another one bites the dust.'
+        'shipped. i supervised.'
+        'we did it. mostly you. some me.'
+        'that one is cooked. next.'
+        'and THAT is how it is done.'
+    )
+    crown = @(             # EVERYTHING done, nothing waiting - peak smug
+        'all done. bow before me.'
+        'inbox zero, terminal edition.'
+        'the kingdom is at peace.'
+        'every session fed. crown earned.'
+    )
+    attention = @(         # something newly needs the human
+        'it needs a grown-up. that is you.'
+        'red row! red row!'
+        'a decision worthy of the boss.'
+    )
+    sleep = @(             # the room went quiet and he is drifting off
+        'all quiet. i sleep with one eye open.'
+        'zzz... compiling dreams...'
+        'night watch: me. sleep: also me.'
+    )
+    hot = @(               # the 5h window just crossed 90%
+        'tokens go brrrr.'
+        'we are COOKING. literally.'
+        'smells like burnt budget in here.'
+    )
+    knocked = @(           # the limit actually hit
+        'we flew too close to the sun.'
+        'out of tokens. hold me.'
+        'limit hit. tell my story.'
+    )
+    idle = @(              # awake with nothing to do: tiny existential bird
+        'do worms have deadlines?'
+        'i have seen things. mostly logs.'
+        'you good? blink twice.'
+        'quiet... too quiet.'
+    )
+}
+$script:QuipChance = @{ done = 12; crown = 30; attention = 7; sleep = 18; hot = 25; knocked = 40; idle = 5 }
+
+function Invoke-BirdQuip([string]$Moment) {
+    try {
+        if (-not (Test-BirdOnStage)) { return }
+        if ($script:PillDragging) { return }
+        if ($null -ne $script:BirdBubble -and $script:BirdBubble.IsOpen) { return }
+        if (((Get-Date) - $script:QuipLastAt).TotalMinutes -lt 6) { return }   # hard silence floor
+        $pool = $script:QuipPools[$Moment]
+        $chance = [int]$script:QuipChance[$Moment]
+        if ($null -eq $pool -or @($pool).Count -eq 0 -or $chance -le 0) { return }
+        if ((Get-Random -Minimum 1 -Maximum 101) -gt $chance) { return }      # the dice decide
+        Show-BirdBubble ([string](Get-Random -InputObject $pool)) 3600
     }
     catch { }
 }
@@ -6736,7 +6805,16 @@ function Update-List {
                 $script:BirdFlapTimer.Stop(); $script:BirdFlapTimer.Start()
             }
         }
+        Invoke-BirdQuip 'done'    # ...and once in a while, commentary
     }
+    # milestone chatter: the ALL-DONE crown moment and 5h-limit crossings
+    # fire on the TRANSITION only, never on the standing state
+    if ($script:PillDoneAll -and -not $script:QuipPrevCrown) { Invoke-BirdQuip 'crown' }
+    $script:QuipPrevCrown = [bool]$script:PillDoneAll
+    $p5q = [double]$script:Pill5hPct
+    if ($p5q -ge 99.5 -and $script:QuipPrev5h -lt 99.5 -and $script:QuipPrev5h -ge 0) { Invoke-BirdQuip 'knocked' }
+    elseif ($p5q -ge 90.0 -and $script:QuipPrev5h -lt 90.0 -and $script:QuipPrev5h -ge 0) { Invoke-BirdQuip 'hot' }
+    $script:QuipPrev5h = $p5q
 
     # resurface the HUD when a session NEWLY needs attention
     $curAtt = @{}
@@ -6754,6 +6832,7 @@ function Update-List {
             $script:BirdFaceHoldUntil = (Get-Date).AddSeconds(45)
             Set-BirdFace 'alert'
         }
+        Invoke-BirdQuip 'attention'
     }
     $script:PrevAttention = $curAtt
 

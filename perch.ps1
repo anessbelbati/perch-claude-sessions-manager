@@ -2773,7 +2773,7 @@ function Load-MascotFaces {
             foreach ($f in @(Get-ChildItem -LiteralPath $spec.Dir -Filter '*.png' -ErrorAction SilentlyContinue)) {
                 $key = $f.BaseName
                 if ($key -like 'bird-*') { $key = $key.Substring(5) }
-                if ($key -eq 'logo' -or $key -eq 'neutral' -or [string]::IsNullOrWhiteSpace($key)) { continue }
+                if ($key -eq 'logo' -or $key -eq 'neutral' -or $key -eq 'bubble' -or [string]::IsNullOrWhiteSpace($key)) { continue }
                 $img = Import-MascotBitmap $f.FullName 160
                 if ($null -ne $img) { $faces[$key] = $img }
             }
@@ -3947,28 +3947,40 @@ function New-BubbleVisual([string]$ArtPath) {
     $bmp = $null
     if (-not [string]::IsNullOrEmpty($ArtPath)) { $bmp = Import-MascotBitmap $ArtPath 480 }
     if ($null -ne $bmp) {
-        $w = 236.0
+        # 190px: big enough to read, small enough to belong to a 52px
+        # creature (236 dwarfed him - the bubble was doing the talking)
+        $w = 190.0
         $h = [Math]::Round($w * $bmp.PixelHeight / [Math]::Max(1, $bmp.PixelWidth))
+        # PIN the root to the art box: a Popup measures its child with an
+        # INFINITE constraint, so without explicit size the text zone never
+        # constrains the TextBlock - lines refused to wrap and clipped
+        $root.Width = $w; $root.Height = $h
         $img = New-Object System.Windows.Controls.Image
         $img.Source = $bmp
         $img.Width = $w; $img.Height = $h
         $img.Stretch = 'Fill'
         [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($img, 'HighQuality')
         [void]$root.Children.Add($img)
+        # the text lives INSIDE a clipped zone box - a Grid does not clip,
+        # so long wrapped lines were painting straight over the bubble rim
+        $zone = New-Object System.Windows.Controls.Border
+        $zone.Background = [System.Windows.Media.Brushes]::Transparent
+        $zone.ClipToBounds = $true
+        # the spec's clear zone: x 20%..92%, y 12%..80% (tail owns the left)
+        $zone.Margin = New-Object System.Windows.Thickness(($w * 0.20), ($h * 0.12), ($w * 0.08), ($h * 0.20))
         $txt = New-Object System.Windows.Controls.TextBlock
         # handwriting stack: the art carries the comic energy, the font joins it
         $txt.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe Print,Comic Sans MS,Segoe UI')
-        $txt.FontSize = 11.5
+        $txt.FontSize = 10.0   # Show-BirdBubble re-sizes per line length
         $txt.FontWeight = [System.Windows.FontWeights]::SemiBold
         $txt.Foreground = Get-Brush '#1F1E28'   # dark words on the light interior
         $txt.TextWrapping = 'Wrap'
         $txt.TextAlignment = 'Center'
         $txt.HorizontalAlignment = 'Center'
         $txt.VerticalAlignment = 'Center'
-        # the spec's clear zone: x 20%..92%, y 12%..80% (tail owns the left)
-        $txt.Margin = New-Object System.Windows.Thickness(($w * 0.20), ($h * 0.12), ($w * 0.08), ($h * 0.20))
-        [void]$root.Children.Add($txt)
-        return @{ Root = $root; Text = $txt; Card = $null }
+        $zone.Child = $txt
+        [void]$root.Children.Add($zone)
+        return @{ Root = $root; Text = $txt; Card = $null; H = $h }
     }
     $row = New-Object System.Windows.Controls.StackPanel
     $row.Orientation = 'Horizontal'
@@ -4029,6 +4041,7 @@ function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
             $script:BirdBubbleRoot = $vis.Root
             $script:BirdBubbleText = $vis.Text
             $script:BirdBubbleCard = $vis.Card
+            $script:BirdBubbleH = [double]$vis.H
             $script:BirdBubbleArtPath = [string]$art
             $script:BirdBubble.Child = $script:BirdBubbleRoot
         }
@@ -4040,9 +4053,22 @@ function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
             $script:BirdBubbleCard.BorderBrush = Get-Brush ('#66' + $glowHex.TrimStart('#'))
         }
         $script:BirdBubbleText.Text = $Text
+        # longer line -> smaller hand: keeps every quip inside the art's
+        # clear zone instead of trimming a punchline mid-word
+        $ln = $Text.Length
+        $script:BirdBubbleText.FontSize = $(if ($ln -le 22) { 11.0 } elseif ($ln -le 34) { 10.0 } else { 9.0 })
         $script:BirdBubble.PlacementTarget = $script:BirdRingGrid
-        $script:BirdBubble.HorizontalOffset = 2
-        $script:BirdBubble.VerticalOffset = $(if ($null -eq $script:BirdBubbleCard) { -6 } else { 4 })
+        if ($null -eq $script:BirdBubbleCard) {
+            # ART bubble: aim the TAIL (about 40% down the left edge) at the
+            # mascot's head (about 16px into his 52px box) - top-aligning the
+            # popup made the bubble hang low like a name tag, not speech
+            $script:BirdBubble.HorizontalOffset = -4
+            $script:BirdBubble.VerticalOffset = [Math]::Round(16 - (0.40 * [double]$script:BirdBubbleH))
+        }
+        else {
+            $script:BirdBubble.HorizontalOffset = 2
+            $script:BirdBubble.VerticalOffset = 4
+        }
         $script:BirdBubbleRoot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
         $script:BirdBubbleRoot.Opacity = 0.0
         $script:BirdBubble.IsOpen = $true

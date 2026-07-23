@@ -164,8 +164,16 @@ foreach ($ev in $events) {
     }
 }
 if ($added -gt 0) {
-    $settings | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $cc -Encoding UTF8
-    Write-Host "  [ok] hook registered on $added Claude Code event(s) (new sessions pick it up)"
+    # the user's claude settings are SACRED: back up first, then tmp+rename
+    # so a crash mid-write can never truncate them. A half-written
+    # settings.json makes claude silently drop ALL hooks + the statusline -
+    # sessions run fine but perch goes blind (seen in the field after a PC
+    # crash: sessions restored, zero rows, zero limits).
+    try { Copy-Item -LiteralPath $cc -Destination ($cc + '.perch-backup') -Force -ErrorAction SilentlyContinue } catch { }
+    $tmpCc = $cc + '.tmp'
+    $settings | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $tmpCc -Encoding UTF8
+    Move-Item -LiteralPath $tmpCc -Destination $cc -Force
+    Write-Host "  [ok] hook registered on $added Claude Code event(s) (new sessions pick it up; prior settings backed up to settings.json.perch-backup)"
 }
 else {
     Write-Host "  [ok] hook already registered on all events"

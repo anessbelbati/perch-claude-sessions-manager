@@ -73,6 +73,15 @@ catch { }
 # processes that count as "an agent CLI" for liveness + untracked discovery
 $script:AgentProcRegex = '^(' + ((@($AgentProcNames) + @('node', 'bun', 'deno', 'python')) -join '|') + ')'
 
+function Set-ContentAtomic([string]$Path, [string]$Text) {
+    # tmp + rename: a power cut mid-write must never leave a TRUNCATED file.
+    # (A friend's PC crash taught us what half-written JSON does to a boot -
+    # config and state writes get the same law the hook status files follow.)
+    $tmp = $Path + '.tmp'
+    Set-Content -LiteralPath $tmp -Value $Text -Encoding UTF8
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
 # real backdrop blur for the glass theme: undocumented-but-ubiquitous
 # SetWindowCompositionAttribute acrylic + Win11 DWM rounded corners
 Add-Type -TypeDefinition @"
@@ -4429,7 +4438,7 @@ function Update-AccountsPanel {
                 if (Test-Path -LiteralPath $CfgPath) { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json }
                 if ($null -eq $cfg) { $cfg = [pscustomobject]@{} }
                 $cfg | Add-Member -NotePropertyName AccountsDisclaimerOk -NotePropertyValue $true -Force
-                $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
+                Set-ContentAtomic $CfgPath ($cfg | ConvertTo-Json)
             }
             catch { }
         }
@@ -4525,7 +4534,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName MascotPack        -NotePropertyValue $script:MascotPack -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
-        $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
+        Set-ContentAtomic $CfgPath ($cfg | ConvertTo-Json)
     }
     catch { }
 
@@ -6388,10 +6397,9 @@ $Window.Add_MouseLeftButtonUp({
 })
 function Save-HudState {
     try {
-        @{ Left = $script:Window.Left; Top = $script:Window.Top
+        Set-ContentAtomic $StatePath (@{ Left = $script:Window.Left; Top = $script:Window.Top
            Topmost = $script:UserTopmost; Compact = $script:Compact
-           Calib = @($script:BlockCalib) } |
-            ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatePath -Encoding UTF8
+           Calib = @($script:BlockCalib) } | ConvertTo-Json -Depth 4)
     }
     catch { }
 }

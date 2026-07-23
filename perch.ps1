@@ -2137,18 +2137,23 @@ $xaml = @"
           <TextBlock FontSize="13.5" FontWeight="SemiBold" Text="Perch"
                      Foreground="#F4F4F8" VerticalAlignment="Center"/>
         </StackPanel>
+        <!-- header icons: Segoe MDL2 Assets glyphs, NOT text/emoji - emoji
+             render in fixed color and cannot show state; font glyphs tint
+             via Foreground, so toggles can actually LOOK on/off -->
         <StackPanel Grid.Column="1" Orientation="Horizontal">
-          <TextBlock x:Name="MiniBtn" Text="&#x2013;" FontSize="12" Padding="5,3"
+          <!-- E738 Remove, NOT E921 ChromeMinimize: E921 is missing from
+               older MDL2 revisions and renders as a tofu rectangle -->
+          <TextBlock x:Name="MiniBtn" Text="&#xE738;" FontFamily="Segoe MDL2 Assets" FontSize="11" Padding="6,4"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="compact mode (double-click the header works too)"/>
-          <TextBlock x:Name="GearBtn" Text="&#x2699;" FontSize="12" Padding="5,3"
+          <TextBlock x:Name="GearBtn" Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="12" Padding="6,4"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="settings"/>
-          <TextBlock x:Name="PinBtn" Text="&#x1F4CC;" FontSize="11" Padding="5,3"
-                     Style="{StaticResource HudIconButton}" Margin="2,0"
-                     ToolTip="pinned = always on top; unpinned = normal window (attention only flashes the taskbar)"/>
-          <TextBlock x:Name="CloseBtn" Text="&#x2715;" FontSize="12" Padding="5,3"
-                     Style="{StaticResource HudIconButton}" Margin="4,0,2,0"/>
+          <TextBlock x:Name="PinBtn" Text="&#xE841;" FontFamily="Segoe MDL2 Assets" FontSize="12" Padding="6,4"
+                     Style="{StaticResource HudIconButton}" Margin="2,0"/>
+          <TextBlock x:Name="CloseBtn" Text="&#xE8BB;" FontFamily="Segoe MDL2 Assets" FontSize="11" Padding="6,4"
+                     Style="{StaticResource HudIconButton}" Margin="4,0,2,0"
+                     ToolTip="hide to tray - the bird keeps watching (quit from the tray icon)"/>
         </StackPanel>
       </Grid>
       <WrapPanel x:Name="ChipsPanel" Orientation="Horizontal" Margin="16,0,16,4" Background="Transparent"/>
@@ -6196,13 +6201,36 @@ function Save-HudState {
 }
 
 $CloseBtn.Add_MouseLeftButtonUp({ $script:Window.Close() })
+# pin = a TOGGLE, and a toggle must LOOK toggled: pinned shows the filled
+# pin in gold, unpinned shows the slashed unpin glyph in the same dim gray
+# as its neighbors. (The old look was one emoji at 35% opacity - unreadable.)
+# Local Foreground beats the style's hover trigger, so hover is code-side too.
+function Update-PinLook {
+    if ($script:UserTopmost) {
+        $script:PinBtn.Text = [string][char]0xE841   # PinnedFill
+        $script:PinBtn.Foreground = Get-Brush $(if ($script:PinBtn.IsMouseOver) { '#FFE3A1' } else { '#FFD479' })
+        $script:PinBtn.ToolTip = 'pinned: always on top (click to unpin)'
+    }
+    else {
+        $script:PinBtn.Text = [string][char]0xE77A   # UnPin (slashed)
+        $script:PinBtn.Foreground = Get-Brush $(if ($script:PinBtn.IsMouseOver) { '#DCDCE4' } else { '#66666E' })
+        $script:PinBtn.ToolTip = 'unpinned: normal window - attention only flashes the taskbar (click to pin on top)'
+    }
+}
 $PinBtn.Add_MouseLeftButtonUp({
     $script:UserTopmost = -not $script:UserTopmost
     $script:Window.Topmost = $script:UserTopmost
-    if ($script:UserTopmost) { $script:PinBtn.Opacity = 1.0 } else { $script:PinBtn.Opacity = 0.35 }
+    Update-PinLook
     Save-HudState
 })
-if (-not $script:UserTopmost) { $PinBtn.Opacity = 0.35 }
+$PinBtn.Add_MouseEnter({ Update-PinLook })
+$PinBtn.Add_MouseLeave({ Update-PinLook })
+Update-PinLook
+
+# close leans RED on hover - universal "this dismisses something" grammar.
+# ClearValue on leave hands Foreground back to the style (incl. its trigger).
+$CloseBtn.Add_MouseEnter({ $script:CloseBtn.Foreground = Get-Brush '#FF8585' })
+$CloseBtn.Add_MouseLeave({ $script:CloseBtn.ClearValue([System.Windows.Controls.TextBlock]::ForegroundProperty) })
 
 # ===== TRAY RESIDENCY ====================================================
 # closing the HUD is NOT quitting the app. The bird moves to the system

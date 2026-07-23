@@ -108,6 +108,32 @@ named moving part**.
 
 ---
 
+### 5 · the speech bubble (optional — the mascot TALKS)
+
+| file | what it is |
+|------|-----------|
+| `bubble.png` | An **empty comic speech bubble** in your pack's art style. Perch overlays the words at runtime (the hello on boot, and future chatter) — so the inside must be **completely blank**. If you skip it, a plain built-in bubble is used. |
+
+Rules for `bubble.png` (these are a **contract with the app** — the text is
+placed by code, so the geometry must hold):
+
+1. **Transparent background**, PNG alpha, nothing outside the bubble.
+2. **Wide format, about 2.2:1** (e.g. 1060×480). ≥1024 px wide.
+3. **The tail sprouts from the LEFT edge**, in the upper half, pointing
+   left — the mascot sits to the bubble's left and the tail must aim at it.
+4. **Light, plain interior** (white/cream — dark text is drawn onto it),
+   with a bold clean outline in your pack's style. Chunky > delicate: it
+   renders ~236 px wide.
+5. **Keep the interior EMPTY and keep this zone clear**: from **20% to 92%
+   of the width** and **12% to 80% of the height**. That's where the app
+   writes. The tail, outline flourishes, little clouds — all of it stays
+   outside that zone. **No text, ever** — the app brings the words.
+
+> Prompt sketch: *"A single empty comic speech bubble, [your pack's art
+> style], white interior, bold outline, tail on the left edge pointing
+> left, transparent background, no text, wide 2.2:1 format."* Then check
+> rule 5 and regenerate if the tail or decorations invade the clear zone.
+
 ## Minimum viable mascot
 
 If you only do a few: **`logo.png` + `alert.png` + `happy.png` + `sleep.png`**

@@ -3882,6 +3882,203 @@ if ($null -ne $script:BirdFaces['hatch'] -and $null -ne $script:PillBirdA) {
         }
     })
 }
+
+# ---- the bird SPEAKS: a comic speech bubble anchored to whichever perch he
+# is on (header or pill - PlacementTarget rides the reparent). A Popup is
+# its OWN hwnd, so the bubble never resizes the window (layered-window law)
+# and can hang past the card's edge. Opaque background on purpose: popup
+# hwnds have no acrylic backdrop, translucency blends into whatever is
+# behind and reads as milky garbage (same law as the row tooltips).
+$script:BirdBubble = $null
+$script:BirdBubbleRoot = $null
+$script:BirdBubbleTimer = $null
+$script:BirdBubbleArtPath = [string]::Empty   # '' = not resolved yet for this pack
+
+function Get-BubbleArtPath {
+    # bubble ART, resolved like faces: the active pack's bubble.png first,
+    # then the shipped default at assets\bubble.png, then $null (the drawn
+    # fallback card - never crash, never blank; same law as mascot faces)
+    try {
+        $spec = Get-MascotSpec
+        if ($null -ne $spec -and $null -ne $spec.Dir) {
+            $p = Join-Path $spec.Dir 'bubble.png'
+            if (Test-Path -LiteralPath $p) { return $p }
+        }
+    }
+    catch { }
+    $g = Join-Path $PSScriptRoot 'assets\bubble.png'
+    if (Test-Path -LiteralPath $g) { return $g }
+    return $null
+}
+
+function New-BubbleVisual([string]$ArtPath) {
+    # ART bubble: the pack's hand-drawn comic bubble at a fixed size, words
+    # overlaid inside the SPEC'D safe area (MASCOT-SPEC.md pins the interior
+    # clear zone, so the code can trust these fractions). Fallback: a plain
+    # drawn card + tail, so packs without bubble art still get to speak.
+    $root = New-Object System.Windows.Controls.Grid
+    $root.IsHitTestVisible = $false   # decoration, never a click target
+    $bmp = $null
+    if (-not [string]::IsNullOrEmpty($ArtPath)) { $bmp = Import-MascotBitmap $ArtPath 480 }
+    if ($null -ne $bmp) {
+        $w = 236.0
+        $h = [Math]::Round($w * $bmp.PixelHeight / [Math]::Max(1, $bmp.PixelWidth))
+        $img = New-Object System.Windows.Controls.Image
+        $img.Source = $bmp
+        $img.Width = $w; $img.Height = $h
+        $img.Stretch = 'Fill'
+        [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($img, 'HighQuality')
+        [void]$root.Children.Add($img)
+        $txt = New-Object System.Windows.Controls.TextBlock
+        # handwriting stack: the art carries the comic energy, the font joins it
+        $txt.FontFamily = New-Object System.Windows.Media.FontFamily('Segoe Print,Comic Sans MS,Segoe UI')
+        $txt.FontSize = 11.5
+        $txt.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $txt.Foreground = Get-Brush '#1F1E28'   # dark words on the light interior
+        $txt.TextWrapping = 'Wrap'
+        $txt.TextAlignment = 'Center'
+        $txt.HorizontalAlignment = 'Center'
+        $txt.VerticalAlignment = 'Center'
+        # the spec's clear zone: x 20%..92%, y 12%..80% (tail owns the left)
+        $txt.Margin = New-Object System.Windows.Thickness(($w * 0.20), ($h * 0.12), ($w * 0.08), ($h * 0.20))
+        [void]$root.Children.Add($txt)
+        return @{ Root = $root; Text = $txt; Card = $null }
+    }
+    $row = New-Object System.Windows.Controls.StackPanel
+    $row.Orientation = 'Horizontal'
+    $tail = New-Object System.Windows.Shapes.Polygon
+    $pc = New-Object System.Windows.Media.PointCollection
+    $pc.Add((New-Object System.Windows.Point(9, 6)))
+    $pc.Add((New-Object System.Windows.Point(0, 12)))
+    $pc.Add((New-Object System.Windows.Point(9, 18)))
+    $tail.Points = $pc
+    $tail.Fill = Get-Brush '#FF23222D'
+    $tail.VerticalAlignment = 'Top'
+    $tail.Margin = New-Object System.Windows.Thickness(0, 6, -1, 0)
+    [void]$row.Children.Add($tail)
+    $card = New-Object System.Windows.Controls.Border
+    $card.CornerRadius = New-Object System.Windows.CornerRadius(10)
+    $card.Background = Get-Brush '#FF23222D'
+    $card.BorderThickness = New-Object System.Windows.Thickness(1)
+    $card.Padding = New-Object System.Windows.Thickness(10, 6, 11, 7)
+    $txt = New-Object System.Windows.Controls.TextBlock
+    $txt.FontSize = 11.5
+    $txt.Foreground = Get-Brush '#F0F0F5'
+    $txt.TextWrapping = 'Wrap'
+    $txt.MaxWidth = 190
+    $card.Child = $txt
+    [void]$row.Children.Add($card)
+    [void]$root.Children.Add($row)
+    return @{ Root = $root; Text = $txt; Card = $card }
+}
+
+function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
+    if ([string]::IsNullOrWhiteSpace($Text) -or $null -eq $script:BirdRingGrid) { return }
+    try {
+        if ($null -eq $script:BirdBubble) {
+            $pop = New-Object System.Windows.Controls.Primitives.Popup
+            $pop.AllowsTransparency = $true
+            $pop.PopupAnimation = 'None'
+            $pop.Placement = 'Right'
+            $pop.StaysOpen = $true
+            $pop.Focusable = $false
+            $script:BirdBubble = $pop
+            $script:BirdBubbleTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:BirdBubbleTimer.Add_Tick({
+                $script:BirdBubbleTimer.Stop()
+                try {
+                    $bye = New-Object System.Windows.Media.Animation.DoubleAnimation(1.0, 0.0,
+                        (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(260))))
+                    $bye.Add_Completed({ try { $script:BirdBubble.IsOpen = $false } catch { } })
+                    $script:BirdBubbleRoot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $bye)
+                }
+                catch { try { $script:BirdBubble.IsOpen = $false } catch { } }
+            })
+        }
+        # (re)build the visual when the active pack's bubble art changes -
+        # bubbles show rarely, a rebuild costs nothing that matters
+        $art = Get-BubbleArtPath
+        if ($null -eq $script:BirdBubbleRoot -or [string]$script:BirdBubbleArtPath -ne [string]$art) {
+            $vis = New-BubbleVisual $art
+            $script:BirdBubbleRoot = $vis.Root
+            $script:BirdBubbleText = $vis.Text
+            $script:BirdBubbleCard = $vis.Card
+            $script:BirdBubbleArtPath = [string]$art
+            $script:BirdBubble.Child = $script:BirdBubbleRoot
+        }
+        if ($null -ne $script:BirdBubbleCard) {
+            # drawn fallback: its accent matches the room (same as the halo)
+            $glowHex = '#E07B54'
+            $sp = $script:ThemeSpecs[$script:ThemeName]
+            if ($null -ne $sp -and $sp.Glow) { $glowHex = [string]$sp.Glow }
+            $script:BirdBubbleCard.BorderBrush = Get-Brush ('#66' + $glowHex.TrimStart('#'))
+        }
+        $script:BirdBubbleText.Text = $Text
+        $script:BirdBubble.PlacementTarget = $script:BirdRingGrid
+        $script:BirdBubble.HorizontalOffset = 2
+        $script:BirdBubble.VerticalOffset = $(if ($null -eq $script:BirdBubbleCard) { -6 } else { 4 })
+        $script:BirdBubbleRoot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+        $script:BirdBubbleRoot.Opacity = 0.0
+        $script:BirdBubble.IsOpen = $true
+        $hi = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0,
+            (New-Object System.Windows.Duration([TimeSpan]::FromMilliseconds(200))))
+        $script:BirdBubbleRoot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $hi)
+        $script:BirdBubbleTimer.Stop()
+        $script:BirdBubbleTimer.Interval = [TimeSpan]::FromMilliseconds([Math]::Max(1200, $HoldMs))
+        $script:BirdBubbleTimer.Start()
+    }
+    catch { }
+}
+
+function Get-BirdGreeting {
+    # one cute line for the hatch moment. Time-of-day pools, and a genuinely
+    # useful line when a crash snapshot is waiting (the restore bar is the
+    # single most missable thing on the card).
+    if ($null -ne $script:RestorePending -and $script:RestorePending.Count -gt 0) {
+        return 'welcome back! your old sessions are one click away.'
+    }
+    $h = (Get-Date).Hour
+    if ($h -ge 5 -and $h -lt 11) {
+        return (Get-Random -InputObject @(
+            "mornin'! fresh tokens, fresh chaos."
+            'up with the birds, i see.'
+            'coffee for you, worms for me. deal.'
+        ))
+    }
+    if ($h -ge 23 -or $h -lt 4) {
+        return (Get-Random -InputObject @(
+            'night shift again? i will keep watch.'
+            'sleep is a suggestion, apparently.'
+            'just you, me, and the 5h window. cozy.'
+        ))
+    }
+    return (Get-Random -InputObject @(
+        "hey! i'm perched."
+        'chirp. reporting for duty.'
+        'i watch. you build.'
+        'your sessions cannot hide from me.'
+    ))
+}
+
+# he says hello ~1s after the egg appears - while the hatch face still
+# holds, so the wide-eyed just-born look and the bubble land as ONE moment.
+# ContentRendered fires once per process: tray hide/show never re-greets.
+$Window.Add_ContentRendered({
+    try {
+        if ($script:BirdHelloDone) { return }
+        $script:BirdHelloDone = $true
+        if ($null -eq $script:BirdHelloTimer) {
+            $script:BirdHelloTimer = New-Object System.Windows.Threading.DispatcherTimer
+            $script:BirdHelloTimer.Interval = [TimeSpan]::FromMilliseconds(950)
+            $script:BirdHelloTimer.Add_Tick({
+                $script:BirdHelloTimer.Stop()
+                try { Show-BirdBubble (Get-BirdGreeting) } catch { }
+            })
+        }
+        $script:BirdHelloTimer.Start()
+    }
+    catch { }
+})
 # hover triggers NOTHING - peek opens on click only (see HeaderClick)
 $Window.Add_SizeChanged({
     param($s, $e)

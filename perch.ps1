@@ -3531,7 +3531,11 @@ function Set-CompactMode([bool]$On) {
         $script:RootCard.Width = 264.0
         $script:PillCard.Visibility = 'Visible'
         $script:Window.SizeToContent = 'WidthAndHeight'
-        $script:MiniBtn.Text = [string][char]0x25FB   # restore glyph
+        # MDL2 codepoints ONLY: MiniBtn's font is Segoe MDL2 Assets, and the
+        # old text glyphs (U+2013 en dash / U+25FB square) simply DO NOT
+        # EXIST in that font (verified via GlyphTypeface) - the minus
+        # vanished forever after the first fold/expand round-trip
+        $script:MiniBtn.Text = [string][char]0xE740   # E740 FullScreen = expand
         $script:MiniBtn.ToolTip = 'expand (or just click the pill)'
         # folding a quiet HUD: the bird should already be asleep AND breathing
         if ($script:BirdDozing) { Invoke-BirdMotion 'doze' }
@@ -3563,7 +3567,7 @@ function Set-CompactMode([bool]$On) {
             $script:RowsScroll.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $rf)
         }
         catch { }
-        $script:MiniBtn.Text = [string][char]0x2013   # minimize glyph
+        $script:MiniBtn.Text = [string][char]0xE738   # E738 Remove = the minus (same as the XAML boot glyph)
         $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
     }
 }

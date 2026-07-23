@@ -47,6 +47,7 @@ $script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
 $script:CompactAtK = 120   # context (k tokens) past which a row grows its compact button (0 = never)
 $script:ShowTimers = $true
 $script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (midnight/oled/glass/phosphor/nord/catppuccin/synthwave)
+$script:MascotPack = 'bird'      # 'bird' = built-in (root logo.png + assets\bird\); else assets\mascots\<name>\
 $script:AcctDisclaimerOk = $false
 $script:AcctPanel = $null
 try {
@@ -61,6 +62,7 @@ try {
         if ($null -ne $cfg.PSObject.Properties['CompactAtK']) { $script:CompactAtK = [int]$cfg.CompactAtK }
         if ($null -ne $cfg.PSObject.Properties['ShowWorkTimers']) { $script:ShowTimers = [bool]$cfg.ShowWorkTimers }
         if ($null -ne $cfg.PSObject.Properties['ThemeName']) { $script:ThemeName = [string]$cfg.ThemeName }
+        if ($null -ne $cfg.PSObject.Properties['MascotPack'] -and -not [string]::IsNullOrWhiteSpace([string]$cfg.MascotPack)) { $script:MascotPack = [string]$cfg.MascotPack }
         if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
@@ -2565,6 +2567,92 @@ try {
 }
 catch { }
 
+# ===== MASCOT PACKS ======================================================
+# A mascot is a folder of PNGs. The built-in 'bird' lives at root logo.png +
+# assets\bird\bird-<state>.png. Any OTHER pack is assets\mascots\<name>\ with
+# logo.png (or neutral.png) + <state>.png. Everything here is written to
+# NEVER throw and NEVER blank the HUD: any missing file, missing pack, or
+# unreadable image falls back - state file -> pack neutral -> bird -> root
+# logo. Generate art in any order; the mascot levels up incrementally.
+function Import-MascotBitmap([string]$Path, [int]$DecodeW) {
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) { return $null }
+    try {
+        $bi = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bi.BeginInit()
+        $bi.UriSource = New-Object System.Uri($Path)
+        if ($DecodeW -gt 0) { $bi.DecodePixelWidth = $DecodeW }
+        $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bi.EndInit()
+        $bi.Freeze()
+        return $bi
+    }
+    catch { return $null }
+}
+function Get-MascotSpec {
+    # @{ Name; Dir; Neutral } for the active pack - ALWAYS valid.
+    $root = $PSScriptRoot
+    $name = [string]$script:MascotPack
+    if ([string]::IsNullOrWhiteSpace($name)) { $name = 'bird' }
+    if ($name -ne 'bird') {
+        $dir = Join-Path $root ('assets\mascots\' + $name)
+        if (Test-Path -LiteralPath $dir) {
+            $neutral = $null
+            foreach ($n in @('logo.png', 'neutral.png')) {
+                $p = Join-Path $dir $n
+                if (Test-Path -LiteralPath $p) { $neutral = $p; break }
+            }
+            if ($null -eq $neutral) { $neutral = Join-Path $root 'logo.png' }   # pack has no neutral yet: borrow bird's
+            return @{ Name = $name; Dir = $dir; Neutral = $neutral }
+        }
+        # named pack folder is gone: fall through to the bird
+    }
+    return @{ Name = 'bird'; Dir = (Join-Path $root 'assets\bird'); Neutral = (Join-Path $root 'logo.png') }
+}
+function Get-MascotPacks {
+    # 'bird' (always) + every assets\mascots\<name> that has a neutral image
+    $packs = [System.Collections.ArrayList]@('bird')
+    $mdir = Join-Path $PSScriptRoot 'assets\mascots'
+    if (Test-Path -LiteralPath $mdir) {
+        foreach ($d in @(Get-ChildItem -LiteralPath $mdir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            foreach ($n in @('logo.png', 'neutral.png')) {
+                if (Test-Path -LiteralPath (Join-Path $d.FullName $n)) { [void]$packs.Add($d.Name); break }
+            }
+        }
+    }
+    return $packs
+}
+function Load-MascotFaces {
+    # (re)build $script:BirdFaces + $script:LogoSource for the active pack and
+    # push the neutral face to the live UI. Safe to call at boot OR live from
+    # the picker. State keys: <state>.png, and a legacy 'bird-' prefix is
+    # tolerated so the built-in pack's bird-blink.png -> key 'blink'.
+    $spec = Get-MascotSpec
+    $script:MascotActive = $spec.Name
+    $neutral = Import-MascotBitmap $spec.Neutral 160
+    if ($null -eq $neutral) { $neutral = Import-MascotBitmap (Join-Path $PSScriptRoot 'logo.png') 160 }
+    $script:LogoSource = $neutral
+    $faces = @{ neutral = $neutral }
+    try {
+        if (Test-Path -LiteralPath $spec.Dir) {
+            foreach ($f in @(Get-ChildItem -LiteralPath $spec.Dir -Filter '*.png' -ErrorAction SilentlyContinue)) {
+                $key = $f.BaseName
+                if ($key -like 'bird-*') { $key = $key.Substring(5) }
+                if ($key -eq 'logo' -or $key -eq 'neutral' -or [string]::IsNullOrWhiteSpace($key)) { continue }
+                $img = Import-MascotBitmap $f.FullName 160
+                if ($null -ne $img) { $faces[$key] = $img }
+            }
+        }
+    }
+    catch { }
+    $script:BirdFaces = $faces
+    if ($null -ne $script:LogoImg -and $null -ne $neutral) { $script:LogoImg.Source = $neutral }
+    if ($null -ne $script:PillBirdA -and $null -ne $neutral) {
+        $script:PillBirdA.Source = $neutral
+        if ($null -ne $script:PillBirdB) { $script:PillBirdB.Opacity = 0.0 }
+        $script:BirdFaceKey = 'neutral'
+    }
+}
+
 # window/taskbar icon + header logo
 try {
     $iconPath = Join-Path $PSScriptRoot 'icon.ico'
@@ -2574,19 +2662,15 @@ try {
             [System.Windows.Media.Imaging.BitmapCreateOptions]::None,
             [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
     }
-    $logoPath = Join-Path $PSScriptRoot 'logo.png'
     $logoImg = $Window.FindName('LogoImg')
     $script:LogoImg = $logoImg
-    if ($null -ne $logoImg -and (Test-Path -LiteralPath $logoPath)) {
-        $bi = New-Object System.Windows.Media.Imaging.BitmapImage
-        $bi.BeginInit()
-        $bi.UriSource = New-Object System.Uri($logoPath)
-        $bi.DecodePixelWidth = 128
-        $bi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-        $bi.EndInit()
-        $bi.Freeze()
-        $logoImg.Source = $bi
-        $script:LogoSource = $bi
+    # neutral face for the ACTIVE mascot pack (Get-MascotSpec always resolves
+    # to something loadable - a custom pack, or the built-in bird, or at worst
+    # the root logo). Drives BOTH the header logo and the bird's resting face.
+    $mspec0 = Get-MascotSpec
+    $script:LogoSource = Import-MascotBitmap $mspec0.Neutral 128
+    if ($null -ne $logoImg -and $null -ne $script:LogoSource) {
+        $logoImg.Source = $script:LogoSource
     }
 }
 catch { }
@@ -2655,25 +2739,11 @@ $script:PillRingArc.StrokeEndLineCap = 'Round'
 $script:PillRingArc.Visibility = 'Collapsed'
 [void]$birdGrid.Children.Add($script:PillRingArc)
 if ($null -ne $script:LogoSource) {
-    # FACE LIBRARY: assets/bird/bird-<state>.png keyed by <state>. Missing
-    # files silently fall back to the logo - the pack can be incomplete.
+    # FACE LIBRARY for the active mascot pack. Built by Load-MascotFaces
+    # (below, once PillBirdA exists so it can push the neutral face) - keyed
+    # by <state>, missing files fall back to neutral. Seed it now so the gate
+    # code paths that read $script:BirdFaces before the load never null out.
     $script:BirdFaces = @{ neutral = $script:LogoSource }
-    try {
-        $bdir = Join-Path $PSScriptRoot 'assets\bird'
-        if (Test-Path -LiteralPath $bdir) {
-            foreach ($bfF in Get-ChildItem -LiteralPath $bdir -Filter 'bird-*.png' -ErrorAction SilentlyContinue) {
-                $bfi = New-Object System.Windows.Media.Imaging.BitmapImage
-                $bfi.BeginInit()
-                $bfi.UriSource = New-Object System.Uri($bfF.FullName)
-                $bfi.DecodePixelWidth = 160   # crisp at the 68px carry size on scaled displays
-                $bfi.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-                $bfi.EndInit()
-                $bfi.Freeze()
-                $script:BirdFaces[$bfF.BaseName.Substring(5)] = $bfi
-            }
-        }
-    }
-    catch { }
     # two stacked Images = 120ms face crossfades; transforms ride on the
     # wrapper grid so every motion moves whichever face is showing
     $birdImgGrid = New-Object System.Windows.Controls.Grid
@@ -2705,6 +2775,9 @@ if ($null -ne $script:LogoSource) {
     $birdImgGrid.RenderTransformOrigin = New-Object System.Windows.Point(0.5, 0.72)
     [void]$birdGrid.Children.Add($birdImgGrid)
     $script:BirdImgGrid = $birdImgGrid
+    # now that PillBirdA/B exist, build the full face library for the active
+    # pack (bird by default) and push its neutral face onto them
+    Load-MascotFaces
 }
 [void]$pillRow.Children.Add($birdGrid)
 $script:BirdRingGrid = $birdGrid   # resized during a drag: the carried bird grows
@@ -3923,6 +3996,83 @@ function New-ThemeSwatch([string]$Name) {
     return $wrap
 }
 
+function New-MascotSwatch([string]$Name) {
+    # preview card in settings: the pack's neutral face + name. Click = LIVE
+    # swap of the whole mascot on the real widget; cancel reverts. A pack that
+    # can't produce a thumbnail still shows a labeled placeholder (never blank).
+    $wrap = New-Object System.Windows.Controls.StackPanel
+    $wrap.Margin = New-Object System.Windows.Thickness(0, 2, 10, 0)
+    $wrap.Cursor = [System.Windows.Input.Cursors]::Hand
+    $wrap.Tag = $Name
+
+    $ring = New-Object System.Windows.Controls.Border
+    $ring.CornerRadius = New-Object System.Windows.CornerRadius(12)
+    $ring.BorderThickness = New-Object System.Windows.Thickness(2)
+    $ring.Padding = New-Object System.Windows.Thickness(2)
+    $ring.BorderBrush = [System.Windows.Media.Brushes]::Transparent
+
+    $prev = New-Object System.Windows.Controls.Border
+    $prev.CornerRadius = New-Object System.Windows.CornerRadius(8)
+    $prev.Width = 54; $prev.Height = 54
+    $prev.Background = Get-Brush '#14FFFFFF'
+    $prev.BorderThickness = New-Object System.Windows.Thickness(1)
+    $prev.BorderBrush = Get-Brush '#26FFFFFF'
+
+    # thumbnail = that pack's neutral (root logo for bird, pack logo/neutral else)
+    $thumbPath = $null
+    if ($Name -eq 'bird') { $thumbPath = Join-Path $PSScriptRoot 'logo.png' }
+    else {
+        foreach ($n in @('logo.png', 'neutral.png')) {
+            $p = Join-Path $PSScriptRoot ('assets\mascots\' + $Name + '\' + $n)
+            if (Test-Path -LiteralPath $p) { $thumbPath = $p; break }
+        }
+    }
+    $thumb = Import-MascotBitmap $thumbPath 96
+    if ($null -ne $thumb) {
+        $img = New-Object System.Windows.Controls.Image
+        $img.Source = $thumb
+        $img.Width = 40; $img.Height = 40
+        $img.HorizontalAlignment = 'Center'; $img.VerticalAlignment = 'Center'
+        [System.Windows.Media.RenderOptions]::SetBitmapScalingMode($img, 'HighQuality')
+        $prev.Child = $img
+    }
+    else {
+        $ph = New-Object System.Windows.Controls.TextBlock
+        $ph.Text = [string][char]0x2027   # tiny dot: pack present but art not generated yet
+        $ph.FontSize = 18
+        $ph.Foreground = Get-Brush '#66666E'
+        $ph.HorizontalAlignment = 'Center'; $ph.VerticalAlignment = 'Center'
+        $prev.Child = $ph
+    }
+    $ring.Child = $prev
+    [void]$wrap.Children.Add($ring)
+
+    $lbl = New-Object System.Windows.Controls.TextBlock
+    $lbl.Text = $Name
+    $lbl.FontSize = 10
+    $lbl.Foreground = Get-Brush '#8A8A93'
+    $lbl.HorizontalAlignment = 'Center'
+    $lbl.Margin = New-Object System.Windows.Thickness(0, 4, 0, 0)
+    [void]$wrap.Children.Add($lbl)
+
+    $script:MascotPickRings[$Name] = $ring
+    if ($Name -eq $script:PickMascot) { $ring.BorderBrush = Get-Brush '#E07B54' }
+
+    $wrap.Add_MouseLeftButtonDown({
+        param($s, $e)
+        $script:PickMascot = [string]$s.Tag
+        foreach ($k in @($script:MascotPickRings.Keys)) {
+            $script:MascotPickRings[$k].BorderBrush = $(
+                if ($k -eq $script:PickMascot) { Get-Brush '#E07B54' }
+                else { [System.Windows.Media.Brushes]::Transparent })
+        }
+        $script:MascotPack = $script:PickMascot
+        try { Load-MascotFaces; Update-BirdFace } catch { }   # live swap on the real widget
+        $e.Handled = $true
+    })
+    return $wrap
+}
+
 function New-DialogButton([string]$Text, [bool]$Primary) {
     $b = New-Object System.Windows.Controls.Border
     $b.CornerRadius = New-Object System.Windows.CornerRadius(9)
@@ -4352,6 +4502,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName ParkAfterMinutes  -NotePropertyValue $script:ParkMinutes -Force
         $cfg | Add-Member -NotePropertyName CompactAtK        -NotePropertyValue $script:CompactAtK -Force
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
+        $cfg | Add-Member -NotePropertyName MascotPack        -NotePropertyValue $script:MascotPack -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
         $cfg | ConvertTo-Json | Set-Content -LiteralPath $CfgPath -Encoding UTF8
@@ -4429,6 +4580,24 @@ function Show-SettingsDialog {
         [void]$themeRow.Children.Add((New-ThemeSwatch ([string]$tn)))
     }
     [void]$stack.Children.Add($themeRow)
+
+    # mascot picker: same live-preview-cancel-reverts pattern as the theme row.
+    # 'bird' is built in; drop a folder in assets\mascots\<name> and it shows
+    # up here (see assets\mascots\MASCOT-SPEC.md for the art an AI must make).
+    $script:PickMascot = $script:MascotPack
+    $script:MascotOrig = $script:MascotPack
+    $script:MascotSaved = $false
+    $script:MascotPickRings = @{}
+    [void]$stack.Children.Add((New-DarkLabel 'mascot'))
+    $mascotRow = New-Object System.Windows.Controls.WrapPanel
+    $mascotRow.Orientation = 'Horizontal'
+    $mascotRow.MaxWidth = 404
+    $mascotRow.HorizontalAlignment = 'Left'
+    $mascotRow.Margin = New-Object System.Windows.Thickness(2, 0, 0, 6)
+    foreach ($mn in @(Get-MascotPacks)) {
+        [void]$mascotRow.Children.Add((New-MascotSwatch ([string]$mn)))
+    }
+    [void]$stack.Children.Add($mascotRow)
 
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
@@ -4530,6 +4699,8 @@ function Show-SettingsDialog {
         param($s, $e)
         $c = $s.Tag.Tag
         $script:ThemeSaved = $true
+        $script:MascotSaved = $true
+        $script:MascotPack = [string]$script:PickMascot   # Save-PerchSettings persists $script:MascotPack
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
                            ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag) ([string]$c.Compact.Text)
@@ -4538,6 +4709,11 @@ function Show-SettingsDialog {
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
     $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
     $dlg.Add_Closed({
+        # closed without saving: undo any live mascot preview
+        if (-not $script:MascotSaved -and $script:MascotPack -ne $script:MascotOrig) {
+            $script:MascotPack = $script:MascotOrig
+            try { Load-MascotFaces; Update-BirdFace } catch { }
+        }
         # closed without saving: undo any live theme preview
         if (-not $script:ThemeSaved -and $script:ThemeName -ne $script:ThemeOrig) {
             $script:ThemeName = $script:ThemeOrig

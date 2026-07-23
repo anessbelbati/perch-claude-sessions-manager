@@ -49,6 +49,7 @@ $script:ShowTimers = $true
 $script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (catalog below; settings builds its picker from the keys)
 $script:MascotPack = 'bird'      # 'bird' = built-in (root logo.png + assets\bird\); else assets\mascots\<name>\
 $script:ResumeShell = 'cmd'      # shell for restored session tabs: cmd | powershell | pwsh (settings dropdown)
+$script:BubblesOn = $true        # speech bubbles (hello + quips); settings toggle
 $script:AcctDisclaimerOk = $false
 $script:AcctPanel = $null
 try {
@@ -68,6 +69,7 @@ try {
             $rs = ([string]$cfg.ResumeShell).ToLowerInvariant()
             if ($rs -in @('cmd', 'powershell', 'pwsh')) { $script:ResumeShell = $rs }
         }
+        if ($null -ne $cfg.PSObject.Properties['SpeechBubbles']) { $script:BubblesOn = [bool]$cfg.SpeechBubbles }
         if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
@@ -3338,6 +3340,12 @@ function Update-PillRing {
     # the bird's halo of consequence: 5h usage as an arc. Rebuilt only when
     # the rounded pct or color changes - between changes it costs nothing.
     if ($null -eq $script:PillRingArc) { return }
+    # NEVER mid-carry: the drag dress strips the pill to the bare bird (ring
+    # hidden), but DragMove pumps the dispatcher so ticks still run - a pct
+    # change here used to pop the limits arc onto the carried bird at random.
+    # Early return BEFORE the key cache updates, so the change lands cleanly
+    # on the first tick after the drop.
+    if ($script:PillDragging) { return }
     $pct = [double]$script:Pill5hPct
     $key = ('{0:0}|{1}' -f $pct, $script:Pill5hHex)
     if ($key -eq $script:PillRingKey) { return }
@@ -3943,7 +3951,9 @@ function New-BubbleVisual([string]$ArtPath) {
     # clear zone, so the code can trust these fractions). Fallback: a plain
     # drawn card + tail, so packs without bubble art still get to speak.
     $root = New-Object System.Windows.Controls.Grid
-    $root.IsHitTestVisible = $false   # decoration, never a click target
+    # clickable ON PURPOSE: a click anywhere on the bubble dismisses it
+    # instantly - a punchline must never cost the user waiting time
+    $root.Cursor = [System.Windows.Input.Cursors]::Hand
     $bmp = $null
     if (-not [string]::IsNullOrEmpty($ArtPath)) { $bmp = Import-MascotBitmap $ArtPath 480 }
     if ($null -ne $bmp) {
@@ -4011,6 +4021,7 @@ function New-BubbleVisual([string]$ArtPath) {
 }
 
 function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
+    if (-not $script:BubblesOn) { return }   # the settings mute: no hello, no quips
     if ([string]::IsNullOrWhiteSpace($Text) -or $null -eq $script:BirdRingGrid) { return }
     try {
         if ($null -eq $script:BirdBubble) {
@@ -4044,6 +4055,17 @@ function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
             $script:BirdBubbleH = [double]$vis.H
             $script:BirdBubbleArtPath = [string]$art
             $script:BirdBubble.Child = $script:BirdBubbleRoot
+            # click = gone. Instantly - no goodbye fade, the user asked it to leave
+            $script:BirdBubbleRoot.Add_MouseLeftButtonDown({
+                param($s, $e)
+                $e.Handled = $true
+                try {
+                    $script:BirdBubbleTimer.Stop()
+                    $script:BirdBubbleRoot.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
+                    $script:BirdBubble.IsOpen = $false
+                }
+                catch { }
+            })
         }
         if ($null -ne $script:BirdBubbleCard) {
             # drawn fallback: its accent matches the room (same as the halo)
@@ -5211,13 +5233,14 @@ function Update-AccountsPanel {
     [void]$script:AcctPanel.Children.Add($add)
 }
 
-function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true, [string]$CompactRaw = '') {
+function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true, [string]$CompactRaw = '', [bool]$Bubbles = $true) {
     if ($script:ThemeSpecs.Keys -contains $Theme -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
         Apply-Theme
     }
     $script:ChirpOn = $Chirp
     $script:ChirpDoneOn = $ChirpDone
+    $script:BubblesOn = $Bubbles
     $script:ShowTimers = $Timers
     $script:HudHideAfterFocus = $HideAfter
 
@@ -5286,6 +5309,7 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
         $cfg | Add-Member -NotePropertyName ThemeName         -NotePropertyValue $script:ThemeName -Force
         $cfg | Add-Member -NotePropertyName MascotPack        -NotePropertyValue $script:MascotPack -Force
         $cfg | Add-Member -NotePropertyName ResumeShell       -NotePropertyValue $script:ResumeShell -Force
+        $cfg | Add-Member -NotePropertyName SpeechBubbles     -NotePropertyValue $script:BubblesOn -Force
         $cfg | Add-Member -NotePropertyName ShowWorkTimers    -NotePropertyValue $script:ShowTimers -Force
         $cfg | Add-Member -NotePropertyName AgentProcessNames -NotePropertyValue $script:AgentProcNames -Force
         Set-ContentAtomic $CfgPath ($cfg | ConvertTo-Json)
@@ -5438,10 +5462,11 @@ function Show-SettingsDialog {
     $startupLnk = Join-Path ([Environment]::GetFolderPath('Startup')) 'Perch.lnk'
     $rowChirp   = New-SettingRow 'chirp when a session needs me'      $script:ChirpOn
     $rowChirpDn = New-SettingRow 'double-chirp when a session finishes' $script:ChirpDoneOn
+    $rowBubbles = New-SettingRow 'mascot speech bubbles (hello + banter)' $script:BubblesOn
     $rowTimers  = New-SettingRow 'show work timers on busy sessions'  $script:ShowTimers
     $rowHide    = New-SettingRow 'minimize after click-to-focus'      $script:HudHideAfterFocus
     $rowStartup = New-SettingRow 'start with windows'                 (Test-Path -LiteralPath $startupLnk)
-    foreach ($r in @($rowChirp, $rowChirpDn, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
+    foreach ($r in @($rowChirp, $rowChirpDn, $rowBubbles, $rowTimers, $rowHide, $rowStartup)) { [void]$stack.Children.Add($r) }
 
     $sep = New-Object System.Windows.Controls.Border
     $sep.Height = 1
@@ -5552,7 +5577,7 @@ function Show-SettingsDialog {
     $dlg.Tag = @{
         Chirp = $rowChirp.Tag; ChirpDone = $rowChirpDn.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
         Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child; Park = $inPark.Child
-        Compact = $inCompact.Child
+        Compact = $inCompact.Child; Bubbles = $rowBubbles.Tag
     }
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
@@ -5566,7 +5591,7 @@ function Show-SettingsDialog {
         $script:ResumeShell = [string]$script:PickShell   # ...and $script:ResumeShell
         Save-PerchSettings ([string]$script:PickTheme) ([bool]$c.Chirp.Tag) ([bool]$c.Timers.Tag) ([bool]$c.Hide.Tag) `
                            ([bool]$c.Startup.Tag) ([string]$c.Refresh.Text) ([string]$c.Volume.Text) ([string]$c.Procs.Text) `
-                           ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag) ([string]$c.Compact.Text)
+                           ([string]$c.Park.Text) ([bool]$c.ChirpDone.Tag) ([string]$c.Compact.Text) ([bool]$c.Bubbles.Tag)
         $s.Tag.Close()
     })
     $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })

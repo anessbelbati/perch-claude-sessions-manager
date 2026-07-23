@@ -46,7 +46,7 @@ $script:ChirpVolume = 10   # percent - birds are for noticing, not startling
 $script:ParkMinutes = 30   # needs-you older than this -> 'parked' (0 = never)
 $script:CompactAtK = 120   # context (k tokens) past which a row grows its compact button (0 = never)
 $script:ShowTimers = $true
-$script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (midnight/oled/glass/phosphor/nord/catppuccin/synthwave)
+$script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (catalog below; settings builds its picker from the keys)
 $script:MascotPack = 'bird'      # 'bird' = built-in (root logo.png + assets\bird\); else assets\mascots\<name>\
 $script:AcctDisclaimerOk = $false
 $script:AcctPanel = $null
@@ -2573,6 +2573,56 @@ $script:ThemeSpecs = [ordered]@{
                     FxUnder = (New-HorizonGlow)
                     FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
                         @('#7AFFD1EC', 0), @('#22FF41B0', 0.10), @('#00000000', 0.5), @('#1633E0FF', 1))) }
+    # electric midnight: cyan circuitry catching a violet edge light
+    cyber      = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F70C1B2F', 0), @('#F7071222', 0.52), @('#F7030813', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
+                        @('#9222D3EE', 0), @('#583B82F6', 0.52), @('#7234D6FF', 1)))
+                    Glow = '#22D3EE'
+                    FxUnder = (New-GradBrush @(0, 0) @(1, 0.72) @(
+                        @('#2822D3EE', 0), @('#183B82F6', 0.48), @('#10E879F9', 0.78), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#86CFFAFE', 0), @('#2422D3EE', 0.10), @('#00000000', 0.52), @('#183B82F6', 1))) }
+    # deep water: an aqua caustic drifting across blue-green glass
+    lagoon     = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F7082D35', 0), @('#F7052028', 0.54), @('#F7031118', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
+                        @('#884DE1D1', 0), @('#5260A5FA', 0.56), @('#3E246B78', 1)))
+                    Glow = '#45E0D0'
+                    FxUnder = (New-DomeGlow @(0.12, -0.06) @(0.98, 0.78) @(
+                        @('#324DE1D1', 0), @('#1A2BA8A1', 0.48), @('#0E60A5FA', 0.76), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#7DA7F3E9', 0), @('#244DE1D1', 0.10), @('#00000000', 0.55), @('#124A8C99', 1))) }
+    # banked coals: copper light blooming out of charred near-black walls
+    ember      = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F72B1512', 0), @('#F71C0D0C', 0.55), @('#F70E0707', 1)))
+                    BorderBrush = (New-GradBrush @(0, 1) @(1, 0) @(
+                        @('#8CFFB454', 0), @('#55E76F3C', 0.50), @('#344C211D', 1)))
+                    Glow = '#FF8A3D'
+                    FxUnder = (New-DomeGlow @(0.12, 1.12) @(0.96, 0.86) @(
+                        @('#46FF8A3D', 0), @('#22D84C2F', 0.48), @('#0E8A1F22', 0.74), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 1) @(1, 0) @(
+                        @('#82FFD08A', 0), @('#28FF8A3D', 0.12), @('#00000000', 0.58), @('#14A53A2B', 1))) }
+    # moonlit violet: a cold spectral bloom hanging over an ink-black room
+    haunted    = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F71A1430', 0), @('#F7110D23', 0.55), @('#F7080712', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
+                        @('#84C4B5FD', 0), @('#566D5DF7', 0.56), @('#3A31264E', 1)))
+                    Glow = '#B794F6'
+                    FxUnder = (New-DomeGlow @(0.82, -0.08) @(0.84, 0.75) @(
+                        @('#38B794F6', 0), @('#1C6D5DF7', 0.50), @('#105B7CFA', 0.72), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(1, 0) @(0, 1) @(
+                        @('#82E4D8FF', 0), @('#26B794F6', 0.12), @('#00000000', 0.55), @('#145B4D89', 1))) }
+    # tea house at night: moss walls with a soft matcha-and-honey glint
+    matcha     = @{ Bg = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#F71A2419', 0), @('#F7111910', 0.55), @('#F7090D09', 1)))
+                    BorderBrush = (New-GradBrush @(0, 0) @(1, 1) @(
+                        @('#829FD67A', 0), @('#526B8653', 0.52), @('#3A3D482F', 1)))
+                    Glow = '#A7D46F'
+                    FxUnder = (New-GradBrush @(0, 0) @(1, 0.72) @(
+                        @('#2CB9E38D', 0), @('#18E5C07B', 0.44), @('#105F8F54', 0.76), @('#00000000', 1)))
+                    FxUnderEdge = (New-GradBrush @(0, 0) @(0, 1) @(
+                        @('#86E6F5C9', 0), @('#249FD67A', 0.10), @('#00000000', 0.55), @('#145C794E', 1))) }
 }
 
 # two code-made overlay layers for theme effects: one under the content
@@ -4714,7 +4764,30 @@ function Show-SettingsDialog {
     [void]$btnRow.Children.Add($btnCancel)
     [void]$stack.Children.Add($btnRow)
 
-    $card.Child = $stack
+    # CAP THE HEIGHT: the theme + mascot pickers made this dialog taller than
+    # short screens. Header and save/cancel stay pinned; everything between
+    # scrolls inside perch's own thin scrollbar. That bar's style is implicit
+    # on the MAIN window - a separate dialog window doesn't inherit it, so
+    # merge the window's resources (this also resolves HudScrollThumb/Btn).
+    try { [void]$dlg.Resources.MergedDictionaries.Add($script:Window.Resources) } catch { }
+    [void]$stack.Children.Remove($head)     # header -> pinned top of $outer
+    [void]$stack.Children.Remove($btnRow)   # buttons -> pinned bottom of $outer
+    $scroller = New-Object System.Windows.Controls.ScrollViewer
+    $scroller.VerticalScrollBarVisibility = 'Auto'
+    $scroller.HorizontalScrollBarVisibility = 'Disabled'
+    $scroller.Content = $stack
+    try {
+        $wa = [System.Windows.SystemParameters]::WorkArea
+        $scroller.MaxHeight = [Math]::Max(300.0, [double]$wa.Height - 210.0)   # never taller than the screen
+    }
+    catch { $scroller.MaxHeight = 540.0 }
+
+    $outer = New-Object System.Windows.Controls.StackPanel
+    $outer.Width = 272   # 266 body + 6 for the scrollbar gutter
+    [void]$outer.Children.Add($head)
+    [void]$outer.Children.Add($scroller)
+    [void]$outer.Children.Add($btnRow)
+    $card.Child = $outer
     $dlg.Content = $card
 
     $dlg.Tag = @{

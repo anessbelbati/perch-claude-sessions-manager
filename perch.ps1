@@ -3891,13 +3891,19 @@ $script:CarrySwingTimer.Add_Tick({
         # deliberate flip, any speed, any DPI, any timer weather. Three
         # flips inside 1.2s windows = he blows up. A plain reposition (one
         # long stroke + maybe one small correction) tops out at two.
+        # Stroke floor 14px, NOT 30 (field report: 'angry after the drop,
+        # not during'): a real pester-shake is a TIGHT rapid wiggle with
+        # 15-25px strokes - at 30px only the bigger final flourish counted
+        # and the rage always arrived exactly at release. Settle nudges
+        # after a reposition are 1-5px, so 14 still never fires on honest
+        # window-moving.
         $dxs = $x - $script:CarryStrokeX
         $script:CarryStrokeX = $x
         $sgn = [Math]::Sign($dxs)
         if ($sgn -ne 0) {
             if ($sgn -eq $script:CarryStrokeSign) { $script:CarryStrokeDist += [Math]::Abs($dxs) }
             else {
-                if ($script:CarryStrokeDist -ge 30.0) {
+                if ($script:CarryStrokeDist -ge 14.0) {
                     if (((Get-Date) - $script:CarryFlipStamp).TotalMilliseconds -gt 1200) { $script:CarryFlips = 0 }
                     $script:CarryFlips++
                     $script:CarryFlipStamp = Get-Date

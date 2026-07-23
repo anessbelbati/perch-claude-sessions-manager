@@ -1176,6 +1176,14 @@ $script:ScreenNeedsYou = @(
     'waitingforuserconfirmation'         # gemini
     'applythischange'                    # gemini diff prompt
     'wouldyouliketo'                     # generic permission phrasing
+    # claude menus that fire NO Notification hook (verified live 2026-07-23):
+    # AskUserQuestion paints 'working' via PreToolUse and then WAITS - the
+    # busy-verify lane saw a calm screen with no needle and flipped the row
+    # to done while the question sat there. These footers only exist while a
+    # selector menu is actually open, and busy markers are checked FIRST so
+    # a running turn that merely echoes these words never trips them.
+    'entertoselect'                      # claude selector footer (AskUserQuestion / pickers)
+    'entertoconfirmesctocancel'          # claude trust-folder dialog footer
 )
 $script:ScreenBusy = @(
     'esctointerrupt'                     # claude/codex busy hint
@@ -1891,6 +1899,11 @@ function ConvertTo-PendingPrompt([string]$RawTail) {
     }
     $best = $null
     $cur = $null
+    $gap = $false
+    # a menu FOOTER hint ends the option block cleanly - it must never be
+    # glued into the last option's label ("Chat about this Enter to select
+    # up/down to navigate..." shipped as a button label otherwise)
+    $footRx = '(?i)enter to (select|confirm|submit)|esc to (cancel|skip|go back|undo)|to navigate|tab to (cycle|toggle|amend)'
     for ($i = 0; $i -lt $clean.Count; $i++) {
         $t = [string]$clean[$i]
         # selected-option caret variants: U+276F heavy chevron, >, U+00BB, U+2192 arrow
@@ -1903,25 +1916,50 @@ function ConvertTo-PendingPrompt([string]$RawTail) {
                 [void]$cur.Opts.Add(@{ Num = 1; Label = $lbl })
             }
             elseif ($null -ne $cur -and $n -eq ($cur.Opts.Count + 1)) {
+                # continues the sequence - INCLUDING across a blank/separator
+                # gap: AskUserQuestion draws a rule between the answer options
+                # and the tail options (N. Chat about this), and the old hard
+                # reset on blank lines dropped everything below the rule
                 [void]$cur.Opts.Add(@{ Num = $n; Label = $lbl })
             }
             else { $cur = $null }
+            $gap = $false
             if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
         }
-        elseif ($null -ne $cur -and $t.Length -gt 0) {
+        elseif ($t.Length -gt 0 -and [regex]::IsMatch($t, $footRx)) {
+            if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
+            $cur = $null
+            $gap = $false
+        }
+        elseif ($null -ne $cur -and $t.Length -gt 0 -and -not $gap) {
             # wrapped option text continues on the next screen row
             $last = $cur.Opts[$cur.Opts.Count - 1]
             if (([string]$last.Label).Length -lt 200) { $last.Label = ([string]$last.Label + ' ' + $t).Trim() }
         }
+        elseif ($t.Length -eq 0) {
+            # blank/separator row: SUSPEND the block (no more label gluing)
+            # but keep it alive - a numbered row continuing the sequence
+            # resumes it, anything else closes it
+            if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
+            $gap = $true
+        }
         else {
+            # prose after a gap: whatever menu was open ended above it
             if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
             $cur = $null
+            $gap = $false
         }
     }
     if ($null -eq $best) { return $null }
     $ctx = New-Object System.Collections.ArrayList
     for ($i = [int]$best.Start - 1; $i -ge 0 -and $ctx.Count -lt 4 -and ([int]$best.Start - $i) -le 10; $i--) {
         $t = [string]$clean[$i]
+        if ($t.Length -eq 0) { continue }
+        # the user's own echoed input line (input-caret prefixed) is not
+        # context - without this the whole typed prompt landed in Detail
+        if ([regex]::IsMatch($t, ('^[' + [char]0x276F + ']'))) { continue }
+        # AskUserQuestion tab-header checkboxes read better without the glyph
+        $t = ($t -replace ('^[' + [char]0x2610 + [char]0x2611 + [char]0x25A0 + [char]0x25A1 + ']\s*'), '').Trim()
         if ($t.Length -eq 0) { continue }
         [void]$ctx.Insert(0, $t)
     }
@@ -2171,7 +2209,7 @@ $xaml = @"
         <!-- header icons: Segoe MDL2 Assets glyphs, NOT text/emoji - emoji
              render in fixed color and cannot show state; font glyphs tint
              via Foreground, so toggles can actually LOOK on/off -->
-        <StackPanel Grid.Column="1" Orientation="Horizontal">
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <!-- E738 Remove, NOT E921 ChromeMinimize: E921 is missing from
                older MDL2 revisions and renders as a tofu rectangle -->
           <TextBlock x:Name="MiniBtn" Text="&#xE738;" FontFamily="Segoe MDL2 Assets" FontSize="11" Padding="6,4"
@@ -2743,6 +2781,10 @@ try {
     }
     $logoImg = $Window.FindName('LogoImg')
     $script:LogoImg = $logoImg
+    # the header's left panel is the bird's EXPANDED-MODE perch: when the
+    # full window is open the living pill bird reparents here (Move-BirdStage)
+    # and the little static logo steps aside
+    $script:HeaderLeftPanel = $logoImg.Parent
     # neutral face for the ACTIVE mascot pack (Get-MascotSpec always resolves
     # to something loadable - a custom pack, or the built-in bird, or at worst
     # the root logo). Drives BOTH the header logo and the bird's resting face.
@@ -2860,6 +2902,7 @@ if ($null -ne $script:LogoSource) {
 }
 [void]$pillRow.Children.Add($birdGrid)
 $script:BirdRingGrid = $birdGrid   # resized during a drag: the carried bird grows
+$script:PillRow = $pillRow         # the bird's COMPACT-MODE perch (Move-BirdStage)
 # HOVER = he NOTICES you. The law stands - hover opens NOTHING - but the
 # bird is a creature, not a button: pass the cursor over HIM and he waves
 # hello (wink, chirp, tiny bounce). Do it while he's asleep and he cracks
@@ -2869,7 +2912,7 @@ $script:BirdRingGrid = $birdGrid   # resized during a drag: the carried bird gro
 $script:BirdGreetStamp = [datetime]::MinValue
 $script:BirdRingGrid.Add_MouseEnter({
     try {
-        if (-not $script:Compact -or $script:PillDragging -or $script:PillPressActive) { return }
+        if (-not (Test-BirdOnStage) -or $script:PillDragging -or $script:PillPressActive) { return }
         if (((Get-Date) - $script:BirdGreetStamp).TotalSeconds -lt 8) {
             # pestering him during the cooldown - he's counting. Four boops
             # and he LOSES IT: grawlix rant + furious feather shake. Works
@@ -3040,14 +3083,25 @@ function New-BirdKeyAnim([object[]]$Frames) {
     return $k
 }
 
+function Test-BirdOnStage {
+    # is the bird's surface actually on screen? compact -> the pill card;
+    # expanded -> the header (the bird LIVES there since the header-perch
+    # redesign - it reparents between the two, see Move-BirdStage). The
+    # compact peek (PillCard Hidden) counts as off-stage, and a window
+    # hidden to the tray animates for nobody.
+    if ($null -eq $script:Window -or -not $script:Window.IsVisible) { return $false }
+    if ($script:Compact) { return ($script:PillCard.Visibility -eq 'Visible') }
+    return $true
+}
+
 function Invoke-BirdMotion([string]$Kind) {
     # the bird is ALIVE - in moments, not loops. Ephemeral kinds (perk, hop,
-    # tilt, settle) only play when the pill is actually on screen; state
+    # tilt, settle) only play when the bird is actually on screen; state
     # kinds (doze, wake) fall back to setting the resting pose directly so
     # the bird is already asleep when you fold a quiet HUD into the pill.
     if ($null -eq $script:BirdScale) { return }
     try {
-    $vis = ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')
+    $vis = Test-BirdOnStage
     $sx = [System.Windows.Media.ScaleTransform]::ScaleXProperty
     $sy = [System.Windows.Media.ScaleTransform]::ScaleYProperty
     $ra = [System.Windows.Media.RotateTransform]::AngleProperty
@@ -3185,8 +3239,7 @@ function Set-BirdFace([string]$Key, [switch]$Instant) {
         $old = $script:PillBirdA.Source
         $script:PillBirdB.BeginAnimation($opProp, $null)
         $script:PillBirdA.Source = $src
-        if ($Instant -or $null -eq $old -or
-            -not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible')) {
+        if ($Instant -or $null -eq $old -or -not (Test-BirdOnStage)) {
             $script:PillBirdB.Opacity = 0.0
             return
         }
@@ -3229,8 +3282,7 @@ function Update-BirdFace {
     # whenever the resting face is hot and the pill is on screen; the
     # timer stops itself the moment either condition breaks
     if ($key -eq 'hot' -and $null -ne $script:BirdFanTimer -and -not $script:BirdFanTimer.IsEnabled -and
-        $null -ne $script:BirdFaces['hot2'] -and $script:Compact -and
-        $script:PillCard.Visibility -eq 'Visible') { $script:BirdFanTimer.Start() }
+        $null -ne $script:BirdFaces['hot2'] -and (Test-BirdOnStage)) { $script:BirdFanTimer.Start() }
 }
 
 function Invoke-JumpToAtt {
@@ -3426,12 +3478,46 @@ function Set-PillEdgeAnchor {
     catch { }
 }
 
+function Move-BirdStage {
+    # ONE bird, TWO perches. Compact: he IS the pill. Expanded: he moves to
+    # the header - full size, ring and all - instead of the old frozen 24px
+    # logo stamp. Reparenting moves the ACTUAL living machine (face pair,
+    # ring arc, transforms, every timer references these same objects), so
+    # blink/flap/sip/greet/rage/doze all work wherever he sits. Two separate
+    # mascot surfaces would need every animation site taught about both;
+    # one bird cannot drift.
+    $bg = $script:BirdRingGrid
+    if ($null -eq $bg -or $null -eq $script:HeaderLeftPanel -or $null -eq $script:PillRow) { return }
+    $wantHeader = -not $script:Compact
+    $inHeader = ([object]::ReferenceEquals($bg.Parent, $script:HeaderLeftPanel))
+    if ($wantHeader -ne $inHeader) {
+        $par = $bg.Parent
+        if ($null -ne $par) { [void]$par.Children.Remove($bg) }
+        if ($wantHeader) {
+            # negative vertical margins let the 52px bird sit big without
+            # inflating the header to pill height; right margin gaps the title
+            $bg.Margin = New-Object System.Windows.Thickness(-2, -6, 8, -6)
+            $script:HeaderLeftPanel.Children.Insert(0, $bg)
+        }
+        else {
+            $bg.Margin = New-Object System.Windows.Thickness(0)
+            $script:PillRow.Children.Insert(0, $bg)
+        }
+    }
+    # the static logo only shows while the living bird is away in the pill
+    if ($null -ne $script:LogoImg) {
+        $wantLogo = $(if ($wantHeader) { 'Collapsed' } else { 'Visible' })
+        if ($script:LogoImg.Visibility -ne $wantLogo) { $script:LogoImg.Visibility = $wantLogo }
+    }
+}
+
 function Set-CompactMode([bool]$On) {
     # compact = THE PILL: the bird wearing its 5h ring + colored counts.
     # Hover peeks chips + limit bars, double-click expands. Everything
     # still lives (chirp, red pulse, taskbar flash) - it just takes ~150px.
     $script:Compact = $On
     Clear-PillAnimations
+    Move-BirdStage
     Set-PillEdgeAnchor
     if ($On) {
         $script:PillPeeked = $false
@@ -3481,6 +3567,11 @@ function Set-CompactMode([bool]$On) {
         $script:MiniBtn.ToolTip = 'compact mode (double-click the header works too)'
     }
 }
+
+# seat the bird for the STARTING mode: a fresh expanded boot never calls
+# Set-CompactMode (the state restore only calls it to fold INTO the pill),
+# so without this the bird would open the show sitting in a hidden pill
+Move-BirdStage
 
 function Set-PillPeek([bool]$On) {
     # hover = CROSSFADE pill -> mini card (header + chips + limit bars).
@@ -3640,7 +3731,7 @@ $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds(52)
 $script:BirdTiltTimer.Add_Tick({
     try {
         $script:BirdTiltTimer.Interval = [TimeSpan]::FromSeconds((Get-Random -Minimum 45 -Maximum 76))
-        if (-not $script:Compact -or $script:BirdDozing -or $script:PillDragging) { return }
+        if (-not (Test-BirdOnStage) -or $script:BirdDozing -or $script:PillDragging) { return }
         if ($script:PillWorkCount -gt 0) {
             # supervising: sometimes a head-tilt, sometimes a peck
             Invoke-BirdMotion $(if ((Get-Random -Minimum 0 -Maximum 2) -eq 0) { 'tilt' } else { 'bob' })
@@ -3675,7 +3766,7 @@ $script:BirdBlinkTimer.Interval = [TimeSpan]::FromSeconds(6)
 $script:BirdBlinkTimer.Add_Tick({
     try {
         $script:BirdBlinkTimer.Interval = [TimeSpan]::FromMilliseconds((Get-Random -Minimum 4000 -Maximum 9000))
-        if (-not ($script:Compact -and $script:PillCard.Visibility -eq 'Visible' -and
+        if (-not ((Test-BirdOnStage) -and
                   $null -ne $script:PillBirdA -and (Get-Date) -ge $script:BirdFaceHoldUntil)) { return }
         if ($script:BirdFaceKey -eq 'neutral' -and $null -ne $script:BirdFaces['blink']) {
             $script:PillBirdA.Source = $script:BirdFaces['blink']
@@ -3720,8 +3811,8 @@ $script:BirdFanTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:BirdFanTimer.Interval = [TimeSpan]::FromMilliseconds(180)
 $script:BirdFanTimer.Add_Tick({
     try {
-        if ($script:BirdFaceKey -ne 'hot' -or -not $script:Compact -or
-            $script:PillCard.Visibility -ne 'Visible' -or $null -eq $script:PillBirdA -or
+        if ($script:BirdFaceKey -ne 'hot' -or -not (Test-BirdOnStage) -or
+            $null -eq $script:PillBirdA -or
             $null -eq $script:BirdFaces['hot2']) { $script:BirdFanTimer.Stop(); return }
         $script:BirdFanFlip = -not $script:BirdFanFlip
         $script:PillBirdA.Source = $script:BirdFaces[$(if ($script:BirdFanFlip) { 'hot2' } else { 'hot' })]
@@ -3833,7 +3924,7 @@ try {
         }
     }
 }
-catch { }
+catch { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -Value "$(Get-Date -Format s) restore: $_" -ErrorAction SilentlyContinue }
 
 Apply-Theme   # brushes now; the acrylic backdrop needs an hwnd, so once more:
 $Window.Add_SourceInitialized({ try { Set-GlassBackdrop ($script:ThemeName -eq 'glass') } catch { } })
@@ -6386,8 +6477,7 @@ function Update-List {
         if ($null -ne $script:BirdFaces['happy']) {
             $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)
             Set-BirdFace 'happy'
-            if ($null -ne $script:BirdFaces['happy2'] -and $script:Compact -and
-                $script:PillCard.Visibility -eq 'Visible') {
+            if ($null -ne $script:BirdFaces['happy2'] -and (Test-BirdOnStage)) {
                 # and he FLAPS through the hop
                 $script:BirdFlapN = 0
                 $script:BirdFlapTimer.Stop(); $script:BirdFlapTimer.Start()

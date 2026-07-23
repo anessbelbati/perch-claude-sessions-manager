@@ -83,11 +83,23 @@ try {
                         # parses pending numbered prompts out of these.
                         # OPT-IN: plain fingerprint probes skip this work.
                         if ($Raw) {
-                            # BOTTOM 30 rows only: the pending-prompt parser
-                            # is bottom-anchored, and a full 200-col screen
-                            # blows past the parent's 4KB stdout pipe buffer
+                            # 30 rows only (a full 200-col screen blows past
+                            # the parent's 4KB stdout pipe buffer) - anchored
+                            # at the LAST NON-BLANK row, not the physical
+                            # screen bottom. Top-anchored dialogs (the trust
+                            # prompt, any menu early in a tall fresh window)
+                            # leave the bottom rows blank, and the old
+                            # bottom-30 window shipped 30 empty lines while
+                            # the actual menu sat above it, unread.
+                            $last = -1
+                            for ($i = $rows - 1; $i -ge 0; $i--) {
+                                $st = $i * $w
+                                if ($st -ge $rawStr.Length) { continue }
+                                $rowTxt = $rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st))
+                                if ($rowTxt.Trim().Length -gt 0) { $last = $i; break }
+                            }
                             $sbR = New-Object System.Text.StringBuilder
-                            for ($i = [Math]::Max(0, $rows - 30); $i -lt $rows; $i++) {
+                            for ($i = [Math]::Max(0, $last - 29); $i -le $last; $i++) {
                                 $st = $i * $w
                                 if ($st -ge $rawStr.Length) { break }
                                 [void]$sbR.AppendLine($rawStr.Substring($st, [Math]::Min($w, $rawStr.Length - $st)).TrimEnd())

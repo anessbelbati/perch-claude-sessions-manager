@@ -2852,6 +2852,7 @@ $script:CarryFlips = 0          # shake detector: fast direction flips -> he swe
 $script:CarryLastSign = 0
 $script:CarryFlipStamp = [datetime]::MinValue
 $script:BirdBoopCount = 0       # boop-spam detector: pester the cooldown -> he swears
+$script:CarryWasShaken = $false # shaken mid-carry: the insult waits for the DROP
 
 $script:PillBar = New-Object System.Windows.Controls.Grid
 # bird-first geometry, packed TIGHT: left margin 3 puts the ring's center
@@ -2945,6 +2946,7 @@ $script:BirdRingGrid.Add_MouseEnter({
                 Set-BirdFace 'cursing'
                 $script:BirdFaceHoldUntil = (Get-Date).AddMilliseconds(2500)
                 if (-not $script:BirdDozing) { Invoke-BirdMotion 'ruffle' }
+                Invoke-BirdQuip 'mad'   # and he TELLS YOU OFF (usually)
             }
             return
         }
@@ -3883,6 +3885,9 @@ $script:CarrySwingTimer.Add_Tick({
                     $null -ne $script:BirdFaces['cursing'] -and $null -ne $script:PillBirdA) {
                     $script:BirdFaceKey = 'cursing'
                     $script:PillBirdA.Source = $script:BirdFaces['cursing']
+                    # remember the offense: the insult lands at DROP (a popup
+                    # cannot chase a window mid-DragMove; he waits, seething)
+                    $script:CarryWasShaken = $true
                 }
             }
         }
@@ -4060,6 +4065,9 @@ function Show-BirdBubble([string]$Text, [int]$HoldMs = 4800) {
 $script:QuipLastAt = [datetime]::MinValue
 $script:QuipPrev5h = -1.0
 $script:QuipPrevCrown = $false
+# the line library. Written by a much larger bird (opus) to a strict brief:
+# ASCII only, no apostrophes (single-quoted strings), <= 48 chars, lowercase
+# deadpan, species-neutral. Add lines freely - the harness length-checks all.
 $script:QuipPools = @{
     done = @(              # a session finished (most common moment: quietest roll)
         'another one bites the dust.'
@@ -4067,48 +4075,200 @@ $script:QuipPools = @{
         'we did it. mostly you. some me.'
         'that one is cooked. next.'
         'and THAT is how it is done.'
+        'another one down. i took notes.'
+        'done. you may thank me later.'
+        'we shipped it. mostly vibes.'
+        'code compiled. ego intact.'
+        'that build feared me.'
+        'finished. i barely lifted a claw.'
+        'wrapped. put me on the poster.'
+        'green across the board. as foreseen.'
+        'done and dusted. dust was you.'
+        'victory. i will accept snacks.'
+        'one more for the trophy shelf.'
+        'sealed. delivered. supervised.'
+        'it works now. you are welcome.'
+        'clean finish. i approve.'
+        'task slain. i watched heroically.'
+        'boom. shipped. next victim.'
+        'flawless. mostly. good enough.'
+        'the perch remains undefeated.'
+        'wrapped it in an imaginary bow.'
+        'great success. minimal effort.'
+        'logged as a win. i decide those.'
     )
     crown = @(             # EVERYTHING done, nothing waiting - peak smug
         'all done. bow before me.'
         'inbox zero, terminal edition.'
         'the kingdom is at peace.'
         'every session fed. crown earned.'
+        'all sessions bow to me.'
+        'nothing left. i reign.'
+        'peace across the kingdom of tabs.'
+        'throne warm. queue empty.'
+        'every task fed and asleep. by me.'
+        'i am, technically, royalty now.'
+        'silence. the good kind. my kind.'
+        'zero waiting. bow lower.'
+        'the realm is spotless. kneel.'
+        'crown me. no one is arguing.'
+        'empire at rest. long live me.'
+        'all quiet, all done, all mine.'
+        'no task dares approach the throne.'
+        'supreme ruler of a done list.'
+        'i did nothing and it is perfect.'
+        'call me your majesty. i insist.'
     )
     attention = @(         # something newly needs the human
         'it needs a grown-up. that is you.'
         'red row! red row!'
         'a decision worthy of the boss.'
+        'psst. a session wants words.'
+        'human! you are needed. hurry.'
+        'someone raised a hand. not me.'
+        'a screen is waiting on you. go.'
+        'decision time. i cannot click.'
+        'over here! yes you. permission.'
+        'a session is holding its breath.'
+        'it wants a yes or a no. from you.'
+        'come look. bring your fingers.'
+        'tap tap. this one needs a boss.'
+        'paging the human. any human. you.'
+        'one wants your blessing. bestow it.'
+        'attention please. i am pointing.'
     )
     sleep = @(             # the room went quiet and he is drifting off
         'all quiet. i sleep with one eye open.'
         'zzz... compiling dreams...'
         'night watch: me. sleep: also me.'
+        'all quiet. eyelids heavy.'
+        'i will rest just my eyes... zzz.'
+        'nothing stirs. neither do i.'
+        'shhh. guarding. also napping.'
+        'the perch grows warm and slow.'
+        'watching the dark. losing.'
+        'off duty in three... two... zz.'
+        'quiet shift. soft brain. bye.'
+        'i dream in tidy commits.'
+        'counting idle sheep. so many.'
+        'guard mode: horizontal.'
+        'one eye open. maybe zero.'
+        'the room hums me to sleep.'
+        'nothing to watch but stars.'
+        'slowly powering down. good night.'
+        'i will just rest here... zzz.'
     )
     hot = @(               # the 5h window just crossed 90%
         'tokens go brrrr.'
         'we are COOKING. literally.'
         'smells like burnt budget in here.'
+        'budget is sizzling. smell it.'
+        'we are cooking with tokens now.'
+        'the meter is glowing. spicy.'
+        'ninety percent gone. gulp.'
+        'spending like hot royalty.'
+        'someone open a window. it burns.'
+        'tokens melting off the bone.'
+        'we are one snack from broke.'
+        'the gauge is blushing. red hot.'
+        'easy, big spender. it is warm.'
+        'fuel low, flames high.'
+        'throttle down or we roast.'
+        'this is fine. it is not fine.'
     )
     knocked = @(           # the limit actually hit
         'we flew too close to the sun.'
         'out of tokens. hold me.'
         'limit hit. tell my story.'
+        'we are out. i faint dramatically.'
+        'the tank is empty. so am i.'
+        'blocked. i collapse gracefully.'
+        'no more tokens. goodbye cruel build.'
+        'down we go. it was an honor.'
+        'budget: zero. drama: maximum.'
+        'curtains. the limit won.'
+        'i see a light. it is the cap.'
+        'wall hit. avenge me.'
+        'empty. carry on without me.'
+        'spent it all. worth it. probably.'
+        'flat broke and fainting.'
+        'the meter said no. i believe it.'
+        'everything stops. so dramatic. brb.'
     )
-    idle = @(              # awake with nothing to do: tiny existential bird
+    idle = @(              # awake with nothing to do: tiny existential creature
         'do worms have deadlines?'
         'i have seen things. mostly logs.'
         'you good? blink twice.'
         'quiet... too quiet.'
+        'am i the app or is the app me?'
+        'i could count pixels. i might.'
+        'so this is peace. weird.'
+        'do robots get bored? asking for me.'
+        'i alphabetized the silence.'
+        'nothing runs. i run in circles.'
+        'hello? is this thing rendering?'
+        'i named a cloud. it left.'
+        'waiting is a hobby now.'
+        'i wonder what the pixels think.'
+        'poke me. or do not. i am here.'
+        'the void and me, just vibing.'
+        'i practiced sitting. i am good.'
+        'who watches the watcher? nobody.'
+        'i invented a game. i lost it.'
+        'still here. still tiny. still bored.'
+        'if a session ends alone, do i chirp?'
+        'i blinked for fun. wild.'
+        'any minute now. any minute.'
+        'i talk to the taskbar. it listens.'
+        'existing is a lot, honestly.'
+        'somewhere, code. not here.'
+    )
+    mad = @(               # you POKED him or SHOOK him. he has words.
+        'hands OFF the merchandise.'
+        'poke me again. i dare you. no.'
+        'i am not a fidget toy.'
+        'rude. deeply, personally rude.'
+        'stop shaking me, you menace.'
+        'i will remember this. i log things.'
+        'unhand me, you enormous cursor.'
+        'do you treat everyone like this?'
+        'i have a perch and a temper.'
+        'quit it. i am delicate. ish.'
+        'excuse YOU.'
+        'personal space. ever heard of it?'
+        'i am tiny, not a stress ball.'
+        'keep poking. nothing happens.'
+        'you woke me to BULLY me?'
+        'i am filing a complaint. with me.'
+        'manners. we have none, apparently.'
+        'put me DOWN, giant.'
+        'harass the taskbar instead.'
+        'i am not your clicky little friend.'
+        'wow. okay. we are doing this.'
+        'you again? predictably annoying.'
+        'i felt that. i did not enjoy it.'
+        'stop it or i turn dramatic.'
+        'shake me once more. find out.'
+        'petty? me? absolutely. earned it.'
+        'i hope your semicolons wander off.'
+        'boop me back? no? typical.'
     )
 }
-$script:QuipChance = @{ done = 12; crown = 30; attention = 7; sleep = 18; hot = 25; knocked = 40; idle = 5 }
+$script:QuipChance = @{ done = 12; crown = 30; attention = 7; sleep = 18; hot = 25; knocked = 40; idle = 5; mad = 80 }
 
 function Invoke-BirdQuip([string]$Moment) {
     try {
         if (-not (Test-BirdOnStage)) { return }
         if ($script:PillDragging) { return }
         if ($null -ne $script:BirdBubble -and $script:BirdBubble.IsOpen) { return }
-        if (((Get-Date) - $script:QuipLastAt).TotalMinutes -lt 6) { return }   # hard silence floor
+        # MAD is a direct reaction to being poked or shaken - it skips the
+        # ambient 6-minute silence floor (ignoring a provocation reads as
+        # broken, not subtle) but keeps a short floor of its own so a
+        # pestering spree gets ONE telling-off, not a monologue.
+        if ($Moment -eq 'mad') {
+            if (((Get-Date) - $script:QuipLastAt).TotalSeconds -lt 20) { return }
+        }
+        elseif (((Get-Date) - $script:QuipLastAt).TotalMinutes -lt 6) { return }   # hard silence floor
         $pool = $script:QuipPools[$Moment]
         $chance = [int]$script:QuipChance[$Moment]
         if ($null -eq $pool -or @($pool).Count -eq 0 -or $chance -le 0) { return }
@@ -7019,6 +7179,10 @@ $Window.Add_MouseMove({
         }
         catch { }
         $script:PillDragEnd = Get-Date
+        if ($script:CarryWasShaken) {
+            $script:CarryWasShaken = $false
+            Invoke-BirdQuip 'mad'   # you SHOOK him. he has words.
+        }
         if ($null -ne $script:PillDragDress) {
             try {
                 $script:PillCard.Background = $script:PillDragDress.Bg

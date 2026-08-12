@@ -559,8 +559,35 @@ function Get-Sessions {
     $script:BusyPids = @{}
     $queue = New-Object System.Collections.ArrayList
     foreach ($s in $kept) {
-        if ($s.Status -notin @('working', 'compacting') -or $s.AgentPid -le 0) { continue }
+        if ($s.AgentPid -le 0) { continue }
         $apid = [int]$s.AgentPid
+        if ($s.Status -eq 'attention' -and -not [bool]$s.Native) {
+            # ATTENTION-VERIFY apply lane (the busy-verify mirror): the hooks
+            # go BLIND between an approved permission and the tool's end -
+            # PreToolUse fired before the prompt, so once you answer IN the
+            # terminal the file says 'attention' while the console provably
+            # cooks (and a bg dev server pins native at 'shell', which claims
+            # nothing). The answer lane's probe flips such rows via a
+            # 'working' override; it dies at the next hook write like every
+            # override, and busy-verify keeps watching it in between.
+            $ov = $script:BusyOverride[$apid]
+            if ($null -ne $ov -and [string]$ov.Status -eq 'working') {
+                if ($ov.FileTs -eq $s.Ts) {
+                    $s.Status = 'working'
+                    $s.Rank   = (Get-StatusMeta 'working').Rank
+                    $script:BusyPids[$apid] = $true
+                    if (-not $script:UntrackedPids.ContainsKey($apid)) {
+                        [void]$queue.Add(@{ Pid = $apid; Ts = $s.Ts; Transcript = [string]$s.Transcript })
+                    }
+                }
+                else {
+                    [void]$script:BusyOverride.Remove($apid)   # newer hook event wins
+                    [void]$script:BusyVerify.Remove($apid)
+                }
+            }
+            continue
+        }
+        if ($s.Status -notin @('working', 'compacting')) { continue }
         if ([bool]$s.Native) {
             # the CLI vouches for this row itself - no stale-busy lie possible
             # (Esc flips its native file to idle instantly). Never probe it,
@@ -680,6 +707,21 @@ function Get-Sessions {
         # collected some OTHER lane's plain (no-raw) probe for this pid:
         # don't cache an empty parse for 20s - retry with a raw probe next tick
         if (-not [bool]$r.RawProbe) { if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid collected PLAIN probe, retrying raw" -ErrorAction SilentlyContinue }; continue }
+        # ATTENTION-VERIFY: this row is painted 'needs you' but the screen we
+        # just collected PROVABLY COOKS (tokens-timer line / braille spinner -
+        # markers that never rotate, one sighting is proof). Classic shape:
+        # permission prompt -> answered in the terminal -> long tool run with
+        # no hook until it ends. Flip to working via override; the next hook
+        # write dissolves it. No buttons on a cooking console either.
+        if (Test-ScreenLooksBusy ([string]$r.Screen) ([string]$r.Title)) {
+            $script:BusyOverride[$apid] = @{ Status = 'working'; FileTs = $s.Ts }
+            [void]$script:PromptCapByPid.Remove($apid)
+            [void]$script:AttnTickByPid.Remove($apid)
+            # always logged: flips are rare and high-signal - the forensic
+            # trail is how "feels stale" reports become diagnoses
+            try { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-verify.log') -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') pid=$apid [$($s.CwdName)] attention row but screen COOKS -> working override (title=[$([string]$r.Title)])" -ErrorAction SilentlyContinue } catch { }
+            continue
+        }
         $parsedP = ConvertTo-PendingPrompt ([string]$r.RawTail)
         if ($script:AnswerDebug) { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-answer.log') -Value "$(Get-Date -Format HH:mm:ss) pid=$apid CAPTURED rawlen=$(([string]$r.RawTail).Length) parsed=$($null -ne $parsedP) q=$(if ($parsedP) { $parsedP.Question })" -ErrorAction SilentlyContinue }
         $script:PromptCapByPid[$apid] = @{ Stamp = Get-Date; Prompt = $parsedP }
@@ -1280,8 +1322,11 @@ function Invoke-BusyVerify {
         $ov = $script:BusyOverride[$apid]
         if (Test-ScreenLooksBusy $txt ([string]$r.Title)) {
             # cooking (again): LIFT any override - an api-retry that got
-            # through goes straight back to plain 'working'
-            if ($null -ne $ov) { [void]$script:BusyOverride.Remove($apid) }
+            # through goes straight back to plain 'working'. EXCEPT a
+            # 'working' override (the attention-verify flip): busy is exactly
+            # what it claims, lifting it would hand the row back to the
+            # stale 'attention' the flip corrected
+            if ($null -ne $ov -and [string]$ov.Status -ne 'working') { [void]$script:BusyOverride.Remove($apid) }
             $st.Misses = 0
             $st.Wait = [Math]::Min([int]$st.Wait + 30, 120)             # confirmed busy: ease off
             continue

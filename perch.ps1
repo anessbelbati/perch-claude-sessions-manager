@@ -1987,12 +1987,13 @@ function ConvertTo-PendingPrompt([string]$RawTail) {
     for ($i = 0; $i -lt $clean.Count; $i++) {
         $t = [string]$clean[$i]
         # selected-option caret variants: U+276F heavy chevron, >, U+00BB, U+2192 arrow
-        $m = [regex]::Match($t, ('^(?:[' + [char]0x276F + '>' + [char]0x00BB + [char]0x2192 + ']\s*)?(\d)\.\s+(\S.*)$'))
+        $m = [regex]::Match($t, ('^([' + [char]0x276F + '>' + [char]0x00BB + [char]0x2192 + ']\s*)?(\d)\.\s+(\S.*)$'))
         if ($m.Success) {
-            $n = [int]$m.Groups[1].Value
-            $lbl = $m.Groups[2].Value.Trim()
+            $hasCaret = ($m.Groups[1].Value.Trim().Length -gt 0)
+            $n = [int]$m.Groups[2].Value
+            $lbl = $m.Groups[3].Value.Trim()
             if ($n -eq 1) {
-                $cur = @{ Start = $i; Opts = (New-Object System.Collections.ArrayList) }
+                $cur = @{ Start = $i; Caret = $hasCaret; Foot = $false; Opts = (New-Object System.Collections.ArrayList) }
                 [void]$cur.Opts.Add(@{ Num = 1; Label = $lbl })
             }
             elseif ($null -ne $cur -and $n -eq ($cur.Opts.Count + 1)) {
@@ -2001,13 +2002,17 @@ function ConvertTo-PendingPrompt([string]$RawTail) {
                 # and the tail options (N. Chat about this), and the old hard
                 # reset on blank lines dropped everything below the rule
                 [void]$cur.Opts.Add(@{ Num = $n; Label = $lbl })
+                $cur.Caret = ([bool]$cur.Caret -or $hasCaret)
             }
             else { $cur = $null }
             $gap = $false
             if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
         }
         elseif ($t.Length -gt 0 -and [regex]::IsMatch($t, $footRx)) {
-            if ($null -ne $cur -and $cur.Opts.Count -ge 2) { $best = $cur }
+            if ($null -ne $cur) {
+                $cur.Foot = $true
+                if ($cur.Opts.Count -ge 2) { $best = $cur }
+            }
             $cur = $null
             $gap = $false
         }
@@ -2031,6 +2036,13 @@ function ConvertTo-PendingPrompt([string]$RawTail) {
         }
     }
     if ($null -eq $best) { return $null }
+    # POSITIVE MENU EVIDENCE required: a real claude menu always renders a
+    # selection caret on one option, and usually an "enter to select" footer
+    # right under the block. But claude also ANSWERS in numbered lists -
+    # "1. do X  2. do Y" as prose - and dressing that in answer buttons made
+    # the HUD offer choices nobody asked (clicking one would even type a
+    # digit into the composer). No caret and no footer -> prose, not a menu.
+    if (-not ([bool]$best.Caret -or [bool]$best.Foot)) { return $null }
     $ctx = New-Object System.Collections.ArrayList
     for ($i = [int]$best.Start - 1; $i -ge 0 -and $ctx.Count -lt 4 -and ([int]$best.Start - $i) -le 10; $i--) {
         $t = [string]$clean[$i]

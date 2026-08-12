@@ -445,6 +445,61 @@ function Get-AgentConsoleTitle {
     try { return [AgentFocus.ConsoleApi]::ReadTitleFrom([uint32]$AgentPid) } catch { return $null }
 }
 
+$script:TabBadgeSource = @"
+using System;
+using System.Runtime.InteropServices;
+
+namespace AgentFocus {
+    public static class TabBadge {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool AttachConsole(uint dwProcessId);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool FreeConsole();
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetConsoleMode(IntPtr h, out uint mode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool SetConsoleMode(IntPtr h, uint mode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(IntPtr h, byte[] buf, uint n, out uint written, IntPtr ov);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool CloseHandle(IntPtr h);
+
+        // ConEmu OSC 9;4 progress: Windows Terminal paints a ring on the TAB
+        // itself (icon slot, accent-colored, fill amount = progress) and
+        // colors the TASKBAR icon (1=green 2=red 4=yellow). State 0 clears.
+        // ConPTY passes the sequence through even mid-render on a live TUI
+        // (proven live 2026-08-12: ring renders = VT parser consumed the
+        // bytes = nothing entered the text buffer; the two are exclusive).
+        // The whole dance lives in native code because between AttachConsole
+        // and FreeConsole ANY managed stdout/stderr paints itself onto the
+        // session's screen (also proven live, by an escaped binding error).
+        public static bool Paint(uint pid, int state, int progress) {
+            FreeConsole();
+            if (!AttachConsole(pid)) { return false; }
+            try {
+                IntPtr h = CreateFileW("CONOUT$", 0xC0000000u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                if (h == new IntPtr(-1)) { return false; }
+                try {
+                    uint mode;
+                    if (GetConsoleMode(h, out mode) && (mode & 4) == 0) { SetConsoleMode(h, mode | 4); }
+                    string seq = "\x1b]9;4;" + state + ";" + progress + "\x07";
+                    byte[] bytes = System.Text.Encoding.ASCII.GetBytes(seq);
+                    uint written;
+                    return WriteFile(h, bytes, (uint)bytes.Length, out written, IntPtr.Zero);
+                } finally { CloseHandle(h); }
+            } finally { FreeConsole(); }
+        }
+    }
+}
+"@
+
+function Ensure-TabBadgeType {
+    if ("AgentFocus.TabBadge" -as [type]) { return $true }
+    try { Add-Type -TypeDefinition $script:TabBadgeSource -ErrorAction Stop; return $true } catch { return $false }
+}
+
 function Get-ConsoleTabHint {
     # Deterministic tab capture: attach to the agent process's console (that
     # console's title IS the session's tab title), find the matching tab via
@@ -790,6 +845,29 @@ try {
         $message = [string]$existing.message
     }
 
+    # -- tab badge: which OSC 9;4 state this event wants on the session's own
+    # terminal tab. Stop = full ring (finished), StopFailure = full ring with
+    # red taskbar, Notification = half arc with red taskbar, everything else =
+    # clear. Claude never emits 9;4 itself, so a stale ring would sit forever:
+    # the clear on working events is load-bearing, not cosmetic. Deduped
+    # against the previously recorded badge so a busy session costs ZERO extra
+    # console attaches - only actual state changes touch the console
+    # (~2 paints per turn). Kill switch: AgentFocus\badge.off.
+    $badgeWant = switch ($eventName) {
+        "Stop" { "1;100"; break }
+        "StopFailure" { "2;100"; break }
+        "Notification" { "2;50"; break }
+        default { "0;0" }
+    }
+    $badgePrev = ""
+    if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['tab_badge']) {
+        $badgePrev = [string]$existing.tab_badge
+    }
+    $needPaint = ($badgeWant -ne $badgePrev) -and
+                 -not ($badgeWant -eq "0;0" -and $badgePrev -eq "") -and
+                 $agentPid -gt 0 -and -not $headless -and
+                 -not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "AgentFocus\badge.off"))
+
     $record = [ordered]@{
         schema = 1
         hook_seq = $spawnTicks
@@ -805,6 +883,7 @@ try {
         agent_pid = $agentPid
         headless = $headless
         context_tokens = $contextTokens
+        tab_badge = $badgeWant
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         window = $window
     }
@@ -819,6 +898,17 @@ try {
     $record | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tempPath -Encoding UTF8
     Move-Item -LiteralPath $tempPath -Destination $statusPath -Force
     Write-HookTiming $eventName $stableId $t0 'wrote'
+
+    # paint the tab badge AFTER the status write (status is sacred, the ring
+    # is cosmetics) but INSIDE the critical section, so paint order follows
+    # write order - the event-order guard above already dropped stale events
+    # before they could paint over a newer state.
+    if ($needPaint) {
+        if (Ensure-TabBadgeType) {
+            $bp = $badgeWant -split ';'
+            try { [void][AgentFocus.TabBadge]::Paint([uint32]$agentPid, [int]$bp[0], [int]$bp[1]) } catch { }
+        }
+    }
 
     # release the mutex NOW: the read-modify-write critical section is done.
     # The capture below can take SECONDS (UIA scan / AttachConsole RPC), and

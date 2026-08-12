@@ -4671,10 +4671,30 @@ function New-DarkLabel([string]$Text) {
     return $tb
 }
 
+function Get-ThemeGlow {
+    # the active theme's accent color - settings chrome (toggles, carets,
+    # save button) wears it so the dialog belongs to the theme it edits
+    $spec = $script:ThemeSpecs[$script:ThemeName]
+    if ($null -ne $spec -and $spec.Glow) { return [string]$spec.Glow }
+    return '#E07B54'
+}
+
+function Get-GlowHover([string]$Hex) {
+    # hover shade: the glow blended ~22% toward white
+    try {
+        $c = [System.Windows.Media.ColorConverter]::ConvertFromString($Hex)
+        return ('#{0:X2}{1:X2}{2:X2}' -f
+            [int][Math]::Min(255, $c.R + (255 - $c.R) * 0.22),
+            [int][Math]::Min(255, $c.G + (255 - $c.G) * 0.22),
+            [int][Math]::Min(255, $c.B + (255 - $c.B) * 0.22))
+    }
+    catch { return $Hex }
+}
+
 function Set-Toggle($Toggle, [bool]$On) {
     $Toggle.Tag = $On
     if ($On) {
-        $Toggle.Background = Get-Brush '#E07B54'
+        $Toggle.Background = Get-Brush (Get-ThemeGlow)
         $Toggle.Child.HorizontalAlignment = 'Right'
     }
     else {
@@ -4752,10 +4772,43 @@ function New-InputBox([string]$Text) {
     $box.Background = [System.Windows.Media.Brushes]::Transparent
     $box.BorderThickness = New-Object System.Windows.Thickness(0)
     $box.Foreground = Get-Brush '#F4F4F8'
-    $box.CaretBrush = Get-Brush '#E07B54'
-    $box.SelectionBrush = Get-Brush '#55E07B54'
+    $glow = Get-ThemeGlow
+    $box.CaretBrush = Get-Brush $glow
+    $box.SelectionBrush = Get-Brush ('#55' + $glow.TrimStart('#'))
     $wrap.Child = $box
     return $wrap
+}
+
+function New-NumberRow([string]$Label, [string]$Value) {
+    # label left (star column, ellipsis-trimmed), input right (fixed width).
+    # A star+auto grid CANNOT overflow its card. The old layout stacked
+    # three label+input columns HORIZONTALLY - and a horizontal StackPanel
+    # measures its children at INFINITE width, so with long labels (or
+    # scaled fonts) the third column landed past the card edge and its
+    # input clipped into invisibility. Never again: no horizontal stacks
+    # of unbounded content inside the width-locked settings card.
+    $grid = New-Object System.Windows.Controls.Grid
+    $grid.Margin = New-Object System.Windows.Thickness(2, 7, 0, 0)
+    $c0 = New-Object System.Windows.Controls.ColumnDefinition
+    $c0.Width = New-Object System.Windows.GridLength(1, 'Star')
+    $c1 = New-Object System.Windows.Controls.ColumnDefinition
+    $c1.Width = [System.Windows.GridLength]::Auto
+    [void]$grid.ColumnDefinitions.Add($c0)
+    [void]$grid.ColumnDefinitions.Add($c1)
+    $tb = New-Object System.Windows.Controls.TextBlock
+    $tb.Text = $Label
+    $tb.FontSize = 10.5
+    $tb.Foreground = Get-Brush '#8A8A93'
+    $tb.VerticalAlignment = 'Center'
+    $tb.TextTrimming = 'CharacterEllipsis'
+    $tb.Margin = New-Object System.Windows.Thickness(0, 0, 10, 0)
+    [System.Windows.Controls.Grid]::SetColumn($tb, 0)
+    [void]$grid.Children.Add($tb)
+    $in = New-InputBox $Value
+    $in.Width = 64
+    [System.Windows.Controls.Grid]::SetColumn($in, 1)
+    [void]$grid.Children.Add($in)
+    return @{ Root = $grid; Box = $in.Child }
 }
 
 function New-ThemeSwatch([string]$Name) {
@@ -5057,10 +5110,12 @@ function New-DialogButton([string]$Text, [bool]$Primary) {
     $tb.FontSize = 11.5
     $tb.FontWeight = [System.Windows.FontWeights]::SemiBold
     if ($Primary) {
-        $b.Background = Get-Brush '#E07B54'
+        # accent = the active theme's glow, resolved AT EVENT TIME so a live
+        # theme preview re-colors the hover without rebuilding the button
+        $b.Background = Get-Brush (Get-ThemeGlow)
         $tb.Foreground = Get-Brush '#1E1E27'
-        $b.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#EC906F' })
-        $b.Add_MouseLeave({ param($s, $e) $s.Background = Get-Brush '#E07B54' })
+        $b.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush (Get-GlowHover (Get-ThemeGlow)) })
+        $b.Add_MouseLeave({ param($s, $e) $s.Background = Get-Brush (Get-ThemeGlow) })
     }
     else {
         $b.Background = Get-Brush '#1AFFFFFF'
@@ -5489,6 +5544,29 @@ function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$
     Update-List -Force
 }
 
+function Set-SettingsDialogTheme {
+    # the settings card wears the ACTIVE theme - same walls, same border,
+    # same accent as the widget it configures - and re-skins LIVE while you
+    # preview themes from inside it. glass is acrylic-on-hwnd (not a brush),
+    # so a glass pick borrows midnight's walls for the dialog.
+    $refs = $script:DlgThemeRefs
+    if ($null -eq $refs) { return }
+    $spec = $script:ThemeSpecs[$script:ThemeName]
+    if ($null -eq $spec -or $null -eq $spec.Bg) { $spec = $script:ThemeSpecs['midnight'] }
+    try {
+        $refs.Card.Background  = $spec.Bg
+        $refs.Card.BorderBrush = $spec.BorderBrush
+        $glow = Get-ThemeGlow
+        foreach ($t in @($refs.Toggles)) { Set-Toggle $t ([bool]$t.Tag) }
+        foreach ($bx in @($refs.Inputs)) {
+            $bx.CaretBrush = Get-Brush $glow
+            $bx.SelectionBrush = Get-Brush ('#55' + $glow.TrimStart('#'))
+        }
+        $refs.Save.Background = Get-Brush $glow
+    }
+    catch { }
+}
+
 function Show-SettingsDialog {
     $dlg = New-Object System.Windows.Window
     $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
@@ -5497,17 +5575,31 @@ function Show-SettingsDialog {
     $dlg.WindowStartupLocation = 'CenterOwner'
     $dlg.Owner = $script:Window
     $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
+    $dlg.Add_Loaded({
+        param($s, $e)
+        # NEVER off-screen: CenterOwner centers on the WIDGET, and a widget
+        # parked at a screen edge dragged half the dialog past the monitor -
+        # inputs hiding outside the desktop. Clamp to the OWNER's monitor
+        # (Forms pixels -> DIPs via the composition transform).
+        try {
+            $h = (New-Object System.Windows.Interop.WindowInteropHelper($s.Owner)).Handle
+            $scr = [System.Windows.Forms.Screen]::FromHandle($h)
+            $t = [System.Windows.PresentationSource]::FromVisual($s).CompositionTarget.TransformFromDevice
+            $tl = $t.Transform((New-Object System.Windows.Point([double]$scr.WorkingArea.Left, [double]$scr.WorkingArea.Top)))
+            $br = $t.Transform((New-Object System.Windows.Point([double]$scr.WorkingArea.Right, [double]$scr.WorkingArea.Bottom)))
+            if ($s.Left + $s.ActualWidth  -gt $br.X) { $s.Left = $br.X - $s.ActualWidth }
+            if ($s.Top  + $s.ActualHeight -gt $br.Y) { $s.Top  = $br.Y - $s.ActualHeight }
+            if ($s.Left -lt $tl.X) { $s.Left = $tl.X }
+            if ($s.Top  -lt $tl.Y) { $s.Top  = $tl.Y }
+        }
+        catch { }
+    })
 
     $card = New-Object System.Windows.Controls.Border
     $card.CornerRadius = New-Object System.Windows.CornerRadius(14)
-    $grad = New-Object System.Windows.Media.LinearGradientBrush
-    $grad.StartPoint = New-Object System.Windows.Point(0, 0)
-    $grad.EndPoint = New-Object System.Windows.Point(0, 1)
-    [void]$grad.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
-        [System.Windows.Media.ColorConverter]::ConvertFromString('#FA1F1F28'), 0.0)))
-    [void]$grad.GradientStops.Add((New-Object System.Windows.Media.GradientStop(
-        [System.Windows.Media.ColorConverter]::ConvertFromString('#FA15151A'), 1.0)))
-    $card.Background = $grad
+    # walls + border come from the theme via Set-SettingsDialogTheme (below,
+    # once the themed children exist); these are the fallbacks it overwrites
+    $card.Background = Get-Brush '#FA1A1A22'
     $card.BorderBrush = Get-Brush '#2AFFFFFF'
     $card.BorderThickness = New-Object System.Windows.Thickness(1)
     $card.Padding = New-Object System.Windows.Thickness(14, 12, 14, 14)
@@ -5562,6 +5654,7 @@ function Show-SettingsDialog {
         param($k)
         $script:PickTheme = $k; $script:ThemeName = $k
         try { Apply-Theme } catch { }
+        try { Set-SettingsDialogTheme } catch { }   # the dialog previews itself too
     }
 
     $mascotItems = @()
@@ -5644,44 +5737,14 @@ function Show-SettingsDialog {
     $sep.Margin = New-Object System.Windows.Thickness(2, 8, 2, 0)
     [void]$stack.Children.Add($sep)
 
-    $numRow = New-Object System.Windows.Controls.StackPanel
-    $numRow.Orientation = 'Horizontal'
-    $colRefresh = New-Object System.Windows.Controls.StackPanel
-    [void]$colRefresh.Children.Add((New-DarkLabel 'refresh every (seconds)'))
-    $inRefresh = New-InputBox ([string]$script:RefreshSeconds)
-    $inRefresh.Width = 64
-    $inRefresh.HorizontalAlignment = 'Left'
-    [void]$colRefresh.Children.Add($inRefresh)
-    $colVolume = New-Object System.Windows.Controls.StackPanel
-    $colVolume.Margin = New-Object System.Windows.Thickness(18, 0, 0, 0)
-    [void]$colVolume.Children.Add((New-DarkLabel 'chirp volume (%)'))
-    $inVolume = New-InputBox ([string]$script:ChirpVolume)
-    $inVolume.Width = 64
-    $inVolume.HorizontalAlignment = 'Left'
-    [void]$colVolume.Children.Add($inVolume)
-    $colPark = New-Object System.Windows.Controls.StackPanel
-    $colPark.Margin = New-Object System.Windows.Thickness(18, 0, 0, 0)
-    [void]$colPark.Children.Add((New-DarkLabel 'park needs-you after (min, 0=never)'))
-    $inPark = New-InputBox ([string]$script:ParkMinutes)
-    $inPark.Width = 64
-    $inPark.HorizontalAlignment = 'Left'
-    [void]$colPark.Children.Add($inPark)
-    [void]$numRow.Children.Add($colRefresh)
-    [void]$numRow.Children.Add($colVolume)
-    [void]$numRow.Children.Add($colPark)
-    [void]$stack.Children.Add($numRow)
-
-    $numRow2 = New-Object System.Windows.Controls.StackPanel
-    $numRow2.Orientation = 'Horizontal'
-    $numRow2.Margin = New-Object System.Windows.Thickness(0, 6, 0, 0)
-    $colCompact = New-Object System.Windows.Controls.StackPanel
-    [void]$colCompact.Children.Add((New-DarkLabel 'compact button past (k tokens, 0=off)'))
-    $inCompact = New-InputBox ([string]$script:CompactAtK)
-    $inCompact.Width = 64
-    $inCompact.HorizontalAlignment = 'Left'
-    [void]$colCompact.Children.Add($inCompact)
-    [void]$numRow2.Children.Add($colCompact)
-    [void]$stack.Children.Add($numRow2)
+    # ONE numeric setting per row: label star-column left, input auto-column
+    # right. The old three-across horizontal stack overflowed the card and
+    # hid inputs off-screen (see New-NumberRow for the autopsy).
+    $nrRefresh = New-NumberRow 'refresh every (seconds)'                ([string]$script:RefreshSeconds)
+    $nrVolume  = New-NumberRow 'chirp volume (%)'                       ([string]$script:ChirpVolume)
+    $nrPark    = New-NumberRow 'park needs-you after (min, 0=never)'    ([string]$script:ParkMinutes)
+    $nrCompact = New-NumberRow 'compact button past (k tokens, 0=off)'  ([string]$script:CompactAtK)
+    foreach ($nr in @($nrRefresh, $nrVolume, $nrPark, $nrCompact)) { [void]$stack.Children.Add($nr.Root) }
 
     [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
     $inProcs = New-InputBox ($script:AgentProcNames -join ', ')
@@ -5746,9 +5809,18 @@ function Show-SettingsDialog {
 
     $dlg.Tag = @{
         Chirp = $rowChirp.Tag; ChirpDone = $rowChirpDn.Tag; Timers = $rowTimers.Tag; Hide = $rowHide.Tag; Startup = $rowStartup.Tag
-        Refresh = $inRefresh.Child; Volume = $inVolume.Child; Procs = $inProcs.Child; Park = $inPark.Child
-        Compact = $inCompact.Child; Bubbles = $rowBubbles.Tag
+        Refresh = $nrRefresh.Box; Volume = $nrVolume.Box; Procs = $inProcs.Child; Park = $nrPark.Box
+        Compact = $nrCompact.Box; Bubbles = $rowBubbles.Tag
     }
+
+    # everything the theme touches, for live re-skin while previewing
+    $script:DlgThemeRefs = @{
+        Card    = $card
+        Toggles = @($rowChirp.Tag, $rowChirpDn.Tag, $rowBubbles.Tag, $rowTimers.Tag, $rowHide.Tag, $rowStartup.Tag)
+        Inputs  = @($nrRefresh.Box, $nrVolume.Box, $nrPark.Box, $nrCompact.Box, $inProcs.Child)
+        Save    = $btnSave
+    }
+    Set-SettingsDialogTheme
     $btnSave.Tag = $dlg
     $btnCancel.Tag = $dlg
     $btnSave.Add_MouseLeftButtonUp({
@@ -5779,6 +5851,7 @@ function Show-SettingsDialog {
         }
         # closed without saving: the shell pick never previews, just reverts
         if (-not $script:ShellSaved) { $script:ResumeShell = $script:ShellOrig }
+        $script:DlgThemeRefs = $null   # dead dialog: nothing left to re-skin
     })
 
     $script:UiHold++

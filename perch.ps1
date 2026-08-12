@@ -548,6 +548,72 @@ function Get-Sessions {
         if ($r.Length -gt 0) { $script:KnownRidClaims[$r] = [int]$s.AgentPid }
     }
 
+    # ACTIVE-TAB LEARNER: a session in an arbitrarily-renamed tab is anonymous
+    # - no title or cwd match can find it, the hook's own recapture nulls its
+    # window on every prompt, and until now only a click-time cycle (the full
+    # tab light show) could prove where it lives. But the user LOOKS at tabs
+    # all day, and the SELECTED tab's pane text is readable without selecting
+    # anything. Every few seconds: fingerprint each WT window's active tab and
+    # score it against the last probed screens of the window-less rows - a
+    # decisive winner (same score+margin discipline the cycle demands) pins
+    # pid->rid in UntrackedTabMap, where next tick's rescue turns it into a
+    # full window hint. The row's name follows the tab, and clicks get the
+    # exact rid with no light show. Selection is re-verified LIVE on the
+    # element right before and after the pane read - the 6s tabs cache could
+    # say 'selected' about a tab the user just left, and pinning a session to
+    # the WRONG rid is the cardinal sin this widget exists to prevent.
+    if (((Get-Date) - $script:ActiveLearnStamp).TotalSeconds -ge 5) {
+        $script:ActiveLearnStamp = Get-Date
+        $orphans = New-Object System.Collections.ArrayList
+        foreach ($s in $kept) {
+            if ($s.AgentPid -le 0) { continue }
+            if ($null -ne $s.Window -and $s.Window.PSObject.Properties['tab_runtime_id'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$s.Window.tab_runtime_id)) { continue }
+            if ($script:UntrackedTabMap.ContainsKey([int]$s.AgentPid)) { continue }
+            $scr = $script:LastScreenMap[[int]$s.AgentPid]
+            if ($null -eq $scr -or ((Get-Date) - $scr.Stamp).TotalMinutes -gt 10) { continue }
+            if (([string]$scr.Text).Length -lt 200) { continue }
+            [void]$orphans.Add($s)
+        }
+        if ($orphans.Count -gt 0) {
+            foreach ($tb in @(Get-AllTerminalTabs | Where-Object { $_.Selected -and $_.Rid.Length -gt 0 -and $null -ne $_.Element })) {
+                if ($script:KnownRidClaims.ContainsKey($tb.Rid)) { continue }
+                $claimedElsewhere = $false
+                foreach ($k in @($script:UntrackedTabMap.Keys)) {
+                    if ([string]$script:UntrackedTabMap[$k] -eq $tb.Rid) { $claimedElsewhere = $true; break }
+                }
+                if ($claimedElsewhere) { continue }
+                $stillSel = $false
+                try {
+                    $stillSel = [bool]$tb.Element.GetCurrentPropertyValue(
+                        [System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty)
+                }
+                catch { }
+                if (-not $stillSel) { continue }
+                $paneText = Get-ActiveTermText -Hwnd $tb.Hwnd
+                if ($paneText.Length -lt 200) { continue }
+                try {
+                    $stillSel = [bool]$tb.Element.GetCurrentPropertyValue(
+                        [System.Windows.Automation.SelectionItemPattern]::IsSelectedProperty)
+                }
+                catch { $stillSel = $false }
+                if (-not $stillSel) { continue }
+                $best = $null; $bestScore = 0; $second = 0
+                foreach ($s in $orphans) {
+                    $sc = Get-ScreenMatchScore -S ([string]$script:LastScreenMap[[int]$s.AgentPid].Text) -T $paneText
+                    if ($sc -gt $bestScore) { $second = $bestScore; $bestScore = $sc; $best = $s }
+                    elseif ($sc -gt $second) { $second = $sc }
+                }
+                if ($null -ne $best -and $bestScore -ge 6 -and ($bestScore - $second) -ge 2 -and
+                    -not $script:PoisonedRids.ContainsKey("$($best.AgentPid)|$($tb.Rid)")) {
+                    $script:UntrackedTabMap[[int]$best.AgentPid] = $tb.Rid
+                    [void]$script:NoTabStamp.Remove([int]$best.AgentPid)
+                    Write-FocusLog "learned [$($best.CwdName)] pid=$($best.AgentPid) -> rid=[$($tb.Rid)] tab=[$($tb.Name)] score=$bestScore/$second (active-tab learner)"
+                }
+            }
+        }
+    }
+
     # WORKING sessions are left alone by the passive learner's probing: their
     # consoles are busy rendering (probes contend with that via conhost RPC
     # and were measurably slowing the CLIs), and their screens change too fast
@@ -750,7 +816,27 @@ function Get-Sessions {
         }
     }
 
-    # apply user prefs: custom names + pinned-to-top
+    # apply user prefs (custom names + pinned-to-top), then let WT tab renames
+    # OVERRIDE the name: the tab strip is the physical namespace the user
+    # actually curates - when they rename a tab, that IS the session's name,
+    # and a months-old perch-side rename must not shadow it. (perch's
+    # right-click rename remains the tool for sessions whose tabs you didn't
+    # rename.) The live tab comes from the session's runtime id via the 6s
+    # Get-AllTerminalTabs cache - the tick already pays for that walk.
+    # Adoption demands the name be clearly HUMAN-chosen, three gates:
+    #   1. starts with a letter/digit (claude authors glyph-prefixed titles -
+    #      spinner braille, the idle asterisk)
+    #   2. differs from the session's console title - but ONLY for hook-made
+    #      '+console' captures, where tab_name genuinely mirrors the console
+    #      title. hud-rescue/hud-scan windows store the VISIBLE tab name in
+    #      tab_name, so this gate would compare the candidate against itself
+    #      and self-block exactly the renamed tabs it exists to serve
+    #   3. identical two consecutive ticks (animated titles never are)
+    $tabByRid = @{}
+    foreach ($tb in @(Get-AllTerminalTabs)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$tb.Rid)) { $tabByRid[[string]$tb.Rid] = $tb }
+    }
+    $seenNow = @{}
     foreach ($s in $kept) {
         $display = $s.CwdName
         $pinned = $false
@@ -761,9 +847,31 @@ function Get-Sessions {
                 -not [string]::IsNullOrWhiteSpace([string]$e.name)) { $display = [string]$e.name }
             if ($null -ne $e.PSObject.Properties['pinned']) { $pinned = [bool]$e.pinned }
         }
+        if ($null -ne $s.Window -and
+            $null -ne $s.Window.PSObject.Properties['tab_runtime_id']) {
+            $tb = $tabByRid[[string]$s.Window.tab_runtime_id]
+            if ($null -ne $tb) {
+                $cand = [string]$tb.Name
+                $capEv = ''
+                if ($null -ne $s.Window.PSObject.Properties['captured_event']) { $capEv = [string]$s.Window.captured_event }
+                $conTitle = ''
+                if ($capEv -like '*+console' -and $capEv -notlike 'hud-*' -and
+                    $null -ne $s.Window.PSObject.Properties['tab_name']) { $conTitle = [string]$s.Window.tab_name }
+                $sid = [string]$s.Id
+                $prev = [string]$script:TabNameSeen[$sid]
+                $seenNow[$sid] = $cand
+                if (-not [string]::IsNullOrWhiteSpace($cand) -and
+                    $cand -match '^[\p{L}\p{Nd}]' -and
+                    (Get-NormalizedTabName $cand) -ne (Get-NormalizedTabName $conTitle) -and
+                    $cand -eq $prev) {
+                    $display = $cand
+                }
+            }
+        }
         $s | Add-Member -NotePropertyName DisplayName -NotePropertyValue $display -Force
         $s | Add-Member -NotePropertyName Pinned -NotePropertyValue $pinned -Force
     }
+    $script:TabNameSeen = $seenNow
 
     return @($kept | Sort-Object -Property @{ Expression = 'Pinned'; Descending = $true },
                                            Rank,
@@ -772,6 +880,7 @@ function Get-Sessions {
 
 # ---------- prefs (rename / pin) ----------
 $script:Prefs = @{}
+$script:TabNameSeen = @{}   # session id -> tab name seen last tick (rename adoption needs two sightings)
 function Load-Prefs {
     $script:Prefs = @{}
     try {
@@ -965,6 +1074,7 @@ $script:NoTabStamp = @{}        # pid -> last time resolution failed (negative c
 $script:ProbeBudget = 3         # probe STARTS allowed per tick (reset in Update-List) -
                                 # starting a child is ~30ms; results are collected async
 $script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel for the passive learner)
+$script:ActiveLearnStamp = [datetime]::MinValue   # active-tab learner throttle (5s)
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
 $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found nothing (30s cooldown)

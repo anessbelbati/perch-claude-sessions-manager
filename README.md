@@ -39,6 +39,7 @@ and the best part: **click a row and it jumps to the EXACT windows terminal tab.
 
 - live status for every claude code session, via hooks
 - click-to-focus down to the exact tab
+- **the tab strip itself tells you**: every session's windows terminal tab wears a native ring badge painted by the hook — **full ring = finished**, **half arc = needs you**, gone = working again. the taskbar icon goes green/red along with it, so a finished session is visible even with the terminal minimized and perch closed. (yes, we once declared this impossible — see war stories for the recantation.) kill switch: an empty `badge.off` file in `%LOCALAPPDATA%\AgentFocus`
 - right-click a row → **pin to top**, **rename**, **hide** (remembered per project folder)
 - pin the widget = always on top. unpin = it stays out of your way and just flashes the taskbar when something needs you
 - also spots `codex` / `gemini` / `opencode` / `aider` sessions out of the box (add whatever names you want to the list)
@@ -117,6 +118,8 @@ the trick: claude code hooks run as child processes of the claude process, so th
 
 clicking a row re-matches against live tabs (fresh title first, UIA runtime id as tiebreaker), restores the window if minimized, selects the tab, brings it forward.
 
+the console link runs both ways: since the hook can attach, it can also *write*. after every status write it paints a ConEmu `ESC]9;4` progress sequence straight into the session's `CONOUT$` — windows terminal renders it as a native ring on the tab itself (full = finished, half arc = needs you) and colors the taskbar icon green/red to match. claude never emits that sequence on its own, so nothing self-heals: the explicit wipe on working events is load-bearing. paints dedup against the last recorded badge, so a cooking session costs zero extra console attaches — a full turn costs two, each a few milliseconds. and because the writer is attached to the session's console while it works, it must be *mute*: any stray output between attach and detach paints itself onto the session's screen (we know because it happened), so the whole dance is a single native call that returns a silent bool.
+
 the *other* hard problem is knowing when a session is actually **done**. the `Stop` hook fires when the model finishes — but a fullscreen TUI keeps typewriter-rendering the answer for 5–15 more seconds (we measured it live), and background tasks can keep working for *minutes* after `Stop` with no hook ever firing again. so "done" is a verdict, not an event: the hook trail, claude's native per-pid self-report (`~/.claude/sessions/<pid>.json`), and a console-screen probe all have to agree. the hook write is detected in ~250ms via a cheeky NTFS trick (a directory's mtime bumps when a child file is created or renamed — one stat call, four times a second, zero file watching), the native file covers everything hooks can't see, and the screen probe holds the "done" until the answer is actually on screen. the chirp only sings when the hooks themselves wrote the idle — so nothing that *isn't* a finish can ever sound like one.
 
 ## war stories
@@ -138,6 +141,7 @@ things that bit me so they don't have to bite you:
 - **hooks are turn-blind.** a background task can keep cooking for ten minutes after `Stop` fired, and no hook will ever tell you. turns out claude code self-reports live per-process state in `~/.claude/sessions/<pid>.json` — busy/idle/asking, rewritten the instant it changes, background tasks included, flips on esc instantly. the CLI's own word, and it outranks the hook trail.
 - **the bird sang for a compact.** `SessionStart(source=compact)` repaints "working" so mid-turn auto-compacts don't flash a false done — but a *manual* `/compact` has nothing running, so the row bounced working→idle and the finish chirp fired for... a compact. the tell: on a real finish `Stop` *authors* the idle; on the phantom nothing ever writes it. the chirp now demands the hooks' signature on the idle (and esc-interrupts stopped chirping too — you stopped it, you know).
 - **you cannot recolor windows terminal tabs from outside. we tried everything. accept it.** the dream: tabs turn red when their session needs you. reality, in order of death: WT has no API for tab colors (manual menu or profile `tabColor` only); `SetConsoleTitle`-style external state never propagates through ConPTY (the marker-title corpse above already knew this); the ConEmu progress OSC (`ESC]9;4`) *does* reach WT — but renders as a tiny ring on the tab icon, not a tint, and claude code's statusline sanitizes OSC out anyway, so there's no delivery path into a claude tab at all. bonus humiliation: our first "successful" test was a tab that was red because *a human had right-clicked it and picked red* weeks earlier. always test against a control. the pill exists precisely because tabs can't say how they feel — turns out that's load-bearing. *(entry filed by the claude that fell for it. the human has been identified. it was the boss.)*
+  **months later, the corpse twitched.** re-read the third death: the OSC *does* reach WT. claude sanitizing escape sequences only guards claude's *own* statusline output — but hooks are child processes, and a child can `AttachConsole` into the session and write `ESC]9;4` to `CONOUT$` itself, underneath anyone's sanitizer. ConPTY passes it through even mid-render on a live TUI, and the ring appearing IS the no-corruption proof: the bytes either become a ring or become literal garbage text on screen, never both. so perch now ships exactly that — full ring on `Stop`, half arc on `Notification`, wiped when work resumes. the headline still stands: you cannot *tint* a tab. the ring is accent-colored no matter what state you send; red/green live only on the taskbar icon. but 'no delivery path into a claude tab at all' was a failure of imagination, not a fact. *(recantation filed by a later claude. the ring is real. re-attack your own 'impossible' list occasionally.)*
 
 ## stolen with love
 
@@ -158,7 +162,7 @@ no code was copied — everything here is hand-rolled PowerShell 5.1 (their stac
 | file | what |
 |---|---|
 | `perch.ps1` | the widget (single WPF file) |
-| `hooks/agent-focus-status.ps1` | claude code hook: events → status JSONs |
+| `hooks/agent-focus-status.ps1` | claude code hook: events → status JSONs + tab ring badges |
 | `install.ps1` | installer |
 | `Perch.vbs` | consoleless launcher |
 | `codex-notify-adapter.ps1` | codex notify → status adapter |

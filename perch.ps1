@@ -1557,6 +1557,17 @@ function Get-NormalizedTabName([string]$Name) {
     return (($Name -replace '^[^\p{L}\p{Nd}]+', '').Trim().ToLowerInvariant())
 }
 
+function Write-FocusLog([string]$Line) {
+    # every click gets one forensic line: which hints existed, which branch
+    # of the resolver decided, what it picked, and what the tab strip looked
+    # like. "It took me to a different session" stops being a mystery the
+    # moment the log names the guilty branch.
+    try {
+        Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-focus.log') `
+            -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Line" -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 function Get-ActiveTermText {
     # UIA TextPattern on the ACTIVE tab's TermControl: the rendered pane text
     # (what Narrator reads). Tab renames touch only the header - the CONTENT
@@ -1675,29 +1686,62 @@ function Invoke-FocusSession($Sess) {
         }
     }
 
-    # match against the LIVE tab list; the hook refreshes tab_name on every
-    # event, so a fresh title match outranks a possibly-stale runtime id.
+    $apid = 0
+    if ($null -ne $Sess.PSObject.Properties['AgentPid']) { try { $apid = [int]$Sess.AgentPid } catch { } }
+
+    # match against the LIVE tab list. rid and tab_name were captured in the
+    # SAME hook write, so neither is "fresher" - when they point at different
+    # live tabs one of them is simply LYING: a twin tab wearing our title
+    # (the same conversation resumed in a new tab does this - the title
+    # follows the conversation, the old tab keeps wearing it) or a recycled
+    # UIA runtime id. The old ladder let a unique title match silently
+    # outrank a live rid, which is exactly how clicks landed on the wrong
+    # session. Now: agreement wins instantly, a lone survivor wins, and a
+    # DISAGREEMENT gets settled by pane content - never by coin flip.
     $tabs = @(Get-AllTerminalTabs)
     $target = $null
+    $branch = 'none'
     if ($tabs.Count -gt 0) {
         $want = Get-NormalizedTabName $tabName
         $byName = @($tabs | Where-Object { $want.Length -gt 0 -and $_.Norm -eq $want })
         $byRid  = @($tabs | Where-Object { $rid.Length -gt 0 -and $_.Rid -eq $rid })
         $both   = @($byRid | Where-Object { $_.Norm -eq $want -and $want.Length -gt 0 })
 
-        if     ($both.Count -ge 1)   { $target = $both[0] }
-        elseif ($byName.Count -eq 1) { $target = $byName[0] }
-        elseif ($byRid.Count -ge 1)  { $target = $byRid[0] }
-        elseif ($byName.Count -gt 1) {
-            $inWin = @($byName | Where-Object { $_.Hwnd -eq $storedHwnd })
-            if ($inWin.Count -ge 1) { $target = $inWin[0] } else { $target = $byName[0] }
+        if     ($both.Count -ge 1) { $target = $both[0]; $branch = 'rid+name' }
+        elseif ($byRid.Count -ge 1 -and $byName.Count -eq 0) {
+            # our tab, renamed by claude since capture: element identity holds
+            $target = $byRid[0]; $branch = 'rid'
         }
-        elseif ($storedHwnd -ne [IntPtr]::Zero -and $tabIndex -ge 0) {
-            $inWin = @($tabs | Where-Object { $_.Hwnd -eq $storedHwnd })
-            if ($tabIndex -lt $inWin.Count) { $target = $inWin[$tabIndex] }
+        elseif ($byRid.Count -ge 1) {
+            # CONFLICT: rid alive on one tab, our title worn by another.
+            # Prove it by content; if the prober can't decide, trust the
+            # element identity (id recycling is the rarer lie than a twin).
+            if ($apid -gt 0) {
+                $target = Resolve-TabByCycle -TargetPid $apid -PreferredNorms @($want)
+                if ($null -ne $target) { $branch = 'conflict-proven' }
+            }
+            if ($null -eq $target) { $target = $byRid[0]; $branch = 'conflict-rid' }
+        }
+        elseif ($byName.Count -eq 1) { $target = $byName[0]; $branch = 'name' }
+        elseif ($byName.Count -gt 1) {
+            # rid dead and SEVERAL tabs wear this exact title: twins. Taking
+            # [0] was a coin flip across sessions - prove by content, and only
+            # guess (loudly, in the log) when proof is impossible.
+            $inWin = @($byName | Where-Object { $_.Hwnd -eq $storedHwnd })
+            if ($inWin.Count -eq 1) { $target = $inWin[0]; $branch = 'nameN-inwin' }
+            else {
+                if ($apid -gt 0) {
+                    $target = Resolve-TabByCycle -TargetPid $apid -PreferredNorms @($want)
+                    if ($null -ne $target) { $branch = 'nameN-proven' }
+                }
+                if ($null -eq $target) {
+                    $target = $(if ($inWin.Count -ge 1) { $inWin[0] } else { $byName[0] })
+                    $branch = 'nameN-guess'
+                }
+            }
         }
 
-        if ($null -eq $target -and $null -ne $Sess.PSObject.Properties['AgentPid'] -and [int]$Sess.AgentPid -gt 0) {
+        if ($null -eq $target -and $apid -gt 0) {
             # stored hints dead or missing (typical for manually-RENAMED tabs:
             # they ignore console titles, so hooks may never capture them).
             # Follow the PROCESS itself: probe its console screen and cycle
@@ -1708,23 +1752,39 @@ function Invoke-FocusSession($Sess) {
                 $n = Get-NormalizedTabName $cand
                 if ($n.Length -gt 0 -and $prefNorms -notcontains $n) { $prefNorms += $n }
             }
-            $target = Resolve-TabByCycle -TargetPid ([int]$Sess.AgentPid) -PreferredNorms $prefNorms
+            $target = Resolve-TabByCycle -TargetPid $apid -PreferredNorms $prefNorms
+            if ($null -ne $target) { $branch = 'cycle' }
         }
 
         if ($null -eq $target) {
-            # weakest fallback: match the tab against what the row is CALLED -
+            # weak fallback: match the tab against what the row is CALLED -
             # custom name first, then the project folder name; users rename
             # tabs to exactly these.
             foreach ($cand in @([string]$Sess.DisplayName, [string]$Sess.CwdName)) {
                 $wantN = Get-NormalizedTabName $cand
                 if ($wantN.Length -eq 0) { continue }
                 $byLabel = @($tabs | Where-Object { $_.Norm -eq $wantN })
-                if ($byLabel.Count -eq 1) { $target = $byLabel[0]; break }
+                if ($byLabel.Count -eq 1) { $target = $byLabel[0]; $branch = 'label'; break }
             }
+        }
+
+        if ($null -eq $target -and $storedHwnd -ne [IntPtr]::Zero -and $tabIndex -ge 0) {
+            # DEMOTED to dead last: an index is a seat number in a room where
+            # people leave - one closed tab to its left and it points at a
+            # stranger. It used to outrank the content prober, which meant a
+            # stale guess beat actual proof.
+            $inWin = @($tabs | Where-Object { $_.Hwnd -eq $storedHwnd })
+            if ($tabIndex -lt $inWin.Count) { $target = $inWin[$tabIndex]; $branch = 'index' }
         }
     }
 
+    $strip = ''
+    try { $strip = (@($tabs | ForEach-Object { $_.Norm }) -join ' | ') } catch { }
+    if ($strip.Length -gt 300) { $strip = $strip.Substring(0, 300) + '...' }
+    $hints = "want=[$(Get-NormalizedTabName $tabName)] rid=[$rid] idx=$tabIndex hwnd=$([long]$storedHwnd)"
+
     if ($null -ne $target) {
+        Write-FocusLog "click [$($Sess.DisplayName)] pid=$apid $hints -> $branch tab=[$($target.Norm)] rid=[$($target.Rid)] hwnd=$([long]$target.Hwnd) | strip: $strip"
         try {
             $pattern = $target.Element.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
             $pattern.Select()
@@ -1744,11 +1804,16 @@ function Invoke-FocusSession($Sess) {
         $pname = ''
         if ($wpid -gt 0) { try { $pname = (Get-Process -Id $wpid -ErrorAction Stop).ProcessName } catch { } }
         if ($pname -match '^(WindowsTerminal|powershell|pwsh|cmd|conhost|OpenConsole|wsl|ubuntu|Code|wezterm|alacritty|Hyper|mintty)$') {
+            # this raises the WINDOW without selecting any tab - whatever tab
+            # is active greets the user. Logged as such: if wrong-session
+            # reports correlate with 'raise', this fallback is the culprit.
+            Write-FocusLog "click [$($Sess.DisplayName)] pid=$apid $hints -> raise (no tab matched, raising stored window bare) | strip: $strip"
             if ([ClaudeHud.Native]::IsIconic($storedHwnd)) { [void][ClaudeHud.Native]::ShowWindowAsync($storedHwnd, 9) }
             [void][ClaudeHud.Native]::SetForegroundWindow($storedHwnd)
             return $true
         }
     }
+    Write-FocusLog "click [$($Sess.DisplayName)] pid=$apid $hints -> none (no match, no usable stored window) | strip: $strip"
     return $false
 }
 

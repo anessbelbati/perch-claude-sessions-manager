@@ -840,11 +840,15 @@ function Get-Sessions {
     foreach ($s in $kept) {
         $display = $s.CwdName
         $pinned = $false
+        $prefName = ''
         $key = Get-PrefKey $s
         if ($script:Prefs.ContainsKey($key)) {
             $e = $script:Prefs[$key]
             if ($null -ne $e.PSObject.Properties['name'] -and
-                -not [string]::IsNullOrWhiteSpace([string]$e.name)) { $display = [string]$e.name }
+                -not [string]::IsNullOrWhiteSpace([string]$e.name)) {
+                $prefName = [string]$e.name
+                $display = $prefName
+            }
             if ($null -ne $e.PSObject.Properties['pinned']) { $pinned = [bool]$e.pinned }
         }
         if ($null -ne $s.Window -and
@@ -865,6 +869,15 @@ function Get-Sessions {
                     (Get-NormalizedTabName $cand) -ne (Get-NormalizedTabName $conTitle) -and
                     $cand -eq $prev) {
                     $display = $cand
+                    # adoption used to be display-only, and a reboot exposed
+                    # the amnesia: fresh tabs wear default titles the gates
+                    # rightly reject, so every row fell back to whatever
+                    # stale pref predated the rename. A name that passed all
+                    # three gates is a name the user CHOSE - write it into
+                    # the pref (cwd-keyed, survives reboots) so the row wears
+                    # it before the tab is ever re-proven. Guarded on change:
+                    # one disk write per rename, not one per tick.
+                    if ($cand -ne $prefName) { Set-Pref $s 'name' $cand }
                 }
             }
         }
@@ -2577,6 +2590,8 @@ $script:RestoreText    = $Window.FindName('RestoreText')
 $script:RestoreGoBtn   = $Window.FindName('RestoreGoBtn')
 $script:RestoreDismiss = $Window.FindName('RestoreDismiss')
 $script:LiveSnapSig = $null            # last written id-set (write only on change)
+$script:SnapLastLive = @{}             # id -> last live snapshot record (feeds the grace ledger)
+$script:SnapGrace = @{}                # id -> @{Rec;At}: sessions that died <10min ago, still snapshotted
 $script:RestorePending = New-Object System.Collections.ArrayList
 $script:RestoreSavedAt = ''
 try {
@@ -2677,11 +2692,27 @@ function Invoke-ResumeSession($P) {
 # staggered relaunch: N simultaneous claude boots would fight over CPU and
 # the terminal - one every 700ms feels like a calm roll call instead
 $script:RestoreQueue = New-Object System.Collections.Queue
+$script:RestoreWaitStart = [datetime]::MinValue
 $script:RestoreTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:RestoreTimer.Interval = [TimeSpan]::FromMilliseconds(700)
 $script:RestoreTimer.Add_Tick({
     try {
         if ($script:RestoreQueue.Count -eq 0) { $script:RestoreTimer.Stop(); return }
+        # cold-boot race, observed live: resume all on a fresh boot scattered
+        # the fleet across several terminal windows. The first launch spawns
+        # a brand-new WT window that takes seconds to register; every 700ms
+        # `-w 0` launch fired into that gap sees no window and births its
+        # own. Hold the queue until a real WT main window exists - then the
+        # drain lands every tab in it. 15s valve so a terminal that never
+        # comes up can't hold the fleet hostage (scattered beats stranded).
+        if ($null -ne (Get-Command wt.exe -ErrorAction SilentlyContinue)) {
+            $wtReady = $false
+            foreach ($p in @(Get-Process WindowsTerminal -ErrorAction SilentlyContinue)) {
+                if ($p.MainWindowHandle -ne [IntPtr]::Zero) { $wtReady = $true; break }
+            }
+            if (-not $wtReady -and
+                ((Get-Date) - $script:RestoreWaitStart).TotalSeconds -lt 15) { return }
+        }
         Invoke-ResumeSession $script:RestoreQueue.Dequeue()
     }
     catch { $script:RestoreTimer.Stop() }
@@ -2694,6 +2725,7 @@ $script:RestoreGoBtn.Add_MouseLeftButtonUp({
         foreach ($p in @($script:RestorePending)) { [void]$script:RestoreQueue.Enqueue($p) }
         $script:RestorePending.Clear()
         Update-RestoreBar
+        $script:RestoreWaitStart = Get-Date   # the 15s valve measures from the click
         Invoke-ResumeSession $script:RestoreQueue.Dequeue()   # first one NOW
         if ($script:RestoreQueue.Count -gt 0) { $script:RestoreTimer.Start() }
     }
@@ -7183,13 +7215,37 @@ function Update-List {
     }
     Update-RestoreBar
     $snapList = @()
+    $liveSnapIds = @{}
     foreach ($s in $visible) {
         if (($s.Provider -eq 'claude' -or $s.Id -match '^[0-9a-fA-F-]{32,}$') -and
             -not [string]::IsNullOrWhiteSpace($s.Id) -and
             -not [string]::IsNullOrWhiteSpace($s.Cwd)) {
             $snapList += , @{ id = $s.Id; cwd = $s.Cwd; name = $s.CwdName
                               flags = (Get-SessionPermFlags ([int]$s.AgentPid)) }
+            $liveSnapIds[[string]$s.Id] = $true
         }
+    }
+    # GRACE LEDGER: a shutdown kills the terminals BEFORE it kills perch, so
+    # the rolling snapshot shrank with every dying session and the reboot
+    # offered whatever splinter was still breathing when perch itself died
+    # (observed live: 7 offered from a much larger fleet). A session that
+    # leaves the live set now stays in the snapshot for 10 more minutes -
+    # long enough to survive any shutdown ordering, short enough that a tab
+    # closed on purpose stops haunting the file within the same sitting.
+    # The restore bar is still offer-only, so the worst case of the grace
+    # window is one unwanted name in a list the user can dismiss.
+    foreach ($gid in @($script:SnapLastLive.Keys)) {
+        if (-not $liveSnapIds.ContainsKey($gid)) {
+            $script:SnapGrace[$gid] = @{ Rec = $script:SnapLastLive[$gid]; At = Get-Date }
+        }
+    }
+    $script:SnapLastLive = @{}
+    foreach ($rec in $snapList) { $script:SnapLastLive[[string]$rec.id] = $rec }
+    foreach ($gid in @($script:SnapGrace.Keys)) {
+        if ($liveSnapIds.ContainsKey($gid)) { [void]$script:SnapGrace.Remove($gid); continue }
+        $g = $script:SnapGrace[$gid]
+        if (((Get-Date) - $g.At).TotalMinutes -ge 10) { [void]$script:SnapGrace.Remove($gid); continue }
+        $snapList += , $g.Rec
     }
     $snapSig = (@($snapList | ForEach-Object { $_.id }) -join '|')
     if ($snapSig -ne $script:LiveSnapSig) {

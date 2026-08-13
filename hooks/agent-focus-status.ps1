@@ -847,21 +847,32 @@ try {
 
     # -- tab badge: which OSC 9;4 state this event wants on the session's own
     # terminal tab. Stop = full ring (finished), StopFailure = full ring with
-    # red taskbar, Notification = half arc with red taskbar, everything else =
-    # clear. Claude never emits 9;4 itself, so a stale ring would sit forever:
-    # the clear on working events is load-bearing, not cosmetic. Deduped
-    # against the previously recorded badge so a busy session costs ZERO extra
-    # console attaches - only actual state changes touch the console
-    # (~2 paints per turn). Kill switch: AgentFocus\badge.off.
+    # red taskbar, Notification = half arc with red taskbar, working events =
+    # state 3 indeterminate, which Windows Terminal renders as a little arc
+    # ORBITING the icon slot (verified frame-by-frame: the arc moves) - motion
+    # means cooking, no fill amount to misread as progress. Session edges
+    # clear: a fresh session hasn't earned a ring and a dead one must not
+    # keep spinning on the empty shell tab. PreCompact carries the previous
+    # badge forward - a manual /compact from idle must not leave a spinner
+    # lying on a session that will sit quiet when the compact ends (there is
+    # no compact-done hook to correct it). Claude never emits 9;4 itself, so
+    # every wrong ring would sit forever: these transitions are the only
+    # self-heal. Deduped against the previously recorded badge so a busy
+    # session costs ZERO extra console attaches - only actual state changes
+    # touch the console (~2 paints per turn: spinner on, verdict on). Kill
+    # switch: AgentFocus\badge.off.
+    $badgePrev = ""
+    if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['tab_badge']) {
+        $badgePrev = [string]$existing.tab_badge
+    }
     $badgeWant = switch ($eventName) {
         "Stop" { "1;100"; break }
         "StopFailure" { "2;100"; break }
         "Notification" { "2;50"; break }
-        default { "0;0" }
-    }
-    $badgePrev = ""
-    if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['tab_badge']) {
-        $badgePrev = [string]$existing.tab_badge
+        "SessionStart" { "0;0"; break }
+        "SessionEnd" { "0;0"; break }
+        "PreCompact" { $badgePrev; break }
+        default { "3;0" }
     }
     $needPaint = ($badgeWant -ne $badgePrev) -and
                  -not ($badgeWant -eq "0;0" -and $badgePrev -eq "") -and

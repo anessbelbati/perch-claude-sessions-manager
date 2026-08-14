@@ -874,7 +874,13 @@ try {
         "PreCompact" { $badgePrev; break }
         default { "3;0" }
     }
-    $needPaint = ($badgeWant -ne $badgePrev) -and
+    # UserPromptSubmit paints even when dedup says the badge is already
+    # right: the record is the hook's memory of its own paints, but perch
+    # corrects Esc-orphaned spinners directly on the tab (see the HUD's
+    # badge corrector) and the record can't know the pixels changed under
+    # it. One unconditional repaint per turn re-syncs pixels to record at
+    # the exact moment a spinner is wanted anyway - a few ms, once a turn.
+    $needPaint = (($badgeWant -ne $badgePrev) -or $eventName -eq "UserPromptSubmit") -and
                  -not ($badgeWant -eq "0;0" -and $badgePrev -eq "") -and
                  $agentPid -gt 0 -and -not $headless -and
                  -not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "AgentFocus\badge.off"))

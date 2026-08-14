@@ -219,6 +219,7 @@ function Get-StatusMeta([string]$Status) {
 }
 
 $script:NativeCache = @{}   # pid -> {LWT; Val}: parse-once cache for the native state files
+$script:NativeRejectLogged = @{}   # pid -> true: procStart mismatch already announced in the focus log
 function Get-NativeAgentStatus([int]$AgentPid, $Proc) {
     # THE STEAL (thanks, claude-busy-monitor): claude code self-reports live
     # per-process state in ~/.claude/sessions/<pid>.json - status busy/shell/
@@ -240,7 +241,27 @@ function Get-NativeAgentStatus([int]$AgentPid, $Proc) {
         if ($null -ne $j.PSObject.Properties['procStart'] -and $null -ne $Proc) {
             [long]$ps = 0
             if ([long]::TryParse([string]$j.procStart, [ref]$ps)) {
-                if ([Math]::Abs($Proc.StartTime.Ticks - $ps) -gt 100000) { $ok = $false }   # 10ms: pid was reused
+                # pid-reuse guard, TWO epochs: the CLI now writes procStart
+                # as a FILETIME (epoch 1601, UTC) while this compare was
+                # written for .NET DateTime ticks (epoch 0001, local). The
+                # single-epoch compare could never match after the CLI
+                # switched - a constant ~1600-year delta - so it silently
+                # rejected EVERY native file and assassinated this whole
+                # lane; rows leaned on the slower probe lane and nobody
+                # noticed until a stuck tab spinner needed the native
+                # verdict. Accept either epoch within 10ms, and log the
+                # first rejection per pid so the NEXT format change
+                # announces itself instead of killing the lane quietly.
+                $st = $Proc.StartTime
+                if ([Math]::Abs($st.Ticks - $ps) -gt 100000 -and
+                    [Math]::Abs($st.ToFileTime() - $ps) -gt 100000) {
+                    $ok = $false
+                    if (-not $script:NativeRejectLogged.ContainsKey($AgentPid)) {
+                        $script:NativeRejectLogged[$AgentPid] = $true
+                        Write-FocusLog ("native-reject pid={0} procStart={1} ticks={2} filetime={3}" -f `
+                            $AgentPid, $ps, $st.Ticks, $st.ToFileTime())
+                    }
+                }
             }
         }
         if ($ok) {
@@ -464,6 +485,9 @@ function Get-Sessions {
             Transcript = $(if ($null -ne $s.PSObject.Properties['transcript_path']) { [string]$s.transcript_path } else { '' })
             Native   = $nativeApplied
             HookStatus = $hookStatus
+            TabBadge = $(if ($null -ne $s.PSObject.Properties['tab_badge']) { [string]$s.tab_badge } else { '' })
+            BadgeSeq = $(if ($null -ne $s.PSObject.Properties['hook_seq']) { [string]$s.hook_seq } else { [string]$s.timestamp })
+            Headless = $isHeadless
             Rank     = (Get-StatusMeta $status).Rank
         })
     }
@@ -932,6 +956,56 @@ function Set-Pref($Sess, [string]$Field, $Value) {
     Save-Prefs
 }
 
+# ---------- tab badge painter (the HUD side of the console link) ----------
+# same dance as the hook's badge painter: attach to the session's console,
+# write one OSC 9;4 sequence to CONOUT$, detach. The whole thing is a single
+# native call returning a silent bool because anything the attached process
+# prints lands on the SESSION's screen (the silence law, learned the hard way).
+$script:TabBadgeSource = @'
+using System;
+using System.Runtime.InteropServices;
+namespace AgentFocus {
+    public static class HudBadge {
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleCtrlHandler(IntPtr handler, bool add);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sec, uint disp, uint flags, IntPtr tmpl);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr h, out uint mode);
+        [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetConsoleMode(IntPtr h, uint mode);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool WriteFile(IntPtr h, byte[] buf, uint n, out uint written, IntPtr ovl);
+        public static bool Paint(uint pid, int state, int progress) {
+            // the HUD is not disposable the way a hook process is: while
+            // attached it joins the target console's ctrl group, and a
+            // Ctrl+C typed in that tab during the few-ms window would kill
+            // the HUD. Opt out of ctrl events for good before attaching.
+            SetConsoleCtrlHandler(IntPtr.Zero, true);
+            FreeConsole();
+            if (!AttachConsole(pid)) { return false; }
+            try {
+                IntPtr h = CreateFileW("CONOUT$", 3221225472u, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                if (h == new IntPtr(-1)) { return false; }
+                try {
+                    uint mode;
+                    if (GetConsoleMode(h, out mode) && (mode & 4) == 0) { SetConsoleMode(h, mode | 4); }
+                    string seq = "\x1b]9;4;" + state + ";" + progress + "\x07";
+                    byte[] bytes = System.Text.Encoding.ASCII.GetBytes(seq);
+                    uint written;
+                    return WriteFile(h, bytes, (uint)bytes.Length, out written, IntPtr.Zero);
+                } finally { CloseHandle(h); }
+            } finally { FreeConsole(); }
+        }
+    }
+}
+'@
+function Ensure-TabBadgeType {
+    if ("AgentFocus.HudBadge" -as [type]) { return $true }
+    try { Add-Type -TypeDefinition $script:TabBadgeSource -ErrorAction Stop; return $true }
+    catch { return $false }
+}
+
 # ---------- untracked claude scan ----------
 function Ensure-ConsoleApi {
     if ("AgentFocus.ConsoleApi" -as [type]) { return $true }
@@ -1090,6 +1164,8 @@ $script:LastScreenMap = @{}     # pid -> last probed console SCREEN text (fuel f
 $script:ActiveLearnStamp = [datetime]::MinValue   # active-tab learner throttle (5s)
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
+$script:BadgeArm = @{}          # "id|seq" -> armed last tick (spinner corrections need two calm sightings)
+$script:BadgeFixDone = @{}      # "id|seq" -> already corrected this record (hook re-owns the tab on its next word)
 $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found nothing (30s cooldown)
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
@@ -7202,6 +7278,47 @@ function Update-List {
     }
     foreach ($k in @($script:WorkSince.Keys)) {
         if (-not $liveIds.ContainsKey($k)) { [void]$script:WorkSince.Remove($k) }
+    }
+
+    # TAB BADGE CORRECTOR: Esc-interrupting a turn fires NO hook event, so
+    # the working spinner painted at prompt time would orbit forever on a
+    # session that is actually sitting quiet (observed live: framekit spun
+    # 2.3 hours after an interrupt). The rows learned long ago that done is
+    # a verdict, not an event - claude's native self-report and the probes
+    # flip an interrupted row calm within seconds. The tab now hears that
+    # verdict too: when the hook's last painted badge is the spinner but the
+    # row's verified status is calm, perch attaches and repaints the truth
+    # (half arc if the row needs you, wiped otherwise). Discipline: ONLY the
+    # spinner is ever second-guessed - verdict rings are hook-earned and a
+    # wrong wipe is worse than a stale ring. The calm must be 10s old and
+    # hold two consecutive ticks (the native lane can lag a fresh record by
+    # a beat), and each record is corrected at most once, keyed by its
+    # hook_seq, so the hook re-owns the tab the moment it speaks again
+    # (UserPromptSubmit repaints unconditionally for exactly this reason).
+    $badgeArmNow = @{}
+    $badgeBusy = @('working', 'compacting', 'retrying')
+    foreach ($s in $visible) {
+        if ([string]$s.TabBadge -ne '3;0' -or [int]$s.AgentPid -le 0) { continue }
+        if ($s.Headless -or ([string]$s.Status) -in $badgeBusy) { continue }
+        if (((Get-Date) - $s.Ts).TotalSeconds -lt 10) { continue }
+        $sig = [string]$s.Id + '|' + [string]$s.BadgeSeq
+        if ($script:BadgeFixDone.ContainsKey($sig)) { continue }
+        if (-not $script:BadgeArm.ContainsKey($sig)) { $badgeArmNow[$sig] = $true; continue }
+        if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'AgentFocus\badge.off')) { continue }
+        $fix = '0;0'
+        if (([string]$s.Status) -in @('attention', 'error', 'parked')) { $fix = '2;50' }
+        if (Ensure-TabBadgeType) {
+            $bp = $fix -split ';'
+            $ok = $false
+            try { $ok = [AgentFocus.HudBadge]::Paint([uint32]$s.AgentPid, [int]$bp[0], [int]$bp[1]) } catch { }
+            $script:BadgeFixDone[$sig] = $true
+            Write-FocusLog ("badge-fix [{0}] pid={1} 3;0 -> {2} verdict={3} ok={4} (esc leaves no event)" -f `
+                $s.CwdName, $s.AgentPid, $fix, $s.Status, $ok)
+        }
+    }
+    $script:BadgeArm = $badgeArmNow
+    foreach ($k in @($script:BadgeFixDone.Keys)) {
+        if (-not $liveIds.ContainsKey(($k -split '\|')[0])) { [void]$script:BadgeFixDone.Remove($k) }
     }
 
     # crash insurance, tick side: (1) anything the old snapshot offered

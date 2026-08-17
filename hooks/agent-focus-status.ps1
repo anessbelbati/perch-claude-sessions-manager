@@ -101,7 +101,18 @@ function Test-IsSubagent {
             $parent = Get-CimInstance Win32_Process -Filter "ProcessId=$parentId" -ErrorAction SilentlyContinue
             if ($null -eq $parent) { break }
             $name = [string]$parent.Name
-            if ($name -match $agentNames) { return $true }
+            if ($name -match $agentNames) {
+                # a claude parent is not always a SPAWNER. Newer CLIs host
+                # their own PTY: `claude --bg-pty-host \\.\pipe\cc-daemon-...`
+                # wraps an interactive session that lives in a real terminal
+                # tab (observed live: the GOA tab, a resumed session, was
+                # flagged headless for three days - the hook stopped painting
+                # its ring and a spinner froze on it forever). A pty host is
+                # plumbing, not ancestry: look through it and keep walking.
+                $pcl = [string]$parent.CommandLine
+                if ($pcl -match '--bg-pty-host') { $current = $parentId; continue }
+                return $true
+            }
             if ($name -match '^(WindowsTerminal|explorer|svchost|services|wininit|winlogon)') { return $false }
             $current = $parentId
         }
@@ -782,6 +793,14 @@ try {
     if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['headless']) {
         $headless = [bool]$existing.headless
     }
+    # a UserPromptSubmit is a HUMAN typing into this session - a subagent
+    # never receives one. Whatever the ancestry walk concluded, a prompt is
+    # proof of an interactive console, so the headless flag lifts here and
+    # every headless-gated path downstream (the badge painter above all)
+    # comes back to life. Without this, one wrong ancestry verdict muted a
+    # session's ring for its whole life (three days, live) while the record
+    # kept remembering paints that never happened.
+    if ($headless -and $eventName -eq "UserPromptSubmit") { $headless = $false }
     # capture is expensive (UIA scan), so only do it when the session has no
     # deterministic console-captured hint yet, or on SessionStart (new tab).
     # Known-headless sessions only recheck on SessionStart/UserPromptSubmit
@@ -884,6 +903,14 @@ try {
                  -not ($badgeWant -eq "0;0" -and $badgePrev -eq "") -and
                  $agentPid -gt 0 -and -not $headless -and
                  -not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA "AgentFocus\badge.off"))
+    # the record remembers what was PAINTED, never what was merely wanted.
+    # A muted paint (headless flag, kill switch, no pid) used to write the
+    # wanted badge anyway - so dedup believed the tab already wore it, the
+    # HUD's corrector reasoned about phantom pixels, and a frozen spinner
+    # had no witness. When the painter is silenced, the record carries the
+    # previous badge forward: the pixels didn't change, so neither does the
+    # memory of them.
+    $badgeRecord = $(if ($needPaint -or $badgeWant -eq $badgePrev) { $badgeWant } else { $badgePrev })
 
     $record = [ordered]@{
         schema = 1
@@ -900,7 +927,7 @@ try {
         agent_pid = $agentPid
         headless = $headless
         context_tokens = $contextTokens
-        tab_badge = $badgeWant
+        tab_badge = $badgeRecord
         timestamp = (Get-Date).ToUniversalTime().ToString("o")
         window = $window
     }

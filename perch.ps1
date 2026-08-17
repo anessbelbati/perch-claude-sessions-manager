@@ -7299,7 +7299,14 @@ function Update-List {
     $badgeBusy = @('working', 'compacting', 'retrying')
     foreach ($s in $visible) {
         if ([string]$s.TabBadge -ne '3;0' -or [int]$s.AgentPid -le 0) { continue }
-        if ($s.Headless -or ([string]$s.Status) -in $badgeBusy) { continue }
+        # NOT gated on the record's headless flag: that flag is a tab-identity
+        # verdict, not a console verdict, and it lied for three days on a
+        # bg-pty-host session (GOA) - the hook went mute on it and the
+        # corrector, honoring the same flag, went blind with it. A record
+        # claiming a spinner is a claim about pixels; a truly hidden console
+        # just fails the attach or paints where nobody looks. Only ever a
+        # row that is VISIBLE here anyway - hidden subagents never reach it.
+        if (([string]$s.Status) -in $badgeBusy) { continue }
         if (((Get-Date) - $s.Ts).TotalSeconds -lt 10) { continue }
         $sig = [string]$s.Id + '|' + [string]$s.BadgeSeq
         if ($script:BadgeFixDone.ContainsKey($sig)) { continue }

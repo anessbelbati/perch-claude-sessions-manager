@@ -1165,7 +1165,8 @@ $script:ActiveLearnStamp = [datetime]::MinValue   # active-tab learner throttle 
 $script:KnownRidClaims = @{}    # rid -> pid for EVERY row perch showed last tick (hook-captured included)
 $script:PoisonedRids = @{}      # "pid|rid" -> true: file hints that lost a conflict; never trust them again
 $script:BadgeArm = @{}          # "id|seq" -> armed last tick (spinner corrections need two calm sightings)
-$script:BadgeFixDone = @{}      # "id|seq" -> already corrected this record (hook re-owns the tab on its next word)
+$script:BadgeFixDone = @{}      # "id|seq|fix" -> already applied that correction to this record (never the same fix twice)
+$script:BadgePerch = @{}        # id -> @{Seq;Badge}: what PERCH last painted over the hook's record (so both directions see it)
 $script:CycleFailStamp = @{}    # pid -> last time the click-time tab walk found nothing (30s cooldown)
 $script:LastTitleByPid = @{}    # pid -> last probed console title (twin-clash detection)
 $script:ConsoleIdByPid = @{}    # pid -> conhost pid owning its console (same console = same session)
@@ -7295,10 +7296,19 @@ function Update-List {
     # a beat), and each record is corrected at most once, keyed by its
     # hook_seq, so the hook re-owns the tab the moment it speaks again
     # (UserPromptSubmit repaints unconditionally for exactly this reason).
+    # The correction runs BOTH WAYS, because the tab can drift either way
+    # without a hook to blame. Esc strands a spinner on a calm session; a
+    # long turn that ends its auto-compact fires no further event, so a
+    # working session can sit with NO ring for minutes (observed live: two
+    # sessions bare at once). Both are the same defect - the tab disagrees
+    # with the verified row - and both corrections only ever touch the
+    # SPINNER. Verdict rings stay hook-earned in both directions: perch
+    # never claims a session finished, it only says "cooking" or takes the
+    # cooking claim back.
     $badgeArmNow = @{}
     $badgeBusy = @('working', 'compacting', 'retrying')
     foreach ($s in $visible) {
-        if ([string]$s.TabBadge -ne '3;0' -or [int]$s.AgentPid -le 0) { continue }
+        if ([int]$s.AgentPid -le 0) { continue }
         # NOT gated on the record's headless flag: that flag is a tab-identity
         # verdict, not a console verdict, and it lied for three days on a
         # bg-pty-host session (GOA) - the hook went mute on it and the
@@ -7306,26 +7316,47 @@ function Update-List {
         # claiming a spinner is a claim about pixels; a truly hidden console
         # just fails the attach or paints where nobody looks. Only ever a
         # row that is VISIBLE here anyway - hidden subagents never reach it.
-        if (([string]$s.Status) -in $badgeBusy) { continue }
         if (((Get-Date) - $s.Ts).TotalSeconds -lt 10) { continue }
-        $sig = [string]$s.Id + '|' + [string]$s.BadgeSeq
+        # what the tab is actually WEARING: the hook's record, unless perch
+        # painted over it since (same record = same hook_seq). Without this
+        # the two directions couldn't see each other's work - a spinner perch
+        # painted would be invisible to the wipe that has to take it back.
+        $sid = [string]$s.Id
+        $eff = [string]$s.TabBadge
+        $pp = $script:BadgePerch[$sid]
+        if ($null -ne $pp -and [string]$pp.Seq -eq [string]$s.BadgeSeq) { $eff = [string]$pp.Badge }
+        $busyNow = (([string]$s.Status) -in $badgeBusy)
+        $fix = $null
+        if ($eff -eq '3;0' -and -not $busyNow) {
+            $fix = '0;0'
+            if (([string]$s.Status) -in @('attention', 'error', 'parked')) { $fix = '2;50' }
+        }
+        elseif ($eff -ne '3;0' -and $busyNow) { $fix = '3;0' }
+        if ($null -eq $fix) { continue }
+        # keyed by direction too: one record may legitimately need the
+        # spinner painted and later taken back, but never the same fix twice
+        $sig = $sid + '|' + [string]$s.BadgeSeq + '|' + $fix
         if ($script:BadgeFixDone.ContainsKey($sig)) { continue }
         if (-not $script:BadgeArm.ContainsKey($sig)) { $badgeArmNow[$sig] = $true; continue }
+        $badgeArmNow[$sig] = $true
         if (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'AgentFocus\badge.off')) { continue }
-        $fix = '0;0'
-        if (([string]$s.Status) -in @('attention', 'error', 'parked')) { $fix = '2;50' }
         if (Ensure-TabBadgeType) {
             $bp = $fix -split ';'
             $ok = $false
             try { $ok = [AgentFocus.HudBadge]::Paint([uint32]$s.AgentPid, [int]$bp[0], [int]$bp[1]) } catch { }
             $script:BadgeFixDone[$sig] = $true
-            Write-FocusLog ("badge-fix [{0}] pid={1} 3;0 -> {2} verdict={3} ok={4} (esc leaves no event)" -f `
-                $s.CwdName, $s.AgentPid, $fix, $s.Status, $ok)
+            if ($ok) { $script:BadgePerch[$sid] = @{ Seq = [string]$s.BadgeSeq; Badge = $fix } }
+            $why = $(if ($fix -eq '3;0') { 'no event since compact-end' } else { 'esc leaves no event' })
+            Write-FocusLog ("badge-fix [{0}] pid={1} {2} -> {3} verdict={4} ok={5} ({6})" -f `
+                $s.CwdName, $s.AgentPid, $eff, $fix, $s.Status, $ok, $why)
         }
     }
     $script:BadgeArm = $badgeArmNow
     foreach ($k in @($script:BadgeFixDone.Keys)) {
         if (-not $liveIds.ContainsKey(($k -split '\|')[0])) { [void]$script:BadgeFixDone.Remove($k) }
+    }
+    foreach ($k in @($script:BadgePerch.Keys)) {
+        if (-not $liveIds.ContainsKey($k)) { [void]$script:BadgePerch.Remove($k) }
     }
 
     # crash insurance, tick side: (1) anything the old snapshot offered

@@ -864,19 +864,14 @@ try {
         $message = [string]$existing.message
     }
 
-    # -- tab badge: which OSC 9;4 state this event wants on the session's own
-    # terminal tab. Stop = full ring (finished), StopFailure = full ring with
-    # red taskbar, Notification = half arc with red taskbar, working events =
-    # state 3 indeterminate, which Windows Terminal renders as a little arc
-    # ORBITING the icon slot (verified frame-by-frame: the arc moves) - motion
-    # means cooking, no fill amount to misread as progress. Session edges
-    # clear: a fresh session hasn't earned a ring and a dead one must not
-    # keep spinning on the empty shell tab. PreCompact carries the previous
-    # badge forward - a manual /compact from idle must not leave a spinner
-    # lying on a session that will sit quiet when the compact ends (there is
-    # no compact-done hook to correct it). Claude never emits 9;4 itself, so
-    # every wrong ring would sit forever: these transitions are the only
-    # self-heal. Deduped against the previously recorded badge so a busy
+    # -- tab badge: which OSC 9;4 state this session's own terminal tab should
+    # wear. idle = full ring (finished), error = full ring with red taskbar,
+    # attention = half arc with red taskbar, working = state 3 indeterminate,
+    # which Windows Terminal renders as a little arc ORBITING the icon slot
+    # (verified frame-by-frame: the arc moves) - motion means cooking, no fill
+    # amount to misread as progress. Claude never emits 9;4 itself, so every
+    # wrong ring would sit forever: these transitions are the only self-heal
+    # the tab gets. Deduped against the previously recorded badge so a busy
     # session costs ZERO extra console attaches - only actual state changes
     # touch the console (~2 paints per turn: spinner on, verdict on). Kill
     # switch: AgentFocus\badge.off.
@@ -884,15 +879,29 @@ try {
     if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['tab_badge']) {
         $badgePrev = [string]$existing.tab_badge
     }
-    $badgeWant = switch ($eventName) {
-        "Stop" { "1;100"; break }
-        "StopFailure" { "2;100"; break }
-        "Notification" { "2;50"; break }
-        "SessionStart" { "0;0"; break }
-        "SessionEnd" { "0;0"; break }
-        "PreCompact" { $badgePrev; break }
-        default { "3;0" }
+    # THE RING FOLLOWS THE STATUS, NOT THE EVENT. The first mapping read
+    # event names directly and quietly re-derived meaning the status switch
+    # above had already worked out - so it disagreed with it. Auto-compact
+    # was the casualty: PreCompact -> SessionStart(source=compact) ends a
+    # compact MID-TURN, the status lane correctly calls that 'working', but
+    # the event-name mapping saw SessionStart and CLEARED the ring. The
+    # session kept cooking with a bare tab until the turn ended, sometimes
+    # many minutes (observed live on two sessions at once). One source of
+    # truth now: the ring shows whatever state the row shows.
+    $badgeWant = switch ($status) {
+        "working" { "3;0"; break }
+        "compacting" { "3;0"; break }   # a compact IS work; perch's corrector wipes it if the turn really ended
+        "idle" { "1;100"; break }
+        "error" { "2;100"; break }
+        "attention" { "2;50"; break }
+        "ended" { "0;0"; break }
+        default { $badgePrev }          # unknown state: never invent a ring
     }
+    # session EDGES still clear: a brand-new session hasn't earned a verdict
+    # ring, and a dead one must not leave jewelry on the empty shell tab.
+    # A compact-sourced SessionStart is not an edge - it's mid-turn.
+    if ($eventName -eq "SessionEnd" -or
+        ($eventName -eq "SessionStart" -and $startSource -ne "compact")) { $badgeWant = "0;0" }
     # UserPromptSubmit paints even when dedup says the badge is already
     # right: the record is the hook's memory of its own paints, but perch
     # corrects Esc-orphaned spinners directly on the tab (see the HUD's

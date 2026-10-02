@@ -1,0 +1,164 @@
+/* A conversation as it can be read: what was asked, what was answered, each tool call folded to one line,
+   edits as changed lines. And the list of files it changed. */
+
+.reader { min-height: 100%; display: flex; flex-direction: column; user-select: text; }
+.reader button, .changes button { user-select: none; }
+.rd-bar { position: sticky; top: 0; z-index: 2; flex: none; display: flex; align-items: center; gap: 8px; padding: 9px var(--side-in, 24px); background: var(--panel); border-bottom: 1px solid var(--line); user-select: none; }
+.rd-find { position: relative; margin-left: auto; display: flex; align-items: center; }
+.rd-find > .i { position: absolute; left: 8px; color: var(--text-3); pointer-events: none; }
+.rd-find .input { width: 200px; padding-left: 27px; }
+.rd-top { flex: none; display: flex; align-items: center; justify-content: center; gap: 12px; padding: 16px 24px 2px; font-size: 12px; }
+.rd-top:empty { display: none; }
+.rd-list { flex: 1; width: 100%; max-width: var(--col, 880px); margin: 0 auto; padding: 10px 24px 88px; display: flex; flex-direction: column; gap: 10px; }
+/* a line that arrives while the conversation is being watched rises into place; nothing else moves */
+.rd-list > .rise { animation: rise 180ms var(--ease) both; }
+@keyframes rise { from { opacity: 0; transform: translateY(3px); } }
+.rd-jump {
+  position: sticky; bottom: 16px; align-self: center; flex: none; height: 28px; margin-top: -28px; display: flex; align-items: center; gap: 6px; padding: 0 12px 0 9px;
+  border-radius: 14px; background: #232327; border: 1px solid var(--line-2); box-shadow: var(--shadow-float); font-size: 12px; font-weight: 500;
+}
+.rd-jump:hover { background: #2a2a2f; }
+
+/* a new day, the end of a turn, and the other marks between things said */
+.rd-day { display: flex; align-items: center; gap: 12px; margin: 12px 0 0; color: var(--text-3); font-size: 11.5px; font-weight: 500; user-select: none; }
+.rd-day::before, .rd-day::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.rd-turn { display: flex; align-items: center; gap: 12px; margin: 4px 0 2px; color: var(--text-4); font-size: 11.5px; font-variant-numeric: tabular-nums; user-select: none; }
+.rd-turn::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.rd-mark { display: flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-3); font-size: 12px; }
+.rd-mark > .i { color: var(--text-4); }
+.rd-mark > span { min-width: 0; overflow-wrap: anywhere; }
+.rd-mark code { font-family: var(--mono); font-size: 11.5px; color: var(--text-2); }
+.rd-mark .at { flex: none; color: var(--text-4); font-variant-numeric: tabular-nums; }
+.rd-run { color: var(--text-4); font-size: 12px; }
+.rd-fail { display: flex; align-items: flex-start; gap: 9px; padding: 8px 12px; border-radius: 8px; border: 1px solid color-mix(in oklch, var(--red) 38%, transparent); color: var(--text-2); font-size: 12.5px; }
+.rd-fail > .i { margin-top: 2px; color: var(--red); }
+.rd-fail > div { min-width: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* what the person typed: the one thing on the page that sits in a box */
+.rd-ask { margin-top: 10px; padding: 10px 14px 12px; border-radius: 10px; background: var(--fill); border: 1px solid var(--line); }
+.rd-who { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; color: var(--text-3); font-size: 11.5px; user-select: none; }
+.rd-who .who { font-weight: 600; color: var(--text-2); }
+.rd-who .at { font-variant-numeric: tabular-nums; }
+.rd-who .mini { margin-left: auto; opacity: 0; }
+.rd-ask:hover .rd-who .mini, .rd-who .mini:focus-visible { opacity: 1; }
+.rd-ask-text { line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.rd-ask-text.clamp { max-height: 12.4em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 68%, transparent); }
+.rd-ask .link { display: inline-block; margin-top: 6px; }
+
+/* what the model said, as it was written: paragraphs, headings, lists, tables, code */
+.rd-say { line-height: 1.6; overflow-wrap: anywhere; }
+.md p { margin: 0 0 .7em; white-space: pre-wrap; }
+.md > :last-child, .md li > :last-child, .md blockquote > :last-child { margin-bottom: 0; }
+.md-h { margin: 1.1em 0 .4em; font-weight: 600; letter-spacing: -0.012em; }
+.md > .md-h:first-child { margin-top: 0; }
+.md-h1 { font-size: 16px; }
+.md-h2 { font-size: 14.5px; }
+.md-h3, .md-h4 { font-size: 13px; }
+.md code { padding: 1px 5px; border-radius: 4px; background: rgba(255, 255, 255, .07); font-family: var(--mono); font-size: 12px; }
+.md-link { color: var(--accent); border-radius: 3px; text-decoration: underline; text-decoration-color: transparent; text-underline-offset: 2px; }
+.md-link:hover { text-decoration-color: currentColor; }
+.md-lists { margin: 0 0 .7em; }
+.md-lists ul, .md-lists ol { margin: 0; padding-left: 22px; }
+.md-lists li { margin: .15em 0; white-space: pre-wrap; }
+.md-lists li::marker { color: var(--text-3); }
+.md blockquote { margin: 0 0 .7em; padding: 1px 0 1px 12px; border-left: 2px solid var(--line-2); color: var(--text-2); }
+.md hr { height: 1px; margin: 1em 0; border: 0; background: var(--line); }
+.md-table { margin: 0 0 .8em; overflow-x: auto; }
+.md-table table { border-collapse: collapse; font-size: 12.5px; }
+.md-table th, .md-table td { padding: 5px 16px 5px 0; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.md-table th { color: var(--text-3); font-weight: 500; white-space: nowrap; }
+.md-pre { margin: .2em 0 .8em; border-radius: 8px; background: var(--well); border: 1px solid var(--line); overflow: hidden; }
+.md-pre-top { display: flex; align-items: center; justify-content: space-between; height: 26px; padding: 0 5px 0 12px; border-bottom: 1px solid var(--line); color: var(--text-4); font-size: 11px; user-select: none; }
+.md-code { margin: 0; padding: 10px 12px; overflow-x: auto; font: 12px/1.5 var(--mono); color: var(--text-2); white-space: pre; tab-size: 2; }
+.md-code .add { color: var(--green); }
+.md-code .del { color: var(--red); }
+.md-code .hunk { color: var(--text-4); }
+
+/* a tool call: one line, which unfolds into what it was given and what came back */
+.rd-tool, .rd-think { margin: -4px -8px; border-radius: 7px; }
+.rd-tool-head, .rd-think-head, .rd-note-head {
+  width: 100%; min-width: 0; height: 26px; display: flex; align-items: center; gap: 8px; padding: 0 8px; border-radius: 7px;
+  color: var(--text-3); font-size: 12px; white-space: nowrap; user-select: none;
+}
+button.rd-tool-head:hover, button.rd-think-head:hover, button.rd-note-head:hover { background: var(--hover); color: var(--text-2); }
+.t-name { flex: none; font-family: var(--mono); font-size: 11.5px; color: var(--text-2); }
+.t-what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.t-err { flex: none; color: var(--red); font-size: 11.5px; }
+.t-len { flex: none; color: var(--text-4); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.t-len.run { color: var(--text-2); }
+.rd-tool.run .t-name { color: var(--text); }
+.rd-tool.open { margin: 2px -8px; background: rgba(0, 0, 0, .16); box-shadow: inset 0 0 0 1px var(--line); }
+.rd-tool-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 10px 10px 28px; }
+.t-pre { position: relative; border-radius: 7px; background: var(--well); border: 1px solid var(--line); }
+.t-pre pre { margin: 0; max-height: 340px; padding: 8px 34px 8px 10px; overflow: auto; font: 11.5px/1.5 var(--mono); color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.t-pre.t-in pre { color: var(--text); }
+.t-pre.bad { border-color: color-mix(in oklch, var(--red) 38%, transparent); }
+.t-pre .mini { position: absolute; top: 4px; right: 5px; opacity: 0; }
+.t-pre:hover .mini, .t-pre .mini:focus-visible { opacity: 1; }
+.t-note { color: var(--text-3); font-size: 12px; }
+.t-note.bad { color: var(--red); }
+.rd-think-head { color: var(--text-4); }
+.rd-think.none .rd-think-head { height: 22px; }
+.rd-think-text { padding: 2px 10px 10px 28px; color: var(--text-3); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.rd-note { border-radius: 8px; border: 1px solid var(--line); }
+.rd-note-head { height: 30px; }
+.rd-note-head.plain { height: auto; padding: 8px 12px 0; white-space: normal; }
+.rd-note-text { padding: 4px 12px 10px; color: var(--text-2); font-size: 12.5px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.rd-note-text.md { white-space: normal; }
+
+/* a change to a file: the lines taken out and the lines put in */
+.diff { border-radius: 7px; border: 1px solid var(--line); background: var(--well); overflow: hidden; }
+.diff-head { display: flex; align-items: center; gap: 8px; min-width: 0; height: 30px; padding: 0 5px 0 10px; border-bottom: 1px solid var(--line); font-size: 12px; white-space: nowrap; user-select: none; }
+.diff-head > .i { color: var(--text-3); }
+.f-name { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.f-dir { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-4); font-family: var(--mono); font-size: 11px; }
+.delta { flex: none; display: inline-flex; gap: 6px; font-family: var(--mono); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.delta i { font-style: normal; }
+.delta .add { color: var(--green); }
+.delta .del { color: var(--red); }
+.diff-body { max-height: 440px; overflow: auto; padding: 4px 0; font: 11.5px/1.55 var(--mono); }
+.dl { display: grid; grid-template-columns: 38px 38px 18px minmax(0, 1fr); }
+.dl .ln { padding-right: 8px; text-align: right; color: var(--text-4); font-variant-numeric: tabular-nums; user-select: none; }
+.dl .sg { text-align: center; color: var(--text-4); user-select: none; }
+.dl .tx { padding-right: 10px; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 2; }
+.dl.ctx .tx { color: var(--text-3); }
+.dl.add { background: oklch(0.76 0.13 155 / 0.1); }
+.dl.add .sg { color: var(--green); }
+.dl.del { background: oklch(0.68 0.16 26 / 0.1); }
+.dl.del .sg { color: var(--red); }
+.dl.del .tx { color: var(--text-2); }
+.dl.meta .tx { color: var(--text-4); }
+.diff-body.plain .dl { grid-template-columns: 22px minmax(0, 1fr); }
+.diff-body.plain .ln { display: none; }
+.hunk-gap { height: 1px; margin: 4px 0; background: var(--line); }
+.diff-more { padding: 6px 10px 4px; color: var(--text-4); font-family: var(--font); font-size: 12px; }
+
+/* ---- the files it changed ---- */
+.changes { width: 100%; max-width: var(--col, 880px); margin: 0 auto; padding: 18px 24px 88px; display: flex; flex-direction: column; gap: 14px; user-select: text; }
+.chg-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chg-sum { display: flex; align-items: center; gap: 10px; font-weight: 600; }
+.chg-top .quiet { font-size: 12px; }
+.chg-list { display: flex; flex-direction: column; }
+.chg-file { border-top: 1px solid var(--line); }
+.chg-file:first-child { border-top: 0; }
+.chg-head { width: 100%; min-width: 0; height: 36px; display: flex; align-items: center; gap: 9px; padding: 0 6px; border-radius: 7px; font-size: 12.5px; white-space: nowrap; user-select: none; }
+.chg-head:hover { background: var(--hover); }
+.chg-head > .i:not(.caret) { color: var(--text-3); }
+.f-n, .f-at { flex: none; color: var(--text-4); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.f-n { width: 52px; text-align: right; }
+.f-at { width: 88px; text-align: right; }
+.chg-body { display: flex; flex-direction: column; gap: 8px; padding: 2px 0 14px 27px; }
+.chg-edit { display: flex; align-items: center; gap: 10px; margin-top: 4px; color: var(--text-3); font-size: 11.5px; font-variant-numeric: tabular-nums; user-select: none; }
+.chg-body > .diff-body { border-radius: 7px; border: 1px solid var(--line); background: var(--well); }
+.chg-foot { display: flex; gap: 6px; margin-left: -8px; }
+
+/* beside a terminal there is less room */
+.detail.compact .rd-bar { flex-wrap: wrap; padding: 8px 14px; }
+.detail.compact .rd-find { flex: 1 1 120px; }
+.detail.compact .rd-find .input { width: 100%; }
+.detail.compact .rd-list { padding: 8px 16px 64px; }
+.detail.compact .changes { padding: 14px 16px 64px; }
+.detail.compact .chg-head .f-dir, .detail.compact .chg-head .f-at { display: none; }
+.detail.compact .chg-head .f-name { flex: 1; }
+.detail.compact .dl { grid-template-columns: 0 30px 16px minmax(0, 1fr); }
+.detail.compact .dl .ln:first-child { visibility: hidden; padding: 0; }

@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- 'unsafe-inline' is for styles only: the terminal widget writes its colours and cell sizes into style tags.
+     data: is for the one small picture of the logo the main process hands over. The typeface is a file of the app. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'">
+<meta name="color-scheme" content="dark">
+<title>Perch Desk</title>
+<link rel="stylesheet" href="node_modules/@xterm/xterm/css/xterm.css">
+<link rel="stylesheet" href="styles/base.css">
+<link rel="stylesheet" href="styles/shell.css">
+<link rel="stylesheet" href="styles/views.css">
+<link rel="stylesheet" href="styles/reader.css">
+</head>
+<body>
+<!-- what lies between the window and the desktop behind it: solid, or thin enough for the blur Windows draws to show -->
+<div class="backdrop" aria-hidden="true"></div>
+<header class="titlebar" id="bar">
+  <div class="tb-start">
+    <button id="side-toggle" class="icon-btn" title="Show or hide the list of chats"></button>
+    <div class="brand"><img id="logo" alt=""><span>Perch</span></div>
+  </div>
+  <button id="jump" class="omni" title="Search chats, commands and what you typed (Ctrl+Shift+P)"></button>
+  <div class="tb-end">
+    <button id="refresh" class="icon-btn" aria-label="Look again now"></button>
+    <div id="split" class="seg tiles" role="group" aria-label="How many chats share the screen"></div>
+    <button id="triage" class="tb-need" title="Go to the chat that has waited longest (Ctrl+Shift+N)" hidden></button>
+    <button id="new-chat" class="btn sm" title="New chat (Ctrl+Shift+T)"></button>
+  </div>
+</header>
+<aside class="sidebar" id="side">
+  <div class="side-top">
+    <span id="side-label" class="nav-label">Chats</span>
+    <span id="side-n" class="side-n"></span>
+    <!-- once there are workspaces: one tab each, in place of the word above -->
+    <div id="spaces" class="spaces" role="tablist" aria-label="Workspaces" hidden></div>
+    <button id="side-more" class="icon-btn" title="New chat, a new workspace, or bring the chats of other terminals here"></button>
+  </div>
+  <div id="chat-list" class="nav"></div>
+  <p id="side-empty" class="side-hint">No chat is running on this machine. Start one with New chat.</p>
+  <div class="side-foot">
+    <div id="side-limit" class="side-limit" hidden></div>
+    <button id="acct" class="acct"></button>
+    <nav class="places" aria-label="Places">
+      <button id="go-history" class="nav-item" title="Every conversation kept on this machine (Ctrl+Shift+H)"></button>
+      <button id="go-stats" class="nav-item" title="Every number: your accounts, what is running, and what it all added up to (Ctrl+Shift+U)"></button>
+      <button id="open-settings" class="icon-btn" title="Settings (Ctrl+,)"></button>
+    </nav>
+  </div>
+</aside>
+<main class="stage" id="main">
+  <div id="notes" class="notes"></div>
+  <div class="views">
+    <section id="peek" class="view"></section>
+    <section id="history" class="view" hidden></section>
+    <section id="stats" class="view" hidden></section>
+    <section id="chat" class="view" hidden>
+      <div id="chat-body">
+        <div id="tiles"></div>
+        <aside id="inspector" hidden></aside>
+      </div>
+    </section>
+  </div>
+</main>
+<!-- where the terminals that are not on screen wait -->
+<div id="park" hidden></div>
+<div id="picker" class="scrim" hidden></div>
+<div id="palette" class="scrim" hidden></div>
+<div id="settings" class="scrim" hidden></div>
+<div id="leave" class="scrim" hidden></div>
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="toast" class="toast" role="status" hidden></div>
+<div id="tip" class="tip" role="tooltip" hidden></div>
+<script src="node_modules/@xterm/xterm/lib/xterm.js"></script>
+<script src="node_modules/@xterm/addon-fit/lib/addon-fit.js"></script>
+<script src="node_modules/@xterm/addon-unicode-graphemes/lib/addon-unicode-graphemes.js"></script>
+<script src="node_modules/@xterm/addon-webgl/lib/addon-webgl.js"></script>
+<script src="icons.js"></script>
+<script src="ui.js"></script>
+<script src="parts.js"></script>
+<script src="terminals.js"></script>
+<script src="reader.js"></script>
+<script src="detail.js"></script>
+<script src="history.js"></script>
+<script src="stats.js"></script>
+<script src="inspector.js"></script>
+<script src="side.js"></script>
+<script src="peek.js"></script>
+<script src="picker.js"></script>
+<script src="palette.js"></script>
+<script src="settings.js"></script>
+<script src="desk.js"></script>
+</body>
+</html>

@@ -1,0 +1,275 @@
+/* The window itself: the ground behind everything, the title bar, the sidebar with its one list of every chat,
+   the one panel the views sit in, the list-beside-a-pane layout of History, and the chats on screen, each in a
+   place of its own. */
+
+body {
+  display: grid;
+  grid-template-columns: var(--sidebar) minmax(0, 1fr);
+  grid-template-rows: var(--titlebar) minmax(0, 1fr);
+}
+body.no-side { grid-template-columns: 0 minmax(0, 1fr); }
+
+/* What lies between the window and the desktop. Solid by default. When the window was opened see-through
+   (html.glass), Windows draws the blurred desktop behind the page and this layer only tints it. Windows stops
+   drawing that blur while the window is not in front, so the layer closes up then. */
+.backdrop { position: fixed; inset: 0; z-index: -1; background: var(--bg); }
+html.glass { background: transparent; }
+html.glass .backdrop { background: rgba(11, 11, 12, .5); }
+html.glass .backdrop::after { content: ''; position: absolute; inset: 0; background: #0b0b0c; opacity: .92; transition: opacity 220ms var(--ease); }
+html.glass body.live .backdrop::after { opacity: 0; }
+
+/* ---- the title bar. All of it drags the window; the padding on the right keeps clear of the window's own
+   ---- three buttons, and the same on the left keeps the search box in the middle of the window. ---- */
+.titlebar {
+  position: relative; grid-column: 1 / -1;
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(180px, 460px) minmax(max-content, 1fr); align-items: center; column-gap: 12px;
+  padding: 0 146px; white-space: nowrap;
+  -webkit-app-region: drag;
+}
+.titlebar button { -webkit-app-region: no-drag; }
+.tb-start { position: absolute; left: 10px; top: 0; height: 100%; display: flex; align-items: center; gap: 8px; }
+.brand { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; letter-spacing: -0.01em; }
+.brand img { width: 18px; height: 18px; border-radius: 5px; }
+.omni {
+  grid-column: 2; min-width: 0; height: 28px; display: flex; align-items: center; gap: 8px; padding: 0 5px 0 10px;
+  border-radius: 8px; background: var(--fill); border: 1px solid var(--line); color: var(--text-3); font-size: 12.5px;
+}
+.omni:hover { background: var(--fill-2); color: var(--text-2); }
+.omni > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tb-end { grid-column: 3; display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.tb-need { flex: none; height: 24px; display: flex; align-items: center; gap: 6px; padding: 0 8px 0 6px; border-radius: 6px; font-size: 12px; font-weight: 500; }
+.tb-need:hover { background: var(--hover); }
+/* how many chats share the screen: one, two side by side, or four */
+#split button { width: 26px; padding: 0; display: grid; place-items: center; }
+
+/* ---- the sidebar: it sits on the window's ground, not in a box of its own. Every chat on the machine, once. ---- */
+.sidebar { grid-row: 2; grid-column: 1; min-height: 0; display: flex; flex-direction: column; padding: 0 8px 8px; }
+body.no-side .sidebar { display: none; }
+.side-top { flex: none; height: 30px; display: flex; align-items: center; gap: 6px; padding-left: 10px; }
+.nav-label { flex: none; font-size: 11.5px; font-weight: 500; color: var(--text-3); }
+.side-n { flex: 1; min-width: 0; color: var(--text-4); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.side-top .icon-btn { width: 24px; height: 24px; border-radius: 6px; }
+/* the workspaces: one tab each, in line with the rows under them; more than fit go on to a second line. The one
+   in front is lit; another says in yellow how many of its chats wait for the person. */
+.side-top:has(> .spaces:not([hidden])) { height: auto; min-height: 30px; align-items: flex-start; padding: 3px 0 5px 2px; }
+.spaces { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 2px; }
+.space-tab { flex: none; max-width: 100%; height: 24px; display: flex; align-items: center; gap: 5px; padding: 0 8px; border-radius: 6px; color: var(--text-3); font-size: 12px; font-weight: 500; white-space: nowrap; }
+.space-tab:hover { background: var(--hover); color: var(--text); }
+.space-tab.on { background: var(--active); color: var(--text); }
+/* what is in no workspace yet stands back: it is there to be emptied */
+.space-tab[data-space="?"]:not(.on) { color: var(--text-4); }
+.space-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.space-n { flex: none; color: var(--yellow); font-size: 11px; font-variant-numeric: tabular-nums; }
+.space-input { flex: none; width: 104px; height: 24px; padding: 0 7px; border-radius: 6px; border: 1px solid var(--accent); background: rgba(0, 0, 0, .3); box-shadow: 0 0 0 3px oklch(0.68 0.15 252 / 0.16); font-size: 12px; font-weight: 500; user-select: text; }
+.nav { flex: none; display: flex; flex-direction: column; gap: 1px; }
+.nav-item {
+  position: relative; flex: none; width: 100%; min-width: 0; height: 30px; display: flex; align-items: center; gap: 10px; padding: 0 10px;
+  border-radius: 6px; color: var(--text-2); font-weight: 500; white-space: nowrap;
+}
+.nav-item:hover { background: var(--hover); color: var(--text); }
+.nav-item.on { background: var(--active); color: var(--text); }
+.nav-item > .i { color: var(--text-3); }
+.nav-item:hover > .i, .nav-item.on > .i { color: var(--text-2); }
+.nav-item .label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#chat-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; margin-right: -6px; padding-right: 6px; gap: 0; }
+/* a group that folds can be squeezed to nothing: in a list that scrolls it keeps its own height */
+.sidebar .group { flex: none; }
+.sidebar .group-head { position: static; height: 26px; gap: 7px; padding: 0 10px; background: none; color: var(--text-3); font-size: 11.5px; }
+.sidebar .group-head::after { content: none; }
+.sidebar .group-head:hover { color: var(--text-2); }
+.sidebar .group-inner { display: flex; flex-direction: column; gap: 1px; padding-bottom: 6px; }
+.sidebar .group.folded .group-inner { padding-bottom: 0; }
+.nav-item.chat { height: 28px; gap: 9px; padding: 0 6px 0 10px; font-weight: 450; }
+.nav-item.chat .glyph { margin: 0 1px; }
+.nav-item.chat.k-ended { color: var(--text-3); }
+/* the chats on screen carry a mark at the edge; the one that holds the keyboard carries it in the accent */
+.nav-item.chat.shown { color: var(--text); }
+.nav-item.chat.shown::before { content: ''; position: absolute; left: 0; top: 7px; bottom: 7px; width: 2px; border-radius: 1px; background: var(--text-4); }
+.nav-item.chat.shown.on::before { background: var(--accent); }
+/* at the right end of a row: how long it has waited, or the RAM its programs hold */
+.nav-item.chat .when, .nav-item.chat .res { flex: none; font-size: 11px; font-variant-numeric: tabular-nums; }
+.nav-item.chat .when { color: var(--text-3); }
+.nav-item.chat .when.needs { color: var(--yellow); }
+.nav-item.chat .res { color: var(--text-4); }
+.nav-item.chat.on .res { color: var(--text-3); }
+.nav-item.chat .res:empty { display: none; }
+/* it runs in another terminal; in yellow once it is on its way here */
+.nav-item.chat .out { margin-right: 2px; color: var(--text-4); }
+.nav-item.chat .out.coming { color: var(--yellow); }
+/* a chat of this window gives that place to its close button under the pointer */
+.nav-item.chat .x { flex: none; width: 20px; height: 20px; display: none; place-items: center; border-radius: 5px; color: var(--text-3); }
+.nav-item.chat.k-here:hover .x, .nav-item.chat.k-here:focus-within .x { display: grid; }
+.nav-item.chat.k-here:hover .res, .nav-item.chat.k-here:focus-within .res,
+.nav-item.chat.k-here:hover .when, .nav-item.chat.k-here:focus-within .when { display: none; }
+.nav-item.chat .x:hover { background: var(--fill-2); color: var(--text); }
+.nav-item.chat.closing { opacity: .5; }
+.nav-item.chat.flash { animation: flash 1.3s var(--ease); }
+.side-all { align-self: flex-start; margin: 3px 0 0 33px; }
+.side-hint { margin: 2px 10px; color: var(--text-4); font-size: 12px; line-height: 1.45; }
+.side-foot { flex: none; padding-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+/* a usage limit that was reached, until it lifts */
+.side-limit { display: flex; align-items: center; gap: 8px; height: 30px; padding: 0 10px; border-radius: 8px; background: var(--fill); font-size: 12px; white-space: nowrap; }
+.side-limit > .i { color: var(--red); }
+.side-limit .words { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.side-limit .r { flex: none; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.side-limit .r b { font-weight: 500; color: var(--text-2); }
+/* the account in use: who, and two lines that fill */
+.acct { display: block; width: 100%; padding: 8px 10px 9px; border-radius: 8px; }
+.acct:hover { background: var(--hover); }
+.acct-top { display: flex; align-items: baseline; gap: 7px; margin-bottom: 6px; }
+.acct-top .acct-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 550; }
+.acct-plan { flex: none; font-size: 11.5px; color: var(--text-3); white-space: nowrap; }
+.slim { display: grid; grid-template-columns: 32px minmax(0, 1fr) 28px 46px; align-items: center; column-gap: 7px; height: 19px; font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.slim b { font-weight: 500; color: var(--text-2); text-align: right; }
+.slim .r { text-align: right; }
+.slim.none .r, .slim.fresh .r { grid-column: 3 / -1; }
+.slim.warm b { color: var(--yellow); }
+.slim.hot b { color: var(--red); }
+.acct-room { margin-top: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--text-3); }
+.acct-room b { font-weight: 500; color: var(--text-2); }
+/* the other places of the window: each as wide as its word, so neither is ever cut */
+.places { display: flex; align-items: center; gap: 2px; }
+.places .nav-item { width: auto; gap: 8px; padding: 0 9px; }
+.places .nav-item .label { flex: none; overflow: visible; }
+.places .icon-btn { margin-left: auto; }
+
+/* ---- the one panel the views sit in ---- */
+.stage {
+  position: relative; grid-row: 2; grid-column: 2; min-width: 0; min-height: 0; margin: 0 8px 8px 0; overflow: hidden;
+  display: flex; flex-direction: column;
+  border-radius: 12px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 10px 40px -16px rgba(0, 0, 0, .6);
+  container: stage / inline-size;
+}
+body.no-side .stage { margin-left: 8px; }
+/* what stands above every view while it matters: chats on their way here, last time's chats on offer, a list that stopped moving */
+.notes { flex: none; display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+.notes:not(:has(> :not([hidden]))) { display: none; }
+/* The panel is solid in a see-through window too: only the sidebar and the title bar let the desktop through.
+   What sticks to its top while a list scrolls (group headings, the reader's bar) is painted in the panel's
+   colour, and would show as a band on a panel that is not quite that colour. */
+.views { position: relative; flex: 1; min-height: 0; }
+.view { position: absolute; inset: 0; min-height: 0; display: flex; flex-direction: column; }
+
+/* ---- a list beside a pane: History ---- */
+.split { flex: 1; min-height: 0; display: flex; }
+.list-pane { flex: none; width: 420px; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+/* the title's row and the bar of the pane beside it are one line: 12px above, 28px tall */
+.list-top { flex: none; display: flex; flex-direction: column; gap: 10px; padding: 12px 14px 10px 16px; }
+.list-title { display: flex; align-items: center; gap: 8px; height: 28px; }
+.list-title h1 { font-size: 15px; font-weight: 600; letter-spacing: -0.012em; }
+.list-n { flex: 1; color: var(--text-3); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.list-top > .seg { align-self: flex-start; }
+.filter-box { position: relative; display: flex; align-items: center; }
+.filter-box > .i { position: absolute; left: 9px; color: var(--text-3); pointer-events: none; }
+.filter-box .input { width: 100%; padding: 0 30px; }
+.filter-box kbd { position: absolute; right: 6px; }
+.filter-box:focus-within kbd { display: none; }
+.list-scroll { flex: 1; min-height: 0; overflow-y: auto; padding: 0 4px 20px 8px; scrollbar-gutter: stable; }
+.list-foot { padding: 12px 10px 0; font-size: 12px; }
+
+.group-head {
+  position: sticky; top: 0; z-index: 1; width: 100%; height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 8px;
+  background: var(--panel); color: var(--text-2); font-size: 12px; font-weight: 500;
+}
+.group-head::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.group-head:hover { color: var(--text); }
+.g-n { color: var(--text-4); font-variant-numeric: tabular-nums; }
+.group-rows { display: grid; grid-template-rows: 1fr; transition: grid-template-rows 240ms var(--ease), opacity 200ms var(--ease); }
+.group-inner { min-height: 0; overflow: hidden; padding-bottom: 8px; }
+.group.folded .group-rows { grid-template-rows: 0fr; opacity: 0; }
+.group.folded .group-inner { visibility: hidden; padding-bottom: 0; transition: visibility 0s 240ms; }
+
+.row { position: relative; margin-top: 1px; border-radius: 8px; }
+.row:hover { background: var(--hover); }
+.row.sel { background: var(--active); box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .045); }
+/* a hairline between rows, which steps aside for the row under the pointer and for the one that is picked */
+.row + .row::before { content: ''; position: absolute; left: 35px; right: 10px; top: -1px; height: 1px; background: var(--line); }
+.row:hover::before, .row.sel::before, .row:hover + .row::before, .row.sel + .row::before { opacity: 0; }
+@keyframes flash { from { background: var(--fill-2); } }
+.row-main { display: grid; grid-template-columns: 14px minmax(0, 1fr); column-gap: 11px; align-items: start; padding: 9px 10px 10px; }
+.row-main > .glyph { margin-top: 3px; }
+.row-top { display: flex; align-items: baseline; gap: 8px; min-width: 0; white-space: nowrap; }
+.row-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.row-when { flex: none; margin-left: auto; font-size: 11.5px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.row-sub { display: flex; align-items: center; gap: 8px; min-width: 0; margin-top: 1px; font-size: 12px; color: var(--text-3); white-space: nowrap; }
+.row-say { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+
+.detail-pane { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.detail-pane > * { flex: 1; min-height: 0; }
+
+/* too narrow for both: the list by itself; a conversation that is picked takes the whole panel */
+@container stage (max-width: 860px) {
+  .split { display: block; overflow-y: auto; }
+  .list-pane { width: auto; border-right: 0; }
+  .list-scroll { overflow: visible; padding-bottom: 4px; }
+  .detail-pane { display: block; border-top: 1px solid var(--line); }
+  .view.has-sel .split { display: flex; overflow: hidden; }
+  .view.has-sel .list-pane { display: none; }
+  .view.has-sel .detail-pane { display: flex; border-top: 0; }
+}
+
+/* ---- the chats on screen: one, two side by side, or four. Each has a slim strip and, under it, its terminal.
+   ---- Beside them, when asked for, the panel of the chat that holds the keyboard. ---- */
+#chat-body { flex: 1; min-height: 0; display: flex; }
+/* the hairlines between the places are the ground showing through the gaps */
+#tiles { flex: 1; min-width: 0; min-height: 0; display: grid; gap: 1px; grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); background: var(--line); }
+#tiles[data-n="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+#tiles[data-n="3"], #tiles[data-n="4"] { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: repeat(2, minmax(0, 1fr)); }
+/* three: two above, the third across the foot */
+#tiles[data-n="3"] > .tile:nth-child(3) { grid-column: 1 / -1; }
+.tile { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--panel); }
+.tile-head { flex: none; height: 36px; display: flex; align-items: center; gap: 12px; padding: 0 5px 0 13px; border-bottom: 1px solid var(--line); white-space: nowrap; overflow: hidden; container: tile / inline-size; }
+/* with several chats on screen, the one that holds the keyboard says so */
+#tiles:not([data-n="1"]) .tile.on .tile-head { box-shadow: inset 0 2px 0 var(--accent); }
+#tiles:not([data-n="1"]) .tile:not(.on) .th-name { color: var(--text-2); }
+.tile:not(.on) .th-tools { opacity: .5; }
+.tile:not(.on):hover .th-tools { opacity: 1; }
+/* The name keeps the room its words need, up to a share of the strip, and never shrinks: a box even a fraction
+   of a pixel short of its text swaps the end of it for "…". What the chat is doing takes the room that is left
+   and is the one cut short when there is too little. */
+.th-id { flex: 0 0 auto; min-width: 0; max-width: 44%; display: flex; align-items: center; gap: 8px; }
+.th-name { min-width: 0; margin: 0 -5px; padding: 2px 5px; border-radius: 6px; overflow: hidden; text-overflow: ellipsis; font-size: 12.5px; font-weight: 600; }
+.th-name:hover { background: var(--hover); }
+.th-rename { width: 220px; max-width: 100%; height: 24px; margin: 0 -5px; padding: 0 5px; border-radius: 6px; border: 1px solid var(--accent); background: rgba(0, 0, 0, .3); box-shadow: 0 0 0 3px oklch(0.68 0.15 252 / 0.16); font-size: 12.5px; font-weight: 600; user-select: text; }
+/* where a name is too long for its share, the folder gives way before the name is cut */
+.th-folder { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; color: var(--text-3); font-size: 12px; }
+.th-doing { flex: 1 1 0; min-width: 0; display: flex; align-items: baseline; gap: 8px; overflow: hidden; color: var(--text-2); font-size: 12px; }
+.th-doing .words { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.th-doing.s-needs .words, .th-doing.s-error .words { color: var(--text); font-weight: 500; }
+.th-doing.s-needs .timer { color: var(--yellow); }
+.timer { flex: none; color: var(--text-3); font-size: 12px; font-variant-numeric: tabular-nums; }
+.timer.still { color: var(--yellow); }
+.timer b { font-weight: 500; color: var(--text-2); }
+.th-facts { flex: none; display: flex; align-items: center; }
+.th-tools { flex: none; display: flex; gap: 2px; }
+.th-tools .icon-btn { width: 26px; height: 26px; }
+.tile-body { flex: 1; min-width: 0; min-height: 0; padding: 8px 2px 6px 13px; overflow: hidden; }
+.term { height: 100%; }
+/* a place too narrow for everything: the folder goes first, then the word after the figure, then what it is doing */
+@container tile (max-width: 640px) {
+  .th-folder, .fact .w { display: none; }
+}
+@container tile (max-width: 400px) {
+  .th-doing { display: none; }
+  .th-id { flex: 1 1 0; max-width: none; }
+}
+#inspector { flex: none; width: 420px; min-height: 0; display: flex; flex-direction: column; border-left: 1px solid var(--line); }
+#inspector > div { flex: 1; min-height: 0; }
+#inspector > .insp-empty { flex: none; padding: 22px 18px; display: flex; flex-direction: column; gap: 6px; color: var(--text-2); }
+
+/* the facts of a session: a few words each, in one line */
+.fact { flex: none; display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.fact b { font-weight: 500; color: var(--text-2); }
+.fact > .i { color: var(--text-4); }
+.fact .track { width: 34px; }
+.fact.warm { color: var(--yellow); }
+.fact.hot { color: var(--red); }
+.cache.soon { color: var(--yellow); }
+.cache.cold { color: var(--text-4); }
+
+@container stage (max-width: 1080px) {
+  #inspector { width: 340px; }
+}
+@container stage (max-width: 880px) {
+  #inspector { width: 300px; }
+}

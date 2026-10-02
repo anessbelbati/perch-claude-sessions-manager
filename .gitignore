@@ -14,6 +14,9 @@ hud-boot.log
 icon-preview.png
 .osgrep
 
+# the desk app's downloaded parts (npm install brings them back)
+app/node_modules/
+
 # (bird chirps now ship in sounds/ - mixkit free license, see ATTRIBUTION)
 hud-answer.log
 hud-focus.log

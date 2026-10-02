@@ -6,6 +6,9 @@ hud-state.json
 hud-prefs.json
 hud-livesnap.json
 hud-livesnap.json.tmp
+hud-saves.json
+hud-saves.json.tmp
+hud-saves.json.bad
 hud-error.log
 hud-boot.log
 icon-preview.png

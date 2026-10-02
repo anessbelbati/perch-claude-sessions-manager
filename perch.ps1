@@ -2552,6 +2552,9 @@ $xaml = @"
           <TextBlock x:Name="MiniBtn" Text="&#xE738;" FontFamily="Segoe MDL2 Assets" FontSize="11" Padding="6,4"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="compact mode (double-click the header works too)"/>
+          <TextBlock x:Name="SaveBtn" Text="&#xE74E;" FontFamily="Segoe MDL2 Assets" FontSize="12" Padding="6,4"
+                     Style="{StaticResource HudIconButton}" Margin="2,0"
+                     ToolTip="saved states - save the open sessions, reopen them later"/>
           <TextBlock x:Name="GearBtn" Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="12" Padding="6,4"
                      Style="{StaticResource HudIconButton}" Margin="2,0"
                      ToolTip="settings"/>
@@ -2652,6 +2655,7 @@ $script:PinBtn      = $Window.FindName('PinBtn')
 $script:CloseBtn    = $Window.FindName('CloseBtn')
 $script:GearBtn     = $Window.FindName('GearBtn')
 $script:MiniBtn     = $Window.FindName('MiniBtn')
+$script:SaveBtn     = $Window.FindName('SaveBtn')
 $script:Divider     = $Window.FindName('Divider')
 $script:RowsScroll  = $Window.FindName('RowsScroll')
 # ---------------------------------------------------- crash insurance --
@@ -2681,7 +2685,8 @@ try {
                 (Test-Path -LiteralPath ([string]$p.cwd))) {
                 [void]$script:RestorePending.Add(@{
                     Id = [string]$p.id; Cwd = [string]$p.cwd; Name = [string]$p.name
-                    Flags = [string]$p.flags })   # absent in old snapshots -> ''
+                    Flags = [string]$p.flags       # absent in old snapshots -> ''
+                    Provider = $(if ([string]$p.provider -eq 'codex') { 'codex' } else { 'claude' }) })
             }
         }
     }
@@ -2716,7 +2721,7 @@ function Update-RestoreBar {
     if ($script:RestoreBar.Visibility -ne 'Visible') { $script:RestoreBar.Visibility = 'Visible' }
 }
 $script:PermFlagsByPid = @{}   # pid -> permission flags the session was LAUNCHED with (one cmdline query per pid, ever)
-function Get-SessionPermFlags([int]$AgentPid) {
+function Get-SessionPermFlags([int]$AgentPid, [string]$Provider = 'claude') {
     # a bypass-permissions fleet restored into DEFAULT mode is a downgrade
     # trap: every restored session starts blocking on prompts the user never
     # sees. Read the live process's command line ONCE and remember exactly
@@ -2726,7 +2731,12 @@ function Get-SessionPermFlags([int]$AgentPid) {
     $flags = ''
     try {
         $cl = [string](Get-CimInstance Win32_Process -Filter "ProcessId = $AgentPid" -ErrorAction Stop).CommandLine
-        if ($cl -match '--dangerously-skip-permissions') { $flags = '--dangerously-skip-permissions' }
+        if ($Provider -eq 'codex') {
+            # each CLI spells "don't ask me" its own way; a claude flag on a
+            # codex command line is a tab that dies on an argument error
+            if ($cl -match '--dangerously-bypass-approvals-and-sandbox|--yolo\b') { $flags = '--dangerously-bypass-approvals-and-sandbox' }
+        }
+        elseif ($cl -match '--dangerously-skip-permissions') { $flags = '--dangerously-skip-permissions' }
         elseif ($cl -match '--permission-mode[= ]+([A-Za-z]+)') { $flags = '--permission-mode ' + $Matches[1] }
     }
     catch { }
@@ -2740,7 +2750,11 @@ function Invoke-ResumeSession($P) {
     # default mode). cmd /k keeps the tab (and any resume error) visible
     # instead of vanishing on failure.
     try {
-        $cmd = 'claude --resume ' + $P.Id
+        # a codex session id is a UUID too, so the snapshot always let codex
+        # rows in - and then fed them to `claude --resume`, which can only
+        # answer "no conversation found". Each CLI resumes its own.
+        if ([string]$P.Provider -eq 'codex') { $cmd = 'codex resume ' + $P.Id }
+        else { $cmd = 'claude --resume ' + $P.Id }
         if (-not [string]::IsNullOrWhiteSpace([string]$P.Flags)) { $cmd += ' ' + [string]$P.Flags }
         # YOUR shell, your rules (settings -> resume shell). Every choice
         # keeps the tab alive on failure: /k for cmd, -NoExit for the
@@ -2817,6 +2831,292 @@ $script:RestoreDismiss.Add_MouseLeftButtonUp({
     # it can't re-offer after the NEXT reboot (the writer rebuilds it live)
     try { Remove-Item -LiteralPath $SnapPath -Force -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 })
+# ------------------------------------------------------- saved states --
+# crash insurance remembers the fleet by accident; this remembers it on
+# PURPOSE. The header's save button stores the live claude sessions under a
+# name in hud-saves.json, and the same menu reopens a saved state later
+# through the exact relaunch path crash insurance uses (same stagger, same
+# one-window wait, same inherited permission flags). Sessions that are
+# already running are skipped, so reopening twice never doubles a session.
+# Manual only, like everything here that launches a process.
+$SavesPath = Join-Path $PSScriptRoot 'hud-saves.json'
+$script:ReopenedAt = @{}   # id -> when WE launched it: covers the seconds before a resumed session shows up live
+function Write-SavesError([string]$What, $Err) {
+    try {
+        "$(Get-Date -Format s)  saves ($What): $Err" |
+            Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -ErrorAction SilentlyContinue
+    }
+    catch { }
+}
+function Read-SavedStates {
+    # these records end up on a command line (Invoke-ResumeSession), so every
+    # field is checked on the way IN: anything that is not a plain session
+    # id, a known permission flag and a quote-free folder never reaches a shell
+    $out = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $SavesPath)) { return $out }
+    try {
+        $doc = Get-Content -LiteralPath $SavesPath -Raw | ConvertFrom-Json
+        foreach ($sv in @($doc.saves)) {
+            if ($null -eq $sv -or [string]::IsNullOrWhiteSpace([string]$sv.name)) { continue }
+            $list = New-Object System.Collections.ArrayList
+            foreach ($p in @($sv.sessions)) {
+                if ($null -eq $p) { continue }
+                $id = [string]$p.id; $cwd = [string]$p.cwd; $fl = [string]$p.flags
+                if ($id -notmatch '^[0-9a-fA-F-]{32,}$') { continue }
+                if ([string]::IsNullOrWhiteSpace($cwd) -or $cwd.IndexOf('"') -ge 0) { continue }
+                $prov = $(if ([string]$p.provider -eq 'codex') { 'codex' } else { 'claude' })
+                if ($prov -eq 'codex') {
+                    if ($fl -ne '--dangerously-bypass-approvals-and-sandbox') { $fl = '' }
+                }
+                elseif ($fl -ne '' -and $fl -ne '--dangerously-skip-permissions' -and
+                    $fl -notmatch '^--permission-mode [A-Za-z]+$') { $fl = '' }
+                $label = [string]$p.label
+                if ([string]::IsNullOrWhiteSpace($label)) { $label = Split-Path -Leaf $cwd }
+                [void]$list.Add(@{ Id = $id; Cwd = $cwd; Name = $label; Flags = $fl; Provider = $prov })
+            }
+            [void]$out.Add(@{ Name = [string]$sv.name; SavedAt = [string]$sv.savedAt; Sessions = $list })
+        }
+    }
+    catch {
+        # an unreadable file must not be silently overwritten by the next
+        # save: park a copy first, then carry on with whatever parsed
+        Write-SavesError 'read' $_
+        try { Copy-Item -LiteralPath $SavesPath -Destination ($SavesPath + '.bad') -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    return $out
+}
+function Write-SavedStates($Saves) {
+    $docSaves = @()
+    foreach ($sv in @($Saves)) {
+        $sess = @()
+        foreach ($p in @($sv.Sessions)) {
+            $sess += , @{ id = $p.Id; cwd = $p.Cwd; label = $p.Name; flags = $p.Flags; provider = $p.Provider }
+        }
+        $docSaves += , @{ name = $sv.Name; savedAt = $sv.SavedAt; sessions = $sess }
+    }
+    $tmp = $SavesPath + '.tmp'
+    @{ saves = $docSaves } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $tmp -Encoding UTF8
+    Move-Item -LiteralPath $tmp -Destination $SavesPath -Force
+}
+function Save-CurrentState([string]$Name) {
+    # source = the tick's own live list: exactly the claude sessions on the
+    # card right now, without the grace ledger's recently-dead
+    $sess = New-Object System.Collections.ArrayList
+    foreach ($rec in @($script:SnapLastLive.Values)) {
+        # an un-named tab's title is the shell's own path
+        # ("C:\WINDOWS\system32\cmd.exe") - the folder name says more
+        $label = ([string]$rec.label).Trim()
+        if ($label -eq '' -or $label -match '\.exe$') { $label = [string]$rec.name }
+        [void]$sess.Add(@{ Id = [string]$rec.id; Cwd = [string]$rec.cwd; Name = $label; Flags = [string]$rec.flags
+                           Provider = $(if ([string]$rec.provider -eq 'codex') { 'codex' } else { 'claude' }) })
+    }
+    if ($sess.Count -eq 0) { return 0 }
+    $saves = New-Object System.Collections.ArrayList
+    foreach ($sv in @(Read-SavedStates)) {
+        if ([string]$sv.Name -ne $Name) { [void]$saves.Add($sv) }   # -ne ignores case: same name = overwrite
+    }
+    $saves.Insert(0, @{ Name = $Name; SavedAt = (Get-Date).ToString('o'); Sessions = $sess })
+    Write-SavedStates $saves
+    return $sess.Count
+}
+function Remove-SavedState([string]$Name) {
+    $saves = New-Object System.Collections.ArrayList
+    foreach ($sv in @(Read-SavedStates)) {
+        if ([string]$sv.Name -ne $Name) { [void]$saves.Add($sv) }
+    }
+    Write-SavedStates $saves
+}
+function Test-SessionTranscript([string]$Id, [string]$Provider = 'claude') {
+    # the CLIs delete old conversation files on their own schedule, and a
+    # resume on a vanished one opens a tab that holds nothing but an error.
+    # claude: ~/.claude/projects/<folder>/<id>.jsonl
+    # codex : ~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-<stamp>-<id>.jsonl
+    try {
+        if ($Provider -eq 'codex') {
+            $root = Join-Path $env:USERPROFILE '.codex\sessions'
+            $pattern = Join-Path $root ('*\*\*\*' + $Id + '.jsonl')
+        }
+        else {
+            $root = Join-Path $env:USERPROFILE '.claude\projects'
+            $pattern = Join-Path $root ('*\' + $Id + '.jsonl')
+        }
+        if (-not (Test-Path -LiteralPath $root)) { return $true }   # can't tell = let the CLI answer
+        $hit = Get-ChildItem -Path $pattern -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        return ($null -ne $hit)
+    }
+    catch { return $true }
+}
+function Invoke-ReopenState($Save) {
+    $go = 0; $open = 0; $gone = 0
+    $busy = @{}
+    foreach ($q in @($script:RestoreQueue.ToArray())) { $busy[[string]$q.Id] = $true }
+    foreach ($k in @($script:ReopenedAt.Keys)) {
+        if (((Get-Date) - $script:ReopenedAt[$k]).TotalSeconds -lt 180) { $busy[[string]$k] = $true }
+        else { [void]$script:ReopenedAt.Remove($k) }
+    }
+    foreach ($p in @($Save.Sessions)) {
+        $id = [string]$p.Id
+        if ($script:SnapLastLive.ContainsKey($id) -or $busy.ContainsKey($id)) { $open++; continue }
+        if (-not (Test-Path -LiteralPath ([string]$p.Cwd)) -or
+            -not (Test-SessionTranscript $id ([string]$p.Provider))) { $gone++; continue }
+        [void]$script:RestoreQueue.Enqueue($p)
+        $busy[$id] = $true
+        $script:ReopenedAt[$id] = Get-Date
+        $go++
+    }
+    # a drain already running (crash-insurance resume all) picks these up on
+    # its own; otherwise start one exactly the way the restore bar does
+    if ($go -gt 0 -and -not $script:RestoreTimer.IsEnabled) {
+        $script:RestoreWaitStart = Get-Date
+        Invoke-ResumeSession $script:RestoreQueue.Dequeue()
+        if ($script:RestoreQueue.Count -gt 0) { $script:RestoreTimer.Start() }
+    }
+    return @{ Go = $go; Open = $open; Gone = $gone }
+}
+function Get-AgoText([string]$Iso) {
+    try {
+        $age = (Get-Date) - [datetime]::Parse($Iso, $null, [System.Globalization.DateTimeStyles]::RoundtripKind)
+        if ($age.TotalDays -ge 2) { return ('{0}d ago' -f [int][Math]::Floor($age.TotalDays)) }
+        if ($age.TotalHours -ge 1) { return ('{0}h ago' -f [int][Math]::Floor($age.TotalHours)) }
+        return ('{0}min ago' -f [int][Math]::Max(1, [Math]::Floor($age.TotalMinutes)))
+    }
+    catch { return '' }
+}
+function Show-SavesMenu {
+    # one flat menu: HudMenuItem's template has no submenu popup, so every
+    # saved state is a single row - click = reopen, its own x = delete
+    $menu = New-Object System.Windows.Controls.ContextMenu
+    $menu.Style = $script:Window.FindResource('HudMenu')
+    # a menu inherits its font from the element it hangs off, and SaveBtn is
+    # drawn in the ICON font (Segoe MDL2 Assets), which has no letters: every
+    # word in the menu rendered as tofu squares until the font was pinned
+    $menu.FontFamily = $script:Window.FontFamily
+    $miStyle = $script:Window.FindResource('HudMenuItem')
+    $liveN = $script:SnapLastLive.Count
+
+    $miSave = New-Object System.Windows.Controls.MenuItem
+    $miSave.Style = $miStyle
+    if ($liveN -gt 0) { $miSave.Header = ('Save open sessions ({0})...' -f $liveN) }
+    else { $miSave.Header = 'Save open sessions (none open)'; $miSave.IsEnabled = $false; $miSave.Opacity = 0.45 }
+    $miSave.Add_Click({
+        param($s, $e)
+        try {
+            $def = (Get-Date).ToString('ddd d MMM HH:mm').ToLower()
+            $name = Show-RenameDialog $def 'name this saved state' 'Enter = save   Esc = cancel   same name = overwrite'
+            if ($null -eq $name) { return }
+            $name = $name.Trim()
+            if ($name -eq '') { $name = $def }
+            $n = Save-CurrentState $name
+            if ($n -gt 0) {
+                Show-BirdBubble ('saved {0} session{1} as "{2}"' -f $n, $(if ($n -eq 1) { '' } else { 's' }), $name)
+            }
+        }
+        catch { Write-SavesError 'save' $_ }
+    })
+    [void]$menu.Items.Add($miSave)
+
+    # a Separator, not a bare Border: a menu wraps anything that is not a
+    # MenuItem/Separator in a default MenuItem, which turned a 1px rule into
+    # a tall, hoverable, empty row
+    $rule = New-Object System.Windows.Controls.Separator
+    $rule.Template = [System.Windows.Markup.XamlReader]::Parse(
+        '<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Separator">' +
+        '<Border Height="1" Background="#1FFFFFFF" Margin="9,4,9,4"/></ControlTemplate>')
+    [void]$menu.Items.Add($rule)
+
+    $saves = @(Read-SavedStates)
+    if ($saves.Count -eq 0) {
+        $miNone = New-Object System.Windows.Controls.MenuItem
+        $miNone.Style = $miStyle
+        $miNone.Header = 'no saved states yet'
+        $miNone.IsEnabled = $false
+        $miNone.Opacity = 0.45
+        [void]$menu.Items.Add($miNone)
+    }
+    foreach ($sv in $saves) {
+        $total = @($sv.Sessions).Count
+        $openN = 0
+        $tip = ''
+        foreach ($p in @($sv.Sessions)) {
+            $isOpen = $script:SnapLastLive.ContainsKey([string]$p.Id)
+            if ($isOpen) { $openN++ }
+            $tip += ('  ' + $p.Name + '  -  ' + $p.Cwd + $(if ($isOpen) { '  (open now)' } else { '' }) + "`n")
+        }
+        $meta = ('{0} session{1}' -f $total, $(if ($total -eq 1) { '' } else { 's' }))
+        if ($openN -gt 0) { $meta += $script:Sep + ('{0} open' -f $openN) }
+        $ago = Get-AgoText ([string]$sv.SavedAt)
+        if ($ago) { $meta += $script:Sep + $ago }
+
+        $grid = New-Object System.Windows.Controls.Grid
+        $grid.MinWidth = 200
+        $c0 = New-Object System.Windows.Controls.ColumnDefinition
+        $c0.Width = New-Object System.Windows.GridLength(1, [System.Windows.GridUnitType]::Star)
+        $c1 = New-Object System.Windows.Controls.ColumnDefinition
+        $c1.Width = [System.Windows.GridLength]::Auto
+        [void]$grid.ColumnDefinitions.Add($c0)
+        [void]$grid.ColumnDefinitions.Add($c1)
+
+        $tb = New-Object System.Windows.Controls.TextBlock
+        $tb.TextTrimming = 'CharacterEllipsis'
+        $tb.MaxWidth = 250
+        $tb.VerticalAlignment = 'Center'
+        $rName = New-Object System.Windows.Documents.Run -ArgumentList ([string][char]0x21BB + ' ' + [string]$sv.Name)
+        $rMeta = New-Object System.Windows.Documents.Run -ArgumentList ('   ' + $meta)
+        $rMeta.Foreground = Get-Brush '#8A8A93'
+        $rMeta.FontSize = 10.5
+        [void]$tb.Inlines.Add($rName)
+        [void]$tb.Inlines.Add($rMeta)
+        [void]$grid.Children.Add($tb)
+
+        $x = New-Object System.Windows.Controls.TextBlock
+        $x.Text = [string][char]0x2715
+        $x.FontSize = 10
+        $x.Foreground = Get-Brush '#6E6E78'
+        $x.Padding = New-Object System.Windows.Thickness(12, 1, 0, 1)
+        $x.VerticalAlignment = 'Center'
+        $x.Cursor = [System.Windows.Input.Cursors]::Hand
+        $x.ToolTip = 'delete this saved state (the sessions themselves are untouched)'
+        $x.Tag = @{ Name = [string]$sv.Name; Menu = $menu }
+        # swallow BOTH halves of the press or the row underneath reads it as
+        # its own click and reopens the state you were trying to delete
+        $x.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+        $x.Add_MouseLeftButtonUp({
+            param($s, $e)
+            $e.Handled = $true
+            try { Remove-SavedState ([string]$s.Tag.Name) }
+            catch { Write-SavesError 'delete' $_ }
+            $s.Tag.Menu.IsOpen = $false
+        })
+        [System.Windows.Controls.Grid]::SetColumn($x, 1)
+        [void]$grid.Children.Add($x)
+
+        $mi = New-Object System.Windows.Controls.MenuItem
+        $mi.Style = $miStyle
+        $mi.Header = $grid
+        $mi.Tag = $sv
+        $mi.ToolTip = ("click = reopen every session below that is not already open, each in its own terminal tab:`n" + $tip).TrimEnd()
+        $mi.Add_Click({
+            param($s, $e)
+            try {
+                $r = Invoke-ReopenState $s.Tag
+                $parts = @()
+                if ($r.Go -gt 0) { $parts += ('reopening {0}' -f $r.Go) }
+                if ($r.Open -gt 0) { $parts += ('{0} already open' -f $r.Open) }
+                if ($r.Gone -gt 0) { $parts += ('{0} gone (folder or chat history deleted)' -f $r.Gone) }
+                Show-BirdBubble ($parts -join $script:Sep)
+            }
+            catch { Write-SavesError 'reopen' $_ }
+        })
+        [void]$menu.Items.Add($mi)
+    }
+
+    $menu.Add_Opened({ $script:UiHold++; $script:UiHoldStamp = Get-Date })
+    $menu.Add_Closed({ $script:UiHold = [Math]::Max(0, $script:UiHold - 1) })
+    $menu.PlacementTarget = $script:SaveBtn
+    $menu.Placement = 'Bottom'
+    $menu.IsOpen = $true
+}
 $script:RootCard    = $Window.FindName('RootCard')
 $script:PillCard    = $Window.FindName('PillCard')
 $script:GlassDome   = $Window.FindName('GlassDome')
@@ -4815,7 +5115,11 @@ catch { Add-Content -LiteralPath (Join-Path $PSScriptRoot 'hud-error.log') -Valu
 Apply-Theme   # brushes now; the acrylic backdrop needs an hwnd, so once more:
 $Window.Add_SourceInitialized({ try { Set-GlassBackdrop ($script:ThemeName -eq 'glass') } catch { } })
 
-function Show-RenameDialog([string]$Current) {
+function Show-RenameDialog([string]$Current, [string]$Caption = 'rename session',
+                           [string]$KeysLine = 'Enter = save   empty = reset   Esc = cancel') {
+    # parameter names must NOT collide with the locals below: PowerShell
+    # variables ignore case, so a [string]$Title parameter IS $title - the
+    # TextBlock assigned to it got flattened to a string and '.Text' blew up
     $script:RenameResult = $null
     $dlg = New-Object System.Windows.Window
     $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
@@ -4836,7 +5140,7 @@ function Show-RenameDialog([string]$Current) {
     $stack.Width = 230
 
     $title = New-Object System.Windows.Controls.TextBlock
-    $title.Text = 'rename session'
+    $title.Text = $Caption
     $title.FontSize = 11
     $title.Foreground = Get-Brush '#8A8A93'
     $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
@@ -4865,7 +5169,7 @@ function Show-RenameDialog([string]$Current) {
     [void]$stack.Children.Add($box)
 
     $hint = New-Object System.Windows.Controls.TextBlock
-    $hint.Text = 'Enter = save   empty = reset   Esc = cancel'
+    $hint.Text = $KeysLine
     $hint.FontSize = 10
     $hint.Foreground = Get-Brush '#6E6E78'
     $hint.Margin = New-Object System.Windows.Thickness(0, 8, 0, 0)
@@ -7375,8 +7679,11 @@ function Update-List {
         if (($s.Provider -eq 'claude' -or $s.Id -match '^[0-9a-fA-F-]{32,}$') -and
             -not [string]::IsNullOrWhiteSpace($s.Id) -and
             -not [string]::IsNullOrWhiteSpace($s.Cwd)) {
+            $snapProv = $(if ([string]$s.Provider -eq 'codex') { 'codex' } else { 'claude' })
             $snapList += , @{ id = $s.Id; cwd = $s.Cwd; name = $s.CwdName
-                              flags = (Get-SessionPermFlags ([int]$s.AgentPid)) }
+                              label = [string]$s.DisplayName
+                              provider = $snapProv
+                              flags = (Get-SessionPermFlags ([int]$s.AgentPid) $snapProv) }
             $liveSnapIds[[string]$s.Id] = $true
         }
     }
@@ -7623,6 +7930,8 @@ $CloseBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $GearBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $script:MiniBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
 $GearBtn.Add_MouseLeftButtonUp({ Show-SettingsDialog })
+$script:SaveBtn.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
+$script:SaveBtn.Add_MouseLeftButtonUp({ Show-SavesMenu })
 $script:MiniBtn.Add_MouseLeftButtonUp({
     Set-CompactMode (-not $script:Compact)
     Save-HudState

@@ -820,6 +820,14 @@ try {
     $needCapture = ($eventName -eq "SessionStart") -or
                    ($eventName -eq "UserPromptSubmit") -or
                    ($eventName -notin @("SessionEnd", "PreCompact") -and -not $hasConsoleHint -and -not $headless)
+    # A window that embeds its own terminal says so (AGENTFOCUS_HOST): the
+    # session has no Windows Terminal tab, so there is nothing to capture.
+    # Such a session never earns a console hint, which made the line above
+    # re-run the whole capture - three tab scans plus the ancestry walk,
+    # 2.2s measured - on EVERY event: each finished turn, each notification,
+    # and each tool call for providers that send PreToolUse (codex).
+    $hostedElsewhere = -not [string]::IsNullOrWhiteSpace($env:AGENTFOCUS_HOST)
+    if ($hostedElsewhere) { $needCapture = $false }
 
     # pin the session's identity to its ORIGINAL folder: agents cd around
     # (docs/webapp/pages...) and a changing name makes rows jump in viewers
@@ -995,6 +1003,17 @@ try {
             $rewrite = $true
         }
         # $null = attach failed entirely -> keep whatever we had
+    }
+    elseif ($hostedElsewhere -and $eventName -eq "SessionStart") {
+        # no tab to find, but the capture also decided two things that still
+        # matter here. A helper (a claude spawned by a claude) must stay hidden
+        # from viewers: one ancestry walk at birth, the same verdict the capture
+        # would have reached. And a conversation RESUMED here from a Windows
+        # Terminal tab still carries that dead tab's hint: drop it, or viewers
+        # keep refreshing and focusing a tab the session no longer lives in.
+        $headless = $(if ($agentPid -gt 0) { Test-IsSubagent -AgentPid $agentPid } else { $false })
+        $window = $null
+        $rewrite = $true
     }
     elseif ($null -ne $window -and $eventName -ne "SessionEnd" -and
             ([string]$window.captured_event) -like "*+console") {

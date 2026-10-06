@@ -50,8 +50,6 @@ $script:ThemeName = 'midnight'   # any key of $script:ThemeSpecs (catalog below;
 $script:MascotPack = 'bird'      # 'bird' = built-in (root logo.png + assets\bird\); else assets\mascots\<name>\
 $script:ResumeShell = 'cmd'      # shell for restored session tabs: cmd | powershell | pwsh (settings dropdown)
 $script:BubblesOn = $true        # speech bubbles (hello + quips); settings toggle
-$script:AcctDisclaimerOk = $false
-$script:AcctPanel = $null
 try {
     if (Test-Path -LiteralPath $CfgPath) {
         $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json
@@ -70,7 +68,6 @@ try {
             if ($rs -in @('cmd', 'powershell', 'pwsh')) { $script:ResumeShell = $rs }
         }
         if ($null -ne $cfg.PSObject.Properties['SpeechBubbles']) { $script:BubblesOn = [bool]$cfg.SpeechBubbles }
-        if ($null -ne $cfg.PSObject.Properties['AccountsDisclaimerOk']) { $script:AcctDisclaimerOk = [bool]$cfg.AccountsDisclaimerOk }
         if ($cfg.PSObject.Properties['AgentProcessNames'] -and $cfg.AgentProcessNames) {
             $AgentProcNames = @($cfg.AgentProcessNames | ForEach-Object { [string]$_ })
         }
@@ -2630,7 +2627,6 @@ $script:Window      = [System.Windows.Markup.XamlReader]::Parse($xaml)
 $script:SessionList = $Window.FindName('SessionList')
 $script:ChipsPanel  = $Window.FindName('ChipsPanel')
 $script:LimitsPanel = $Window.FindName('LimitsPanel')
-$script:UsageFetchStamp = [datetime]::MinValue
 $script:BlocksSpawnStamp = [datetime]::MinValue
 $script:BlocksProc = $null           # blocks-probe child (never overlap scans)
 $script:BlocksFileLWT = [datetime]::MinValue
@@ -2640,9 +2636,7 @@ $script:BlockCalib = New-Object System.Collections.ArrayList   # {Tok;Pct;At}: o
 $script:UsageHist = @{}      # limit label -> samples of (T, Pct) for burn-rate math
 $script:LimitAlerted = @{}   # limit label -> chirped-at-90 flag (cleared on reset)
 $script:LastUsageKey = ''
-$script:UsageFileLWT = [datetime]::MinValue
 $script:LimitsRenderStamp = [datetime]::MinValue
-$script:UsageParsed = $null            # cached endpoint snapshot (parse once per file write)
 $script:LastOfficial = $null           # last good statusline-sourced limits
 $script:LastOfficialStamp = [datetime]::MinValue
 $script:LimitsKey = ''                 # content key: rebuild only on real change
@@ -5346,337 +5340,6 @@ function New-DialogButton([string]$Text, [bool]$Primary) {
     return $b
 }
 
-# ---------- claude account switcher ----------
-# Switch which of YOUR paid Claude subscriptions new sessions use. Manual
-# only, on purpose: no auto-rotation, no multi-account parallelism - just
-# the login dance you already do by hand, without the dance. Tokens come
-# from `claude setup-token` (official, 1-year lifetime) and are stored
-# DPAPI-encrypted; a `claude` profile function injects the active one via
-# CLAUDE_CODE_OAUTH_TOKEN (documented to take precedence) at every launch.
-$script:AcctPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\accounts.json'
-
-function Get-Accounts {
-    try {
-        if (Test-Path -LiteralPath $script:AcctPath) {
-            $a = Get-Content -LiteralPath $script:AcctPath -Raw | ConvertFrom-Json
-            if ($null -ne $a) {
-                if ($null -eq $a.PSObject.Properties['active']) { $a | Add-Member -NotePropertyName active -NotePropertyValue '' }
-                if ($null -eq $a.PSObject.Properties['accounts']) { $a | Add-Member -NotePropertyName accounts -NotePropertyValue @() }
-                return $a
-            }
-        }
-    }
-    catch { }
-    return [pscustomobject]@{ active = ''; accounts = @() }
-}
-
-function Save-Accounts($Data) {
-    try {
-        $Data.accounts = @($Data.accounts)   # keep it an ARRAY through PS 5.1 json round-trips
-        $Data | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:AcctPath -Encoding UTF8
-    }
-    catch { }
-}
-
-function Protect-AccountToken([string]$Plain) {
-    Add-Type -AssemblyName System.Security
-    return [Convert]::ToBase64String([System.Security.Cryptography.ProtectedData]::Protect(
-        [System.Text.Encoding]::UTF8.GetBytes($Plain), $null,
-        [System.Security.Cryptography.DataProtectionScope]::CurrentUser))
-}
-
-function Install-ClaudeLauncher {
-    # a `claude` function in the PowerShell profile(s): reads the ACTIVE
-    # account at every launch and injects its token via CLAUDE_CODE_OAUTH_TOKEN.
-    # Same command you always type; marker-guarded so it installs once.
-    $block = @'
-
-# >>> perch account launcher >>>
-function claude {
-    try {
-        $acctFile = Join-Path $env:LOCALAPPDATA 'AgentFocus\accounts.json'
-        if (Test-Path -LiteralPath $acctFile) {
-            $aj = Get-Content -LiteralPath $acctFile -Raw | ConvertFrom-Json
-            $act = @($aj.accounts) | Where-Object { $_.id -eq $aj.active } | Select-Object -First 1
-            if ($null -ne $act -and $act.token) {
-                Add-Type -AssemblyName System.Security
-                $env:CLAUDE_CODE_OAUTH_TOKEN = [System.Text.Encoding]::UTF8.GetString(
-                    [System.Security.Cryptography.ProtectedData]::Unprotect(
-                        [Convert]::FromBase64String([string]$act.token), $null,
-                        [System.Security.Cryptography.DataProtectionScope]::CurrentUser))
-            }
-        }
-    }
-    catch { }
-    $exe = Get-Command claude.exe -ErrorAction SilentlyContinue
-    if ($null -ne $exe) { & $exe.Source @args } else { Write-Error 'claude.exe not found in PATH' }
-}
-# <<< perch account launcher <<<
-'@
-    foreach ($prof in @(
-        (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
-        (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Microsoft.PowerShell_profile.ps1'))) {
-        try {
-            $dir = Split-Path $prof -Parent
-            if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
-            $existing = ''
-            if (Test-Path -LiteralPath $prof) { $existing = Get-Content -LiteralPath $prof -Raw }
-            if ($existing -notlike '*perch account launcher*') {
-                Add-Content -LiteralPath $prof -Value $block
-            }
-        }
-        catch { }
-    }
-}
-
-function Show-AccountsDisclaimer {
-    # honest modal, shown once: this automates switching between the user's
-    # OWN paid subscriptions, but Anthropic's ToS stance on rotating accounts
-    # around usage limits is not clear - their call to make.
-    $script:DisclaimerOk = $false
-    $dlg = New-Object System.Windows.Window
-    $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
-    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
-    $dlg.SizeToContent = 'WidthAndHeight'
-    $dlg.WindowStartupLocation = 'CenterOwner'
-    $dlg.Owner = $script:Window
-    $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
-
-    $card = New-Object System.Windows.Controls.Border
-    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
-    $card.Background = Get-Brush '#F8202029'
-    $card.BorderBrush = Get-Brush '#33FFFFFF'
-    $card.BorderThickness = New-Object System.Windows.Thickness(1)
-    $card.Padding = New-Object System.Windows.Thickness(18, 14, 18, 14)
-
-    $stack = New-Object System.Windows.Controls.StackPanel
-    $stack.Width = 280
-
-    $title = New-Object System.Windows.Controls.TextBlock
-    $title.Text = 'heads up'
-    $title.FontSize = 12.5
-    $title.FontWeight = [System.Windows.FontWeights]::SemiBold
-    $title.Foreground = Get-Brush '#F4F4F8'
-    $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-    [void]$stack.Children.Add($title)
-
-    $body = New-Object System.Windows.Controls.TextBlock
-    $body.Text = "this switches which of YOUR paid Claude subscriptions new sessions use - the same thing you already do by hand with /login, minus the dance.`n`nhonesty corner: we are not sure where Anthropic's terms stand on rotating accounts around usage limits, even fully paid ones. no auto-switching happens, ever - every switch is your click, your call."
-    $body.FontSize = 11
-    $body.TextWrapping = 'Wrap'
-    $body.Foreground = Get-Brush '#C0C0C8'
-    $body.LineHeight = 16
-    [void]$stack.Children.Add($body)
-
-    $btnRow = New-Object System.Windows.Controls.StackPanel
-    $btnRow.Orientation = 'Horizontal'
-    $btnRow.HorizontalAlignment = 'Right'
-    $btnRow.Margin = New-Object System.Windows.Thickness(0, 14, 0, 0)
-    $btnOk = New-DialogButton 'i understand' $true
-    $btnOk.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-    $btnNo = New-DialogButton 'nevermind' $false
-    $btnOk.Tag = $dlg
-    $btnNo.Tag = $dlg
-    $btnOk.Add_MouseLeftButtonUp({ param($s, $e) $script:DisclaimerOk = $true; $s.Tag.Close() })
-    $btnNo.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
-    [void]$btnRow.Children.Add($btnOk)
-    [void]$btnRow.Children.Add($btnNo)
-    [void]$stack.Children.Add($btnRow)
-
-    $card.Child = $stack
-    $dlg.Content = $card
-    $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
-    $script:UiHold++; $script:UiHoldStamp = Get-Date
-    try { [void]$dlg.ShowDialog() }
-    finally { $script:UiHold = [Math]::Max(0, $script:UiHold - 1) }
-    return $script:DisclaimerOk
-}
-
-function Show-AddAccountDialog {
-    # label + pasted `claude setup-token` output -> encrypted account entry
-    $script:AddAcctResult = $null
-    $dlg = New-Object System.Windows.Window
-    $dlg.WindowStyle = 'None'; $dlg.AllowsTransparency = $true
-    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
-    $dlg.SizeToContent = 'WidthAndHeight'
-    $dlg.WindowStartupLocation = 'CenterOwner'
-    $dlg.Owner = $script:Window
-    $dlg.Topmost = $true; $dlg.ShowInTaskbar = $false
-
-    $card = New-Object System.Windows.Controls.Border
-    $card.CornerRadius = New-Object System.Windows.CornerRadius(12)
-    $card.Background = Get-Brush '#F8202029'
-    $card.BorderBrush = Get-Brush '#33FFFFFF'
-    $card.BorderThickness = New-Object System.Windows.Thickness(1)
-    $card.Padding = New-Object System.Windows.Thickness(16, 12, 16, 12)
-
-    $stack = New-Object System.Windows.Controls.StackPanel
-    $stack.Width = 260
-
-    $title = New-Object System.Windows.Controls.TextBlock
-    $title.Text = 'add claude account'
-    $title.FontSize = 11
-    $title.Foreground = Get-Brush '#8A8A93'
-    $title.Margin = New-Object System.Windows.Thickness(0, 0, 0, 6)
-    [void]$stack.Children.Add($title)
-
-    [void]$stack.Children.Add((New-DarkLabel 'name (e.g. the email)'))
-    $inLabel = New-InputBox ''
-    [void]$stack.Children.Add($inLabel)
-
-    [void]$stack.Children.Add((New-DarkLabel 'token from `claude setup-token` (run it while logged into that account)'))
-    $inToken = New-InputBox ''
-    [void]$stack.Children.Add($inToken)
-
-    $hint = New-Object System.Windows.Controls.TextBlock
-    $hint.Text = 'stored encrypted (DPAPI, this windows user only)'
-    $hint.FontSize = 9.5
-    $hint.Foreground = Get-Brush '#6E6E78'
-    $hint.Margin = New-Object System.Windows.Thickness(2, 6, 0, 0)
-    [void]$stack.Children.Add($hint)
-
-    $btnRow = New-Object System.Windows.Controls.StackPanel
-    $btnRow.Orientation = 'Horizontal'
-    $btnRow.HorizontalAlignment = 'Right'
-    $btnRow.Margin = New-Object System.Windows.Thickness(0, 12, 0, 0)
-    $btnAdd = New-DialogButton 'add' $true
-    $btnAdd.Margin = New-Object System.Windows.Thickness(0, 0, 8, 0)
-    $btnCancel = New-DialogButton 'cancel' $false
-    $dlg.Tag = @{ Label = $inLabel.Child; Token = $inToken.Child }
-    $btnAdd.Tag = $dlg
-    $btnCancel.Tag = $dlg
-    $btnAdd.Add_MouseLeftButtonUp({
-        param($s, $e)
-        $c = $s.Tag.Tag
-        $lbl = ([string]$c.Label.Text).Trim()
-        $tok = ([string]$c.Token.Text).Trim()
-        if ($lbl.Length -gt 0 -and $tok -like 'sk-ant-*') {
-            $script:AddAcctResult = @{ Label = $lbl; Token = $tok }
-            $s.Tag.Close()
-        }
-    })
-    $btnCancel.Add_MouseLeftButtonUp({ param($s, $e) $s.Tag.Close() })
-    [void]$btnRow.Children.Add($btnAdd)
-    [void]$btnRow.Children.Add($btnCancel)
-    [void]$stack.Children.Add($btnRow)
-
-    $card.Child = $stack
-    $dlg.Content = $card
-    $dlg.Add_KeyDown({ param($s, $e) if ($e.Key -eq 'Escape') { $s.Close() } })
-    $script:UiHold++; $script:UiHoldStamp = Get-Date
-    try { [void]$dlg.ShowDialog() }
-    finally { $script:UiHold = [Math]::Max(0, $script:UiHold - 1) }
-    return $script:AddAcctResult
-}
-
-function Update-AccountsPanel {
-    # (re)build the account rows inside the settings dialog
-    if ($null -eq $script:AcctPanel) { return }
-    $script:AcctPanel.Children.Clear()
-    $data = Get-Accounts
-    foreach ($acct in @($data.accounts)) {
-        $row = New-Object System.Windows.Controls.Border
-        $row.CornerRadius = New-Object System.Windows.CornerRadius(8)
-        $row.Padding = New-Object System.Windows.Thickness(9, 5, 7, 6)
-        $row.Margin = New-Object System.Windows.Thickness(0, 1, 0, 1)
-        $row.Cursor = [System.Windows.Input.Cursors]::Hand
-        $row.Background = [System.Windows.Media.Brushes]::Transparent
-        $row.Tag = [string]$acct.id
-        $row.Add_MouseEnter({ param($s, $e) $s.Background = Get-Brush '#12FFFFFF' })
-        $row.Add_MouseLeave({ param($s, $e) $s.Background = [System.Windows.Media.Brushes]::Transparent })
-
-        $g = New-Object System.Windows.Controls.Grid
-        foreach ($wdef in @('Auto', '*', 'Auto')) {
-            $cd = New-Object System.Windows.Controls.ColumnDefinition
-            if ($wdef -eq 'Auto') { $cd.Width = [System.Windows.GridLength]::Auto }
-            else { $cd.Width = New-Object System.Windows.GridLength(1, 'Star') }
-            [void]$g.ColumnDefinitions.Add($cd)
-        }
-
-        $dot = New-Object System.Windows.Shapes.Ellipse
-        $dot.Width = 7; $dot.Height = 7
-        $dot.Margin = New-Object System.Windows.Thickness(0, 1, 8, 0)
-        $dot.VerticalAlignment = 'Center'
-        $dot.Fill = $(if ([string]$acct.id -eq [string]$data.active) { Get-Brush '#5ED584' } else { Get-Brush '#33FFFFFF' })
-        [System.Windows.Controls.Grid]::SetColumn($dot, 0)
-        [void]$g.Children.Add($dot)
-
-        $lbl = New-Object System.Windows.Controls.TextBlock
-        $lbl.Text = [string]$acct.label + $(if ([string]$acct.id -eq [string]$data.active) { '  (active)' } else { '' })
-        $lbl.FontSize = 11.5
-        $lbl.Foreground = $(if ([string]$acct.id -eq [string]$data.active) { Get-Brush '#F4F4F8' } else { Get-Brush '#B9B9C2' })
-        $lbl.VerticalAlignment = 'Center'
-        [System.Windows.Controls.Grid]::SetColumn($lbl, 1)
-        [void]$g.Children.Add($lbl)
-
-        $del = New-Object System.Windows.Controls.TextBlock
-        $del.Text = [string][char]0x2715
-        $del.FontSize = 10
-        $del.Foreground = Get-Brush '#55555E'
-        $del.Cursor = [System.Windows.Input.Cursors]::Hand
-        $del.Padding = New-Object System.Windows.Thickness(6, 1, 2, 1)
-        $del.Tag = [string]$acct.id
-        $del.Add_MouseEnter({ param($s, $e) $s.Foreground = Get-Brush '#FF6B6B' })
-        $del.Add_MouseLeave({ param($s, $e) $s.Foreground = Get-Brush '#55555E' })
-        $del.Add_MouseLeftButtonDown({ param($s, $e) $e.Handled = $true })
-        $del.Add_MouseLeftButtonUp({
-            param($s, $e)
-            $e.Handled = $true
-            $d = Get-Accounts
-            $d.accounts = @($d.accounts | Where-Object { [string]$_.id -ne [string]$s.Tag })
-            if ([string]$d.active -eq [string]$s.Tag) { $d.active = '' }
-            Save-Accounts $d
-            Update-AccountsPanel
-        })
-        [System.Windows.Controls.Grid]::SetColumn($del, 2)
-        [void]$g.Children.Add($del)
-
-        $row.Child = $g
-        $row.Add_MouseLeftButtonUp({
-            param($s, $e)
-            $d = Get-Accounts
-            $d.active = [string]$s.Tag
-            Save-Accounts $d
-            Update-AccountsPanel
-        })
-        [void]$script:AcctPanel.Children.Add($row)
-    }
-
-    $add = New-Object System.Windows.Controls.TextBlock
-    $add.Text = '+ add account'
-    $add.FontSize = 10.5
-    $add.Foreground = Get-Brush '#E07B54'
-    $add.Cursor = [System.Windows.Input.Cursors]::Hand
-    $add.Margin = New-Object System.Windows.Thickness(9, 4, 0, 2)
-    $add.Add_MouseLeftButtonUp({
-        if (-not $script:AcctDisclaimerOk) {
-            if (-not (Show-AccountsDisclaimer)) { return }
-            $script:AcctDisclaimerOk = $true
-            try {
-                $cfg = $null
-                if (Test-Path -LiteralPath $CfgPath) { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json }
-                if ($null -eq $cfg) { $cfg = [pscustomobject]@{} }
-                $cfg | Add-Member -NotePropertyName AccountsDisclaimerOk -NotePropertyValue $true -Force
-                Set-ContentAtomic $CfgPath ($cfg | ConvertTo-Json)
-            }
-            catch { }
-        }
-        $res = Show-AddAccountDialog
-        if ($null -ne $res) {
-            $d = Get-Accounts
-            $id = 'acct-' + ([guid]::NewGuid().ToString('N').Substring(0, 8))
-            $d.accounts = @($d.accounts) + @([pscustomobject]@{
-                id = $id; label = [string]$res.Label; token = (Protect-AccountToken ([string]$res.Token))
-            })
-            if ([string]$d.active -eq '') { $d.active = $id }
-            Save-Accounts $d
-            Install-ClaudeLauncher   # make plain `claude` account-aware (idempotent)
-            Update-AccountsPanel
-        }
-    })
-    [void]$script:AcctPanel.Children.Add($add)
-}
-
 function Save-PerchSettings([string]$Theme, [bool]$Chirp, [bool]$Timers, [bool]$HideAfter, [bool]$Startup, [string]$RefreshRaw, [string]$VolumeRaw, [string]$ProcsRaw, [string]$ParkRaw = '', [bool]$ChirpDone = $true, [string]$CompactRaw = '', [bool]$Bubbles = $true) {
     if ($script:ThemeSpecs.Keys -contains $Theme -and $Theme -ne $script:ThemeName) {
         $script:ThemeName = $Theme
@@ -5968,24 +5631,6 @@ function Show-SettingsDialog {
     [void]$stack.Children.Add((New-DarkLabel 'agent process names'))
     $inProcs = New-InputBox ($script:AgentProcNames -join ', ')
     [void]$stack.Children.Add($inProcs)
-
-    # claude accounts (switch which subscription NEW sessions use)
-    $sep2 = New-Object System.Windows.Controls.Border
-    $sep2.Height = 1
-    $sep2.Background = Get-Brush '#14FFFFFF'
-    $sep2.Margin = New-Object System.Windows.Thickness(2, 12, 2, 0)
-    [void]$stack.Children.Add($sep2)
-    [void]$stack.Children.Add((New-DarkLabel 'claude accounts'))
-    $script:AcctPanel = New-Object System.Windows.Controls.StackPanel
-    [void]$stack.Children.Add($script:AcctPanel)
-    Update-AccountsPanel
-    $acctHint = New-Object System.Windows.Controls.TextBlock
-    $acctHint.Text = 'applies to NEW sessions - in a stuck tab just run: claude --continue'
-    $acctHint.FontSize = 9.5
-    $acctHint.Foreground = Get-Brush '#6E6E78'
-    $acctHint.TextWrapping = 'Wrap'
-    $acctHint.Margin = New-Object System.Windows.Thickness(2, 4, 0, 0)
-    [void]$stack.Children.Add($acctHint)
 
     $btnRow = New-Object System.Windows.Controls.StackPanel
     $btnRow.Orientation = 'Horizontal'
@@ -6289,8 +5934,8 @@ function Get-OfficialLimits {
     # OFFICIAL rate-limit numbers into the statusline command's stdin on
     # every render. Our statusline command tees that json to a file -
     # server-truth percentages with ZERO api calls, fresh whenever any
-    # session is alive. (The oauth endpoint remains as calibration + the
-    # per-model weekly rows, at a gentle cadence.)
+    # session is alive. It is the only official source perch reads: perch
+    # itself never asks Anthropic anything and never opens the login file.
     $sPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\statusline.json'
     if (-not (Test-Path -LiteralPath $sPath)) { return $null }
     if (([datetime]::UtcNow - (Get-Item -LiteralPath $sPath).LastWriteTimeUtc).TotalMinutes -gt 3) { return $null }
@@ -6314,9 +5959,9 @@ function Get-OfficialLimits {
 }
 
 function ConvertTo-ResetIso([object]$Value) {
-    # the statusline sends reset times as UNIX EPOCH SECONDS; the oauth
-    # endpoint sends ISO strings. Normalize to ISO so one parser rules all -
-    # unparsed epochs were rendering as broken countdowns on the 5h/week rows
+    # the statusline sends reset times as UNIX EPOCH SECONDS; the local
+    # block estimate writes ISO strings. Normalize to ISO so one parser rules
+    # all - unparsed epochs were rendering as broken countdowns on the rows
     $s = [string]$Value
     [long]$epoch = 0
     if ([long]::TryParse($s, [ref]$epoch) -and $epoch -gt 1000000000 -and $epoch -lt 100000000000) {
@@ -6327,8 +5972,8 @@ function ConvertTo-ResetIso([object]$Value) {
 
 function Update-LimitsPanel {
     # account limit bars. Source priority: statusline capture (official, free,
-    # live) -> oauth endpoint snapshot (per-model rows + fallback) -> stale
-    # data shown dimmed with its age. The UI thread never touches the network.
+    # live) -> the local 5h-block estimate while the statusline is silent.
+    # Nothing here touches the network or the login.
     try {
         $now = Get-Date
 
@@ -6340,40 +5985,10 @@ function Update-LimitsPanel {
             $official = $script:LastOfficial
         }
 
-        # source 2: the oauth endpoint. 30min cadence while the statusline
-        # feed is alive (it only contributes the per-model weekly rows then),
-        # 5min when it's our only source; file-age gated; never during a 429
-        # cooldown (Retry-After honored by the probe)
-        $uPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage.json'
-        $coolPath = Join-Path $env:LOCALAPPDATA 'AgentFocus\usage-cooldown.txt'
-        $fileAge = 1e9
-        if (Test-Path -LiteralPath $uPath) {
-            $fileAge = ([datetime]::UtcNow - (Get-Item -LiteralPath $uPath).LastWriteTimeUtc).TotalSeconds
-        }
-        $coolActive = $false
-        if (Test-Path -LiteralPath $coolPath) {
-            try {
-                $until = [datetime]::Parse((Get-Content -LiteralPath $coolPath -Raw).Trim(), $null,
-                         [System.Globalization.DateTimeStyles]::RoundtripKind)
-                $coolActive = ([datetime]::UtcNow -lt $until.ToUniversalTime())
-            }
-            catch { }
-        }
-        $cadence = $(if ($null -ne $official) { 1800 } else { 300 })
-        if (-not $coolActive -and $fileAge -gt $cadence -and
-            ($now - $script:UsageFetchStamp).TotalSeconds -gt 60) {
-            $script:UsageFetchStamp = $now
-            $probe = Join-Path $PSScriptRoot 'usage-probe.ps1'
-            if (Test-Path -LiteralPath $probe) {
-                Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
-                    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$probe`"") | Out-Null
-            }
-        }
-
-        # source 3: LOCAL 5h-block estimate (the ccusage steal, zero api):
+        # source 2: LOCAL 5h-block estimate (the ccusage steal, zero api):
         # a BelowNormal child incrementally buckets transcript token usage
-        # into 5h billing blocks. Used only when both official feeds are
-        # silent (offline / api down / rate-limited) - the cap is learned by
+        # into 5h billing blocks. Used only when the statusline feed is
+        # silent (no session alive to report) - the cap is learned by
         # CALIBRATING local block tokens against official percentages seen
         # earlier, falling back to the P90 of past blocks.
         if (($null -eq $script:BlocksProc -or $script:BlocksProc.HasExited) -and
@@ -6401,34 +6016,8 @@ function Update-LimitsPanel {
                 ([datetime]::UtcNow - $bLwt).TotalMinutes -lt 6) { $blocks = $script:BlocksParsed }
         }
 
-        # endpoint snapshot rows (cached parse keyed on file write time)
-        $endpointRows = @()
-        $endpointFetched = [datetime]::MinValue
-        if (Test-Path -LiteralPath $uPath) {
-            $uLwt = (Get-Item -LiteralPath $uPath).LastWriteTimeUtc
-            if ($uLwt -ne $script:UsageFileLWT -or $null -eq $script:UsageParsed) {
-                try {
-                    $u = Get-Content -LiteralPath $uPath -Raw | ConvertFrom-Json
-                    if ($null -ne $u -and $null -ne $u.PSObject.Properties['limits']) {
-                        $script:UsageParsed = $u
-                        $script:UsageFileLWT = $uLwt
-                    }
-                }
-                catch { }
-            }
-            if ($null -ne $script:UsageParsed) {
-                $endpointRows = @($script:UsageParsed.limits)
-                try {
-                    $endpointFetched = ([datetime]::Parse([string]$script:UsageParsed.fetched_at, $null,
-                                        [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime()
-                }
-                catch { }
-            }
-        }
-
-        # assemble: official 5h/week first; endpoint contributes the scoped
-        # per-model weekly rows (statusline doesn't carry those) if reasonably
-        # fresh; endpoint alone when no statusline feed exists
+        # assemble: the official 5h/week rows while the statusline feed is
+        # alive, else the local estimate of the 5h row
         $rows = @()
         $staleMin = 0.0
         $srcStamp = $now
@@ -6476,26 +6065,13 @@ function Update-LimitsPanel {
                     break
                 }
             }
-            # the statusline doesn't carry the per-model weekly rows - keep
-            # them from the endpoint snapshot for up to 6h (weekly numbers
-            # drift slowly; a 2h-old fable row beats a vanished fable row)
-            if (($now - $endpointFetched).TotalHours -lt 6) {
-                foreach ($er in $endpointRows) {
-                    if (([string]$er.label) -like 'week *' -and ([string]$er.label) -ne 'week') {
-                        $rows += $er
-                    }
-                }
-            }
         }
         else {
-            $rows = $endpointRows
-            if ($endpointFetched -gt [datetime]::MinValue) { $staleMin = ($now - $endpointFetched).TotalMinutes }
-            else { $staleMin = 999 }
-            $srcStamp = $endpointFetched
-            # both official feeds silent: local block math carries the 5h row
+            $staleMin = 999
+            $srcStamp = [datetime]::MinValue
+            # statusline feed silent: local block math carries the 5h row
             # (fresh + honest about being an estimate via its '~local' label)
-            if ($null -ne $blocks -and $null -ne $blocks.block -and
-                ($staleMin -gt 20 -or $rows.Count -eq 0)) {
+            if ($null -ne $blocks -and $null -ne $blocks.block) {
                 $cap = 0.0
                 if ($script:BlockCalib.Count -ge 3) {
                     $capsArr = @(foreach ($cs in $script:BlockCalib) { [double]$cs.Tok * 100.0 / [double]$cs.Pct }) | Sort-Object
@@ -6667,17 +6243,15 @@ function Update-LimitsPanel {
         }
         Update-PillRing
 
-        # staleness in words, not just opacity - a 45% dim was too subtle and
-        # old numbers were being read as current
-        if ($staleMin -gt 10) {
+        # say in words when the 5h row is an estimate: no session is
+        # reporting official numbers right now
+        if ($localEst) {
             $old = New-Object System.Windows.Controls.TextBlock
             $old.FontSize = 9
             $old.Foreground = Get-Brush '#8A6E6E'
             $old.HorizontalAlignment = 'Right'
             $old.Margin = New-Object System.Windows.Thickness(0, 1, 0, 0)
-            $old.Text = $(if ($localEst) { "5h = local estimate $([char]0x00B7) wk data $([int]$staleMin)m old" }
-                          else { "data $([int]$staleMin)m old" +
-                                 $(if ($coolActive) { ' (rate-limited, backing off)' } else { ', retrying' }) })
+            $old.Text = '5h = local estimate, no session reporting'
             [void]$script:LimitsPanel.Children.Add($old)
         }
 
